@@ -9,3 +9,6 @@ shots*/
 
 # machine-local hub config (compose reads it automatically)
 hub/.env
+
+# machine-local secrets (OpenRouter recon, GitHub token)
+.env
