@@ -38,6 +38,35 @@ os.environ["ORGTREE_GEMINI"] = os.path.join(
     os.environ["ORGTREE_DATA"], "nowhere", "gemini.js")
 os.environ["ORGTREE_GEMINI_HOME"] = os.path.join(
     os.environ["ORGTREE_DATA"], "ghome")
+# hermetic on the openrouter axis too (design-openrouter.md): providers_payload
+# reads OPENROUTER_API_KEY for the connect state, and the model catalogue would
+# hit the network — pin both to this suite's own fixtures.
+os.environ.pop("OPENROUTER_API_KEY", None)
+_OR_MODELS_FIXTURE = os.path.join(os.environ["ORGTREE_DATA"], "or-models.json")
+os.environ["ORGTREE_OPENROUTER_MODELS"] = _OR_MODELS_FIXTURE
+with open(_OR_MODELS_FIXTURE, "w", encoding="utf-8") as _f:
+    json.dump({"data": [
+        {"id": "openai/gpt-4o-mini", "name": "GPT-4o mini",
+         "context_length": 128000, "supported_parameters": ["tools"],
+         "pricing": {"prompt": "0.00000015", "completion": "0.0000006"}},
+        {"id": "moonshotai/kimi-k2", "name": "Kimi K2",
+         "context_length": 200000, "supported_parameters": ["tools"],
+         "pricing": {"prompt": "0.0000015", "completion": "0.0000025"}},
+        {"id": "openai/gpt-5", "name": "GPT-5",
+         "context_length": 400000,
+         "supported_parameters": ["tools", "reasoning"],
+         "reasoning": {"supported_efforts": ["low", "high"]},
+         "pricing": {"prompt": "0.000003", "completion": "0.00001"}},
+        {"id": "anthropic/claude-sonnet-4.5", "name": "Claude Sonnet 4.5",
+         "context_length": 1000000, "supported_parameters": ["tools"],
+         "pricing": {"prompt": "0.000006", "completion": "0.00003"}},
+        {"id": "anthropic/claude-opus-4.1", "name": "Claude Opus 4.1",
+         "context_length": 200000, "supported_parameters": ["tools"],
+         "pricing": {"prompt": "0.000015", "completion": "0.000075"}},
+        {"id": "some/embedding-model", "name": "not tool-capable",
+         "context_length": 8192, "supported_parameters": ["max_tokens"],
+         "pricing": {"prompt": "0.00000002", "completion": "0"}},
+    ]}, _f)
 
 from orgtree import providers                                      # noqa: E402
 from orgtree.ledger import (LedgerError, MODELS, Org, TIERS,       # noqa: E402
@@ -175,9 +204,9 @@ def main():
     pay = providers.providers_payload({"installed": True, "connected": True})
     # grew to three at D-184 (gemini) — the gemini entry's own behaviour is
     # test_gemini_providers.py's; here it only has to hold its place in line
-    check("exactly three providers, claude first",
+    check("exactly four providers, claude first, openrouter last",
           lambda: eq([p["id"] for p in pay["providers"]],
-                     ["claude", "openai", "google"], "order"))
+                     ["claude", "openai", "google", "openrouter"], "order"))
     codex = next(p for p in pay["providers"] if p["id"] == "openai")
     # FLIPPED at the MVP (M1–M8 standing): the vision live — a CONNECTED CLI
     # is a hireable provider, the same predicate the api hire gate enforces.
@@ -199,6 +228,110 @@ def main():
     check("the claude entry passes the composed status through, hireable",
           lambda: eq((claude["hire_enabled"], claude["status"]["installed"]),
                      (True, True), "claude entry"))
+
+    print("§5 the openrouter axis (design-openrouter.md, provider #4) — DATA "
+          "only until the runner + hire gate land (§4/§5)")
+    # the price→band map: inclusive edges, open-ended nova, free ⇒ spark.
+    check("band_for_price walks the five inclusive bands, nova catches the tail",
+          lambda: eq([providers.band_for_price(x) for x in
+                      (0.0, 0.5, 1.0, 1.01, 2.0, 5.0, 9.99, 10.0, 10.01, 999.0)],
+                     ["spark", "spark", "spark", "ember", "ember", "flare",
+                      "blaze", "blaze", "nova", "nova"], "bands"))
+    check("OPENROUTER_TIERS is the five static price-band seats",
+          lambda: eq(providers.OPENROUTER_TIERS,
+                     {"spark": 1, "ember": 2, "flare": 5, "blaze": 10,
+                      "nova": 20}, "seats"))
+    check("OPENROUTER_TIER_NAMES is the flat ascending vocabulary",
+          lambda: eq(tuple(providers.OPENROUTER_TIER_NAMES),
+                     ("spark", "ember", "flare", "blaze", "nova"), "names"))
+    check("openrouter_tiers(): seat-ordered, provider tagged, default slug, "
+          "distinct chip letters clear of F/O/S/H/L/T/P",
+          lambda: eq(
+              ([(t["tier"], t["seat"], t["provider"], t["model"])
+                for t in providers.openrouter_tiers()],
+               len({t["letter"] for t in providers.openrouter_tiers()}),
+               {t["letter"] for t in providers.openrouter_tiers()}
+               & set("FOSHLTP")),
+              ([("spark", 1, "openrouter", "google/gemini-2.5-flash"),
+                ("ember", 2, "openrouter", "moonshotai/kimi-k2"),
+                ("flare", 5, "openrouter", "openai/gpt-5"),
+                ("blaze", 10, "openrouter", "anthropic/claude-sonnet-4.5"),
+                ("nova", 20, "openrouter", "anthropic/claude-opus-4.1")],
+               5, set()), "tiers"))
+    check("provider_of / provider_label route an openrouter tier to the axis",
+          lambda: eq((providers.provider_of("flare"),
+                      providers.provider_label("flare")),
+                     ("openrouter", "OpenRouter"), "axis"))
+
+    # the catalogue, from this suite's fixture: tool-capable only, cheapest
+    # input first, each row's band == band_for_price(its input $/M).
+    cat = providers.openrouter_models(force=True)
+    check("openrouter_models filters out the non-tool-capable row (5 of 6), "
+          "sorts cheapest-input first, prices in $/M",
+          lambda: eq([(m["id"], m["input_per_M"]) for m in cat],
+                     [("openai/gpt-4o-mini", 0.15),
+                      ("moonshotai/kimi-k2", 1.5),
+                      ("openai/gpt-5", 3.0),
+                      ("anthropic/claude-sonnet-4.5", 6.0),
+                      ("anthropic/claude-opus-4.1", 15.0)], "catalogue"))
+    check("every catalogue row's band agrees with band_for_price",
+          lambda: eq([m["band"] for m in cat],
+                     [providers.band_for_price(m["input_per_M"]) for m in cat],
+                     "row bands"))
+    check("gpt-5's reasoning efforts survive the trim; a plain model has none",
+          lambda: eq((next(m["reasoning_efforts"] for m in cat
+                           if m["id"] == "openai/gpt-5"),
+                      next(m["reasoning_efforts"] for m in cat
+                           if m["id"] == "openai/gpt-4o-mini")),
+                     (["low", "high"], []), "reasoning"))
+    check("band_for_slug: known ⇒ band, unknown ⇒ None, not-tool-capable ⇒ None",
+          lambda: eq((providers.band_for_slug("openai/gpt-5"),
+                      providers.band_for_slug("no/such-model"),
+                      providers.band_for_slug("some/embedding-model")),
+                     ("flare", None, None), "slug→band"))
+
+    # the negative invariant the codex axis shipped behind: nothing
+    # budget-bearing knows the tiers yet, so a hire is refused as unknown.
+    check("preview era: OpenRouter tiers are NOT in ledger.TIERS",
+          lambda: eq([t in TIERS for t in providers.OPENROUTER_TIER_NAMES],
+                     [False] * 5, "not budget-bearing"))
+    check("…so hiring 'flare' is refused with the same 'unknown tier' as junk",
+          lambda: raises(lambda: org.hire(USER, top, "flare", 0, "x-or"),
+                         "unknown tier", "flare refused"))
+
+    # key resolution — presence only; org key wins over env.
+    check("openrouter_key: env unset ⇒ (None, ''), env set ⇒ (…, 'env'), "
+          "explicit org key wins ⇒ (…, 'org')",
+          lambda: eq((providers.openrouter_key(),
+                      (lambda: (os.environ.__setitem__("OPENROUTER_API_KEY",
+                                                       "sk-or-fake"),
+                                providers.openrouter_key())[1])(),
+                      providers.openrouter_key("org-supplied")),
+                     ((None, ""), ("sk-or-fake", "env"),
+                      ("org-supplied", "org")), "key resolution"))
+
+    print("§6 the openrouter payload entry — preview shape")
+    providers.openrouter_status(force=True)  # env now has the fake key
+    p3 = providers.providers_payload({"installed": True, "connected": True})
+    orr = next(p for p in p3["providers"] if p["id"] == "openrouter")
+    check("cli is None, status carries NO 'installed' key (D-OR-2), kind api-key",
+          lambda: eq((orr["cli"], "installed" in orr["status"],
+                      orr["status"]["kind"]), (None, False, "api-key"),
+                     "openrouter entry shape"))
+    check("hire_enabled is hard-False in the preview even with a key present",
+          lambda: eq((orr["hire_enabled"], orr["status"]["connected"]),
+                     (False, True), "preview hire lock"))
+
+    def or_disconnected():
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        providers.openrouter_status(force=True)
+        p4 = providers.providers_payload({"installed": True})
+        o2 = next(p for p in p4["providers"] if p["id"] == "openrouter")
+        eq((o2["status"]["connected"],
+            "OPENROUTER_API_KEY" in (o2["reason"] or "")),
+           (False, True), "disconnected reason")
+    check("…and with no key the reason names OPENROUTER_API_KEY",
+          or_disconnected)
 
     print(f"\n{PASS} checks passed")
 

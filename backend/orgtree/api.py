@@ -2132,6 +2132,19 @@ async def providers_info() -> dict[str, Any]:
     return await run_in_threadpool(_payload)
 
 
+@app.get("/api/providers/openrouter/models")
+async def openrouter_model_catalogue() -> dict[str, Any]:
+    """The tool-capable OpenRouter model catalogue for the hire picker
+    (design-openrouter.md §2 / D-OR-4): id, display name, input/output $/M,
+    context length, reasoning efforts, and the price BAND each model lands
+    in. ~310 rows, cached ~1h in providers.py (memory + disk); the fetch is
+    keyless. Threadpooled — a cold call makes one outbound HTTPS GET."""
+    from fastapi.concurrency import run_in_threadpool
+
+    rows = await run_in_threadpool(providers.openrouter_models)
+    return {"models": rows}
+
+
 class Reorder(Body):
     before: str | None = None
     after: str | None = None
