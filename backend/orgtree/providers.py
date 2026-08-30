@@ -138,6 +138,8 @@ def provider_of(tier: str) -> str:
         return "openai"
     if tier in GEMINI_TIERS:
         return "google"
+    if tier in OPENROUTER_TIERS:
+        return "openrouter"
     return "claude"
 
 
@@ -149,7 +151,11 @@ def provider_of(tier: str) -> str:
 #: in the accounts panel cannot come to disagree about what a provider is
 #: called.
 PROVIDER_LABEL: Final[dict[str, str]] = {
-    "claude": "Claude", "openai": "Codex", "google": "Gemini"}
+    "claude": "Claude", "openai": "Codex", "google": "Gemini",
+    # OpenRouter is not a CLI (design-openrouter.md §0) — the label is the
+    # product's own name, the same §0 naming rule that made "Codex"/"Gemini"
+    # the labels rather than the vendor.
+    "openrouter": "OpenRouter"}
 
 
 def provider_label(tier: str) -> str:
@@ -606,12 +612,258 @@ def gemini_status(force: bool = False) -> dict[str, Any]:
     return st
 
 
+# ── the openrouter axis (design-openrouter.md, provider #4) ────────────────
+# OpenRouter is NOT a CLI — it is a hosted OpenAI-compatible HTTP aggregator
+# (~300 upstream models, one API key). So this axis has no binary to resolve,
+# no auth store to inspect, and no `--version`: detection collapses to "is a
+# key configured" (⚠ deviation D-OR-2). There is no curated model list — the
+# user picks any tool-capable model OpenRouter offers and the SEAT is derived
+# from that model's OpenRouter input $/M via one of five static price bands
+# (⚠ deviation D-OR-3: the band, hence the tier, is a function of the model
+# and can move under switch_model). `hire_enabled` stays hard-False here until
+# the turn runner + hire gate land (§4/§5); this increment ships the axis as
+# read-only DATA, exactly as the codex/gemini axes first shipped.
+
+# chip letters for the openrouter roster — clear of the existing family
+# letters F/O/S/H (claude) · L/T/S (codex) · F/P (gemini): spark→K, blaze→B,
+# nova→N are free first letters, ember→E likewise, flare→R (flaRe, F taken).
+_OPENROUTER_LETTER: Final[dict[str, str]] = {
+    "spark": "K", "ember": "E", "flare": "R", "blaze": "B", "nova": "N"}
+
+#: the five price bands as (name, INCLUSIVE max input $/M, seat), ascending.
+#: `nova` is open-ended (`> 10`), so its ceiling is +inf. Band edges and the
+#: recon price distribution that set them: docs/design-openrouter.md §9.
+OPENROUTER_BANDS: Final[tuple[tuple[str, float, int], ...]] = (
+    ("spark", 1.0, 1),
+    ("ember", 2.0, 2),
+    ("flare", 5.0, 5),
+    ("blaze", 10.0, 10),
+    ("nova", float("inf"), 20),
+)
+
+#: one flat tier vocabulary, clear of fable/opus/sonnet/haiku · luna/terra/sol
+#: · flash/pro (design-openrouter.md §2).
+OPENROUTER_TIER_NAMES: Final = tuple(b[0] for b in OPENROUTER_BANDS)
+
+#: band → seat and band → DEFAULT slug, DERIVED from ledger.TIERS /
+#: ledger.MODELS (the budget-bearing tables — the OpenRouter rows landed
+#: there at hire enablement, §5) exactly as CODEX_TIERS / GEMINI_TIERS are,
+#: so a seat price lives in one place. The band EDGES for the price→band map
+#: stay in OPENROUTER_BANDS above; a drift check pins the two seat views
+#: together. `OPENROUTER_MODELS` is the default used when a node has no
+#: `or_slug` (design §9).
+OPENROUTER_TIERS: Final[dict[str, int]] = {
+    n: _LEDGER_TIERS[n] for n in OPENROUTER_TIER_NAMES}
+OPENROUTER_MODELS: Final[dict[str, str]] = {
+    n: _LEDGER_MODELS[n] for n in OPENROUTER_TIER_NAMES}
+
+#: band → a conservative context-window FLOOR. `_openrouter_leg` (§4) writes
+#: the real per-slug window to `n["context_window"]`, which wins via the
+#: existing `_ctx_for` fallback; this is only the value before a turn has run.
+OPENROUTER_CONTEXT: Final[dict[str, int]] = {
+    "spark": 32_000, "ember": 32_000,
+    "flare": 128_000, "blaze": 128_000, "nova": 128_000,
+}
+
+#: (input, cached, output) $/M used ONLY when a turn result carries NO `cost`
+#: field — the rare "stranger" path (§4 bookkeeping). Set high on purpose:
+#: overstating an unknown model's cost is recoverable, a silent $0 is the
+#: Gemini rule's cardinal sin. There is deliberately NO per-model price table
+#: (design §8); OpenRouter's returned per-request `cost` is the real path.
+OPENROUTER_PRICE_FALLBACK: Final[tuple[float, float, float]] = (10.0, 1.0, 30.0)
+
+_OPENROUTER_MODELS_URL: Final = "https://openrouter.ai/api/v1/models"
+_OR_MODELS_TTL: Final = 3600.0
+_or_models_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+
+def band_for_price(input_per_m: float) -> str:
+    """The ONE price→band map (design §2), used by the hire gate and the
+    switch door. `input_per_m` is OpenRouter's input $/M for the chosen
+    model; the band is the first whose INCLUSIVE ceiling it fits under, and
+    the open-ended `nova` catches the tail. A free model (price ≤ 0) lands in
+    `spark`. Overcharging inside a band is the safe direction (playbook §0)."""
+    for name, ceiling, _seat in OPENROUTER_BANDS:
+        if input_per_m <= ceiling:
+            return name
+    return OPENROUTER_BANDS[-1][0]  # unreachable: nova's ceiling is +inf
+
+
+def _openrouter_models_raw() -> list[dict[str, Any]]:
+    """The raw `/api/v1/models` array. An `ORGTREE_OPENROUTER_MODELS` env
+    override points at a local JSON file (the recon payload, either the whole
+    `{"data": [...]}` document or the bare array) so tests and offline runs
+    never touch the network — the same override shape the codex/gemini
+    resolvers give their binaries. No API key is needed for this endpoint."""
+    override = os.environ.get("ORGTREE_OPENROUTER_MODELS")
+    if override:
+        with open(override, encoding="utf-8") as f:
+            doc: dict[str, Any] | list[Any] = json.load(f)
+    else:
+        import httpx
+        r = httpx.get(_OPENROUTER_MODELS_URL,
+                      timeout=httpx.Timeout(15.0, connect=5.0))
+        r.raise_for_status()
+        doc = r.json()
+    rows: list[Any] = doc.get("data", []) if isinstance(doc, dict) else doc
+    return [m for m in rows if isinstance(m, dict)]
+
+
+def _trim_or_model(m: dict[str, Any]) -> dict[str, Any] | None:
+    """One `/models` entry → the picker's row, or None if it cannot run org
+    powers — no `"tools"` in `supported_parameters` (86 of 396 at recon are
+    filtered out here). `pricing.*` is a $/token string; ×1e6 for $/M."""
+    if "tools" not in (m.get("supported_parameters") or []):
+        return None
+    pricing: dict[str, Any] = m.get("pricing") or {}
+    try:
+        inp = float(pricing.get("prompt") or 0.0) * 1e6
+        out = float(pricing.get("completion") or 0.0) * 1e6
+    except (TypeError, ValueError):
+        inp = out = 0.0
+    reasoning: dict[str, Any] = m.get("reasoning") or {}
+    return {
+        "id": str(m.get("id") or ""),
+        "name": str(m.get("name") or m.get("id") or ""),
+        "input_per_M": round(inp, 4),
+        "output_per_M": round(out, 4),
+        "context_length": int(m.get("context_length") or 0),
+        "reasoning_efforts": list(reasoning.get("supported_efforts") or []),
+        "band": band_for_price(inp),
+    }
+
+
+def _or_models_disk() -> str:
+    return os.path.join(_DATA, "openrouter", "models.json")
+
+
+def openrouter_models(force: bool = False) -> list[dict[str, Any]]:
+    """The tool-capable OpenRouter catalogue for the model picker (D-OR-4),
+    trimmed to what the picker shows and cached ~1h in memory AND on disk
+    (the raw payload is ~1 MB / 396 rows). Served at
+    GET /api/providers/openrouter/models. Sorted cheapest-input first."""
+    global _or_models_cache
+    now = time.time()
+    if not force and _or_models_cache and now - _or_models_cache[0] < _OR_MODELS_TTL:
+        return _or_models_cache[1]
+    disk = _or_models_disk()
+    if not force:
+        try:
+            if now - os.path.getmtime(disk) < _OR_MODELS_TTL:
+                with open(disk, encoding="utf-8") as f:
+                    rows: list[dict[str, Any]] = json.load(f)
+                _or_models_cache = (now, rows)
+                return rows
+        except (OSError, json.JSONDecodeError):
+            pass
+    rows = [t for t in (_trim_or_model(m) for m in _openrouter_models_raw()) if t]
+    rows.sort(key=lambda r: (r["input_per_M"], r["id"]))
+    try:
+        os.makedirs(os.path.dirname(disk), exist_ok=True)
+        with open(disk, "w", encoding="utf-8") as f:
+            json.dump(rows, f)
+    except OSError:
+        pass
+    _or_models_cache = (now, rows)
+    return rows
+
+
+def band_for_slug(slug: str, *, force: bool = False) -> str | None:
+    """The band an OpenRouter model id lands in, from the live catalogue —
+    None if the slug is unknown OR not tool-capable (the hire gate, §5,
+    refuses both loudly). The companion to `band_for_price` — the price→band
+    knowledge stays in one module."""
+    for m in openrouter_models(force=force):
+        if m["id"] == slug:
+            return m["band"]
+    return None
+
+
+def openrouter_key(org_key: str | None = None) -> tuple[str | None, str]:
+    """(key, source) where source ∈ `"org"` | `"env"` | `""`. An explicit
+    per-org key wins; else `OPENROUTER_API_KEY` from the environment.
+
+    ⚠ The key STRING is returned for the turn runner's `api_key_provider`
+    (design §3) — it must never be logged, serialised, or put in a payload.
+    `openrouter_status` below surfaces only its PRESENCE."""
+    if org_key:
+        return org_key, "org"
+    env = os.environ.get("OPENROUTER_API_KEY")
+    if env:
+        return env, "env"
+    return None, ""
+
+
+_or_status_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def openrouter_status(force: bool = False) -> dict[str, Any]:
+    """Connect state for the accounts panel, cached 60s like the siblings —
+    but the payload is just `{"kind": "api-key", "connected": <bool>,
+    "source": ...}`: NO `installed` / `path` / `version` (⚠ deviation
+    D-OR-2 — "installed" has no meaning for a hosted API). No network here
+    either; a live `GET /key` check is a later P2 (design §8)."""
+    global _or_status_cache
+    now = time.time()
+    if not force and _or_status_cache and now - _or_status_cache[0] < 60:
+        return _or_status_cache[1]
+    key, source = openrouter_key()
+    st: dict[str, Any] = {
+        "kind": "api-key",
+        "connected": bool(key),
+        "source": source,
+    }
+    _or_status_cache = (now, st)
+    return st
+
+
+def openrouter_tiers() -> list[TierInfo]:
+    return [
+        {"tier": t, "provider": "openrouter", "seat": seat,
+         "model": OPENROUTER_MODELS[t], "letter": _OPENROUTER_LETTER[t]}
+        for t, seat in sorted(OPENROUTER_TIERS.items(), key=lambda kv: kv[1])
+    ]
+
+
+def openrouter_cost(token_usage: dict[str, Any] | None,
+                    cost: float | None) -> float:
+    """Dollars for one OpenRouter turn. `cost` is the runner's figure —
+    OpenRouter's own per-request `cost` summed across the turn's rounds
+    (design §4/§9); trust it when present. Only when it is None (the rare
+    response with `usage` but no `cost`) fall back to `tokens ×
+    OPENROUTER_PRICE_FALLBACK` — deliberately an OVER-estimate, because a
+    silent $0 is the Gemini rule's cardinal sin and there is no per-model
+    price table (design §8). `token_usage` is the runner's normalized
+    {input, cached, output, prompt}."""
+    if cost is not None:
+        return round(max(0.0, float(cost)), 6)
+    if not token_usage:
+        return 0.0
+    p_in, p_cache, p_out = OPENROUTER_PRICE_FALLBACK
+    inp = max(0, int(token_usage.get("input") or 0))
+    cached = max(0, int(token_usage.get("cached") or 0))
+    out = max(0, int(token_usage.get("output") or 0))
+    return round((inp * p_in + cached * p_cache + out * p_out) / 1e6, 6)
+
+
+def openrouter_occupancy(token_usage: dict[str, Any] | None) -> int:
+    """Context occupancy after the turn: the LAST request's prompt size. The
+    runner already keeps `prompt` as the last round's value (input+cache
+    combined would double-count and the summed-across-rounds figure is the
+    ~123% bug in another coat — same rule as codex_occupancy). 0 means "no
+    measurement" to `_after_turn`, never an empty context."""
+    if not token_usage:
+        return 0
+    return max(0, int(token_usage.get("prompt") or 0))
+
+
 def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
     """The /api/providers document. `claude_status` is composed by the API
     layer from state it already owns (accounts registry, cli_version) — this
     module never reaches into those, so it stays importable from anywhere."""
     codex = codex_status()
     gemini = gemini_status()
+    openrouter = openrouter_status()
     return {"providers": [
         {
             "id": "claude",
@@ -659,5 +911,24 @@ def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
                 if gemini.get("installed")
                 else "Gemini CLI not installed — npm install --prefix "
                      f"{os.path.join(_DATA, 'gemini')} @google/gemini-cli"),
+        },
+        {
+            "id": "openrouter",
+            # the product's own name (§0 naming) — not "OpenRouter API" or
+            # the upstream vendor a request happens to route to.
+            "label": PROVIDER_LABEL["openrouter"],
+            # no CLI — a hosted HTTP aggregator (⚠ D-OR-1/D-OR-2).
+            "cli": None,
+            "tiers": openrouter_tiers(),
+            "status": openrouter,
+            # a CONNECTED provider is a hireable one — the same predicate the
+            # api hire gate enforces (provider_hire_gate). D-OR-2: OpenRouter
+            # is keyed by construction, so "connected" == "an OPENROUTER_API_
+            # KEY is configured", and there is no headless special case.
+            "hire_enabled": bool(openrouter.get("connected")),
+            "reason": (
+                None if openrouter.get("connected")
+                else "no OPENROUTER_API_KEY — set it in the environment or "
+                     "as this org's API key"),
         },
     ]}

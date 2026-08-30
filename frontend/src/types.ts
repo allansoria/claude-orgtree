@@ -222,6 +222,8 @@ export interface TreeNode {
   title: string
   tier: string
   model_id: string
+  /** D-OR-3: actual OpenRouter id; absent on other providers/default bands. */
+  or_slug?: string | null
   state: NodeState
   seat: number
   grant: number
@@ -863,10 +865,11 @@ export interface ProviderTier {
 export interface ProviderInfo {
   id: string
   label: string
-  cli: string
+  cli: string | null
   tiers: ProviderTier[]
   status: {
-    installed: boolean
+    /** absent for hosted-API providers such as OpenRouter (D-OR-2) */
+    installed?: boolean
     version?: string | null
     path?: string | null
     /** how the CLI was found: 'env' | 'pin' | 'path' | '' */
@@ -881,6 +884,18 @@ export interface ProviderInfo {
   reason: string | null
 }
 export interface ProvidersPayload { providers: ProviderInfo[] }
+
+/** GET /api/providers/openrouter/models — tool-capable picker catalogue. */
+export interface OpenRouterModel {
+  id: string
+  name: string
+  input_per_M: number
+  output_per_M: number
+  context_length: number
+  reasoning_efforts: string[]
+  band: string
+}
+export interface OpenRouterModelsPayload { models: OpenRouterModel[] }
 
 /** one bar of the host subscription's rate-limit standing (GET /api/usage —
  *  the same readout Claude Code shows under /usage). `model` is the display
@@ -1059,6 +1074,8 @@ export interface OpRequest {
   node?: string | null
   parent?: string | null
   tier?: string | null
+  /** D-OR-3: OpenRouter model id; the backend derives `tier` from its price. */
+  model?: string | null
   grant?: number | null
   name?: string | null
   charter?: string | null

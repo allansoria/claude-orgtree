@@ -42,13 +42,23 @@ from .schema import (AudienceGrant, DirGrant, MailEntry, NodeDoc, NoticeEntry,
 # through ≥2026-11-21), terra $2, luna $0.20 → floors to 1. The gemini family
 # (D-188): pro $2 standard (the ≤200K band — the >200K long-context surcharge
 # is a cost-dollars concern, never a seat), flash $1.50 → floors to 1 and
-# STAYS 1 when the tier's default model moves to 3.7-flash ($0.38). Existing
-# orgs migrate in the load hook below IF they still carry the old shipped
-# default; a customised table keeps its own number. Tier names are ONE flat
-# vocabulary — a tier implies its provider (providers.py owns that axis).
+# STAYS 1 when the tier's default model moves to 3.7-flash ($0.38). The
+# OpenRouter family (design-openrouter.md §9, user-approved 2026-08-29): FIVE
+# static PRICE BANDS, not per-model rows — spark ≤$1/M→1, ember ≤$2→2,
+# flare ≤$5→5, blaze ≤$10→10, nova >$10→20. A hired node records the BAND
+# here and its chosen model id in `or_slug`; the band (hence the seat) is a
+# function of that model's OpenRouter input $/M and can move under
+# switch_model (⚠ D-OR-3). Seats 1/2/5/10 deliberately echo the other
+# families so the kiosk max_tier ranking stays legible across providers.
+# Existing orgs migrate in the load hook below IF they still carry the old
+# shipped default; a customised table keeps its own number. Tier names are
+# ONE flat vocabulary — a tier implies its provider (providers.py owns that
+# axis).
 TIERS: Final[dict[str, int]] = {"fable": 10, "opus": 5, "sonnet": 2, "haiku": 1,
                                 "sol": 5, "terra": 2, "luna": 1,
-                                "flash": 1, "pro": 2}
+                                "flash": 1, "pro": 2,
+                                "spark": 1, "ember": 2, "flare": 5,
+                                "blaze": 10, "nova": 20}
 
 # №34 runaway insurance, and NOTHING else (user ruling 2026-08-04): "no need to
 # have any practical limit other than to prevent infinite recursion from a bug
@@ -79,6 +89,15 @@ MODELS: Final[dict[str, str]] = {
     # day 3.7 lands (user-approved recommendation, 2026-08-29).
     "flash": "gemini-3.5-flash",
     "pro": "gemini-3.1-pro-preview-customtools",
+    # the OpenRouter family — the band's DEFAULT model id, used when a node
+    # carries no `or_slug` (design-openrouter.md §9). Ids exactly as
+    # /api/v1/models reports them. The user normally overrides this with the
+    # hire picker (D-OR-4); the default just keeps a band usable bare.
+    "spark": "google/gemini-2.5-flash",
+    "ember": "moonshotai/kimi-k2",
+    "flare": "openai/gpt-5",
+    "blaze": "anthropic/claude-sonnet-4.5",
+    "nova": "anthropic/claude-opus-4.1",
 }
 
 # A TIER is a price band — four of them, four chips. A model VERSION is a
@@ -2225,7 +2244,8 @@ class Org:
              add_dirs: list[Any] | None = None, tools: Mapping[str, Any] | None = None,
              org_visibility: str | None = None, charter: str | None = None,
              external_handles: list[str] | None = None,
-             raise_ceiling: bool = False) -> dict[str, Any]:
+             raise_ceiling: bool = False,
+             or_slug: str | None = None) -> dict[str, Any]:
         """§4.2 + §4.6. `parent` None = top level (actor must be USER). If actor is a
         strict ancestor of parent, credits cascade down the path (forcible hire).
 
@@ -2365,6 +2385,13 @@ class Org:
                                 raise_ceiling=raise_ceiling, warnings=warnings))
         nid = self._new_node(tier, parent, int(grant), name, dirs, tset, vis,
                              str(charter).strip() if charter else None)
+        # D-OR-3: `model` remains the price band; the selected OpenRouter
+        # model id is durable node state.  The API validates and derives the
+        # band, while the ledger owns storage for every caller.
+        if or_slug is not None:
+            from . import providers  # noqa: PLC0415 -- providers derives from ledger
+            if tier in providers.OPENROUTER_TIERS:
+                self.nodes[nid]["or_slug"] = str(or_slug)
         if handles:
             self.nodes[nid]["external_handles"] = handles
             stamp_handles(self.nodes[nid], handles)      # D-166
@@ -3147,7 +3174,8 @@ class Org:
         return {"deleted": sorted(doomed_set), "warnings": []}
 
     # ------------------------------------------------------------- reallocate
-    def switch_model(self, actor: str, nid: str, tier: str) -> dict[str, Any]:
+    def switch_model(self, actor: str, nid: str, tier: str,
+                     or_slug: str | None = None) -> dict[str, Any]:
         """User spec: swap an agent's model ON THE FLY, mid-life — the session
         survives (№16: --resume honors a changed --model; the next turn runs
         the new model). CHEAPER: the seat difference melts into the node's own
@@ -3166,7 +3194,21 @@ class Org:
             if not self.is_ancestor(actor, nid):
                 raise LedgerError("model switches cover your own subtree only")
         old = n["model"]
+        from . import providers  # noqa: PLC0415 -- providers derives from ledger
+        new_is_openrouter = tier in providers.OPENROUTER_TIERS
         if tier == old:
+            # A different slug inside the same price band is a real,
+            # budget-neutral model switch (D-OR-3), not the tier no-op below.
+            if new_is_openrouter and or_slug is not None:
+                prior = n.get("or_slug")
+                n["or_slug"] = str(or_slug)
+                if prior != or_slug:
+                    self._log("switch_model", actor,
+                              {"node": nid, "from": old, "to": tier,
+                               "or_slug": str(or_slug)}, [])
+                    return {"model": tier, "or_slug": str(or_slug),
+                            "seat": self.d["tiers"][tier], "freed": 0,
+                            "warnings": []}
             # design motto: asking for what's already true is a no-op, not an error
             return {"model": tier, "seat": self.d["tiers"][tier], "freed": 0,
                     "warnings": [f"{nid} already runs {tier} — nothing to do"]}
@@ -3203,6 +3245,14 @@ class Org:
             n["model"] = tier
             # runtime int: own = min(free, delta), both int-valued for a real node
             n["grant"] -= cast(int, own)   # holding grows by exactly the shortfall
+        # A slug belongs to exactly one OpenRouter band. Crossing bands with
+        # no explicit slug means "use that band's default"; leaving the
+        # provider also clears the provider-specific field.
+        if new_is_openrouter and or_slug is not None:
+            n["or_slug"] = str(or_slug)
+        else:
+            n.pop("or_slug", None)
+
         # D-196: a switch that CROSSES PROVIDERS cannot keep the session, and
         # must not pretend to. `session_id` holds a provider-owned handle — a
         # codex threadId, a gemini ACP sessionId, a Claude session uuid — and
@@ -3254,8 +3304,14 @@ class Org:
         self._notify([x for x in [n["parent"]] if x not in (actor, None)],
                      f'{who.capitalize()} switched "{nid}" {old}→{tier}.')
         self._log("switch_model", actor,
-                  {"node": nid, "from": old, "to": tier}, warnings)
-        return {"model": tier, "seat": self.d["tiers"][tier],
+                  {"node": nid, "from": old, "to": tier,
+                   **({"or_slug": str(or_slug)}
+                      if new_is_openrouter and or_slug is not None else {})},
+                  warnings)
+        return {"model": tier,
+                **({"or_slug": str(or_slug)}
+                   if new_is_openrouter and or_slug is not None else {}),
+                "seat": self.d["tiers"][tier],
                 "freed": max(0, -delta), "warnings": warnings}
 
     def reallocate(self, actor: str, nid: str, delta: int) -> dict[str, Any]:
@@ -6419,7 +6475,9 @@ class Org:
                 "id": nid,
                 "title": n["title"],
                 "tier": n["model"],
-                "model_id": self.d["models"].get(n["model"], n["model"]),
+                "model_id": (n.get("or_slug")
+                             or self.d["models"].get(n["model"], n["model"])),
+                "or_slug": n.get("or_slug"),
                 "state": n["state"],
                 "seat": self.d["tiers"][n["model"]],
                 "grant": n["grant"],

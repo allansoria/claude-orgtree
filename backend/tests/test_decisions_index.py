@@ -248,7 +248,12 @@ def sec_namespace() -> None:
     print("\n§4  the citation form, and why it is not wider")
 
     def _short_form_is_someone_elses():
-        docket = os.path.join(REPO, "docs", "interim-docket.md")
+        # the interim docket's CONTENT moved under docs/history/ in the docs
+        # reorg (de50844); docs/interim-docket.md is now a stub pointer. The
+        # D-NN series it defined still lives, just one directory down.
+        docket = os.path.join(REPO, "docs", "history", "interim-docket.md")
+        if not os.path.exists(docket):
+            docket = os.path.join(REPO, "docs", "interim-docket.md")
         _true(os.path.exists(docket), "interim-docket.md is gone — re-derive "
                                       "the namespace split before trusting §2")
         text = open(docket, encoding="utf-8", errors="replace").read()

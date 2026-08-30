@@ -25,15 +25,18 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type {
-  AccountsPayload, AccountUsage, ProviderInfo, TierStanding, ToastFn,
+  AccountsPayload, AccountUsage, OpenRouterModel, ProviderInfo, TierStanding, ToastFn,
   UsageLimit,
 } from '../types'
 import {
   addAccountKey, deleteAccountKey, getAccounts, getAccountUsage,
-  getProviders, setAccountKeyOrder,
+  getOpenRouterModels, getProviders, setAccountKeyOrder,
 } from '../api'
 import { CheckIcon, DataUsageIcon, DeleteIcon } from '../icons'
-import { TIER_LETTER, TIERS, useEsc } from './shared'
+import {
+  OPENROUTER_TIER_LETTER, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS,
+  TIER_LETTER, TIERS, useEsc,
+} from './shared'
 
 // small local copies of the usage-modal label helpers (App.tsx owns the
 // originals beside UsageModal; importing them here would cycle App ↔ panel)
@@ -156,6 +159,92 @@ export function UsageBars({ u }: { u: AccountUsage }) {
   )
 }
 
+const money = (n: number): string => n < 0.01 ? n.toFixed(4)
+  : n < 1 ? n.toFixed(2) : n.toFixed(2)
+const contextLabel = (n: number): string => n >= 1_000_000
+  ? `${(n / 1_000_000).toFixed(n % 1_000_000 ? 1 : 0)}M`
+  : `${Math.round(n / 1000)}k`
+
+/** D-OR-4's reusable picker. It lives with the provider sections but is used
+ *  by both hire surfaces and NodeConfig; those callers supply `onChoose`, so
+ *  selecting a row reaches the existing hire/switch endpoint with `model`.
+ *  The accounts panel mounts it without `onChoose` as a read-only catalogue. */
+export function OpenRouterModelPicker({ current, initialBand, onChoose, close }: {
+  current?: string | null
+  initialBand?: string | null
+  onChoose?: (model: OpenRouterModel) => void
+  close: () => void
+}) {
+  const [models, setModels] = useState<OpenRouterModel[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [query, setQuery] = useState('')
+  const [band, setBand] = useState<string | null>(initialBand ?? null)
+  useEffect(() => {
+    getOpenRouterModels()
+      .then((r) => { setModels(r.models); setError(null) })
+      .catch((e: Error) => setError(e.message))
+  }, [])
+  const currentRow = models?.find((m) => m.id === current)
+  const activeBand = band ?? currentRow?.band ?? null
+  const q = query.trim().toLowerCase()
+  const shown = (models ?? []).filter((m) =>
+    (!activeBand || m.band === activeBand)
+    && (!q || `${m.name} ${m.id}`.toLowerCase().includes(q)))
+  return (
+    <div className="overlay or-picker-overlay" onClick={close}
+      onPointerDown={(e) => e.stopPropagation()}>
+      <div className="settings or-picker" onClick={(e) => e.stopPropagation()}>
+        <h3>OpenRouter model</h3>
+        <div className="or-band-row" aria-label="OpenRouter price bands">
+          {OPENROUTER_TIERS.map((t) => (
+            <button key={t} type="button"
+              className={'or-band t-' + t + (activeBand === t ? ' on' : '')}
+              title={`${t} · seat ${OPENROUTER_TIER_SEAT[t]}`}
+              onClick={() => setBand(activeBand === t ? null : t)}>
+              <span className={'tier t-' + t}>{OPENROUTER_TIER_LETTER[t]}</span>
+              {t}</button>
+          ))}
+        </div>
+        <input autoFocus className="or-search" type="search"
+          placeholder="search model name or id…" value={query}
+          onChange={(e) => setQuery(e.target.value)} />
+        {error && <div className="ask-warn">could not read models: {error}</div>}
+        {!models && !error && <div className="dim">reading models…</div>}
+        {models && (
+          <div className="or-model-list">
+            {shown.map((m) => {
+              const detail = <>
+                <span className="or-model-main">
+                  <b>{m.name}</b><span className="mono dim">{m.id}</span>
+                </span>
+                <span className="or-model-price">
+                  ${money(m.input_per_M)} in · ${money(m.output_per_M)} out /M
+                </span>
+                <span className="or-model-context">{contextLabel(m.context_length)} ctx</span>
+                <span className="or-model-reason">
+                  reasoning {m.reasoning_efforts.length
+                    ? m.reasoning_efforts.join('/') : 'no'}</span>
+                <span className={'tier t-' + m.band}>
+                  {OPENROUTER_TIER_LETTER[m.band]}</span>
+              </>
+              return onChoose
+                ? <button type="button" key={m.id}
+                    className={'or-model-row' + (m.id === current ? ' on' : '')}
+                    onClick={() => { onChoose(m); close() }}>{detail}</button>
+                : <div key={m.id}
+                    className={'or-model-row browse' + (m.id === current ? ' on' : '')}>
+                    {detail}</div>
+            })}
+            {!shown.length && <div className="dim or-empty">no matching tool-capable models</div>}
+          </div>
+        )}
+        <div className="row"><span style={{ flex: 1 }} />
+          <button type="button" onClick={close}>close</button></div>
+      </div>
+    </div>
+  )
+}
+
 export function AccountsPanel({ toast, close }: {
   toast: ToastFn
   close: () => void
@@ -174,6 +263,7 @@ export function AccountsPanel({ toast, close }: {
   // pre-drag null and silently do nothing. The state twin is styling only.
   const dragRef = useRef<string | null>(null)
   const [overId, setOverId] = useState<string | null>(null)
+  const [orBrowseBand, setOrBrowseBand] = useState<string | null>(null)
 
   const load = () => getAccounts().then((d) => { setData(d); setErr(null) })
     .catch((e: Error) => setErr(e.message))
@@ -189,6 +279,7 @@ export function AccountsPanel({ toast, close }: {
   const claudeProv = providers?.find((p) => p.id === 'claude')
   const codex = providers?.find((p) => p.id === 'openai')
   const gemini = providers?.find((p) => p.id === 'google')
+  const openrouter = providers?.find((p) => p.id === 'openrouter')
   const srcLabel: Record<string, string> = {
     pin: 'private pin', env: 'ORGTREE_CODEX', path: 'on PATH',
   }
@@ -498,6 +589,26 @@ export function AccountsPanel({ toast, close }: {
                   && <div className="dim acct-prov-note">{gemini.reason}</div>}
               </>
             )}
+
+            {/* D-OR-2/D-OR-4: hosted API, so there are deliberately no
+                install/version/path/source lines. The chips are price bands;
+                clicking one opens the searchable tool-capable catalogue. */}
+            <div className="acct-provider-head prov-openrouter">
+              OpenRouter — {openrouter?.status.connected
+                ? 'API key set' : 'API key not set'}
+            </div>
+            <div className="acct-prov-tiers or-account-bands">
+              {OPENROUTER_TIERS.map((t) => (
+                <button type="button" key={t} className="acct-prov-tier"
+                  title={`browse ${t} models · seat ${OPENROUTER_TIER_SEAT[t]}`}
+                  onClick={() => setOrBrowseBand(t)}>
+                  <span className={'tier t-' + t}>{OPENROUTER_TIER_LETTER[t]}</span>
+                  {t} · seat {OPENROUTER_TIER_SEAT[t]}
+                </button>
+              ))}
+            </div>
+            {openrouter?.reason
+              && <div className="dim acct-prov-note">{openrouter.reason}</div>}
           </>
         )}
 
@@ -525,6 +636,8 @@ export function AccountsPanel({ toast, close }: {
             </div>
           </div>
         )}
+        {orBrowseBand && <OpenRouterModelPicker initialBand={orBrowseBand}
+          close={() => setOrBrowseBand(null)} />}
       </div>
     </div>
   )

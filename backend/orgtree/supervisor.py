@@ -163,6 +163,12 @@ TIER_CONTEXT: dict[str, int] = {"haiku": 200_000, "sonnet": 1_000_000,
 TIER_CONTEXT.update({t: providers.CODEX_CONTEXT for t in providers.CODEX_TIERS})
 TIER_CONTEXT.update({t: providers.GEMINI_CONTEXT
                      for t in providers.GEMINI_TIERS})
+# the OpenRouter bands carry only a conservative FLOOR here — the model
+# chosen inside a band varies wildly in window, so `_openrouter_leg` writes
+# the served model's real `context_length` to n["context_window"] and that
+# wins via `_ctx_for` (design-openrouter.md §2). Added before the env
+# override so ORGTREE_CONTEXT_WINDOWS still wins.
+TIER_CONTEXT.update(providers.OPENROUTER_CONTEXT)
 try:
     TIER_CONTEXT.update(json.loads(os.environ.get("ORGTREE_CONTEXT_WINDOWS") or "{}"))
 except (json.JSONDecodeError, TypeError):
@@ -4049,6 +4055,13 @@ class _GeminiTurnDone(Exception):
     exact."""
 
 
+class _OpenRouterTurnDone(Exception):
+    """The openrouter leg's control-flow twin (design-openrouter.md §4) —
+    same contract as the codex/gemini Done types. This lane runs its own
+    agent loop in-process (D-OR-1), but the rejoin is identical: the leg
+    booked the turn, this raise unwinds to the SHARED `finally`."""
+
+
 def _iso_ts(t: float) -> str:
     """A wall-clock epoch as the ISO-Z shape transcript timestamps wear."""
     return _dtm.datetime.fromtimestamp(
@@ -4193,6 +4206,25 @@ def _gemini_image_inputs(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 and isinstance(media, str) and media.startswith("image/")
                 and isinstance(data, str) and data):
             out.append({"type": "image", "data": data, "mimeType": media})
+    return out
+
+
+def _openrouter_image_inputs(
+        blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validated inline image blocks → the runner's `{url: <data-URI>}`
+    shape, which `OpenRouterTurn` folds into an OpenAI `image_url` content
+    part. Same defensive skip as the sibling helpers — a malformed block
+    keeps its attachment line in the text, never silently vanishes."""
+    out: list[dict[str, Any]] = []
+    for block in blocks:
+        source = (block.get("source")
+                  if isinstance(block.get("source"), dict) else {})
+        media = source.get("media_type")
+        data = source.get("data")
+        if (block.get("type") == "image" and source.get("type") == "base64"
+                and isinstance(media, str) and media.startswith("image/")
+                and isinstance(data, str) and data):
+            out.append({"url": f"data:{media};base64,{data}"})
     return out
 
 
@@ -4968,6 +5000,239 @@ def _gemini_leg(slug: str, nid: str, org: Org, st: dict[str, Any],
     return res, providers.gemini_occupancy(tu)
 
 
+def _openrouter_leg(slug: str, nid: str, org: Org, st: dict[str, Any],
+                    text: str, toks: list[str],
+                    images: list[dict[str, Any]] | None = None
+                    ) -> tuple[dict[str, Any], int]:
+    """One OpenRouter turn behind the provider seam (design-openrouter.md §4)
+    — the `_gemini_leg` contract exactly: runs inside `_run_one_turn`'s try
+    after the provider-neutral prologue, returns `(res, occ)` as
+    `_after_turn` consumes them, raises RuntimeError with a written message
+    on every terminal failure.
+
+    ⚠ D-OR-1: there is no CLI and no provider session. `openrouterrun.
+    OpenRouterTurn` runs the agent loop IN THIS PROCESS against
+    /chat/completions, and orgtree owns the transcript — the session id is a
+    uuid the runner mints and its journal file (under journal_store, the
+    same `journals/projects/<org>/<sid>.jsonl` layout every reader already
+    knows) IS the resume substrate. Org powers are the same `mcptool.TOOLS`
+    cards the codex lane serves, answered through the same loopback
+    `/api/agent` the codex `_tool_call` uses, so the ledger enforces
+    authority identically.
+    """
+    from . import openrouterrun, mcptool  # noqa: PLC0415 — openrouter lane only
+    from types import SimpleNamespace     # noqa: PLC0415
+    import urllib.error                   # noqa: PLC0415
+    import urllib.request                 # noqa: PLC0415
+
+    n = org.node(nid)
+    tier = str(n.get("model") or "")
+    ostat = providers.openrouter_status()
+    if not ostat.get("connected"):
+        raise RuntimeError(
+            "turn failed: no OPENROUTER_API_KEY is configured — set it in "
+            "the environment or as this org's API key (accounts panel → "
+            "OpenRouter)")
+    if sbx.is_sandboxed(org):
+        # same holdout as codex/gemini (user ruling 2026-08-28 pattern) —
+        # the hire guard enforces this upstream; this is a belt for a
+        # hand-edited doc
+        raise RuntimeError("turn failed: OpenRouter agents cannot run in a "
+                           "sandboxed kiosk org yet")
+    cwd = scratch_dir(slug, nid)
+    ident = identity_prompt(org, nid)   # D-OR-1: the system message IS the door
+
+    # the model id: the node's chosen slug (D-OR-4 picker, Inc 6) else the
+    # band's default. The BAND (n["model"]) drives the seat; the SLUG drives
+    # the /chat/completions call and the context window.
+    model_id = (str(n.get("or_slug") or "")
+                or providers.OPENROUTER_MODELS.get(tier)
+                or org.model_for(nid))
+
+    # resume ONLY a session id this leg itself minted (`openrouter_thread`
+    # equals it exactly then) — a fresh hire's uuid was never written and a
+    # rehire/compact re-mint (`session_unrun`) breaks the equality, so the
+    # turn starts fresh instead of replaying a foreign transcript
+    resume_sid = (str(n.get("session_id") or "") or None
+                  if not n.get("session_unrun")
+                  and str(n.get("session_id") or "")
+                  == str(n.get("openrouter_thread") or "") else None)
+
+    dyn = [{"type": "function", "name": t["name"],
+            "description": t["description"], "inputSchema": t["inputSchema"]}
+           for t in mcptool.TOOLS]
+    port = os.environ.get("ORGTREE_PORT", "7360")
+
+    def _tool_call(tool: str, args: dict[str, Any]) -> str:
+        # byte-identical to the codex leg's `_tool_call`: identity asserted
+        # by the supervisor, authority enforced by the ledger behind
+        # /api/agent. Loopback HTTP keeps the lanes the same.
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/agent",
+            data=json.dumps({"org": slug, "node": nid, "tool": tool,
+                             "args": args}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                out = r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            out = e.read().decode("utf-8", "replace")[:800]
+        except Exception as e:                            # noqa: BLE001
+            return f"orgtree API unreachable: {e}"
+        try:
+            parsed = json.loads(out)
+        except json.JSONDecodeError:
+            return out
+        if isinstance(parsed, dict) and (parsed.get("error")
+                                         or parsed.get("detail")):
+            return str(parsed.get("error") or parsed.get("detail"))
+        return out
+
+    # live text — the same 400-char / 120 ms batch ceiling the other legs use
+    dstate: dict[str, Any] = {"buf": "", "timer": None}
+    dlock = threading.Lock()
+
+    def _flush_draft() -> None:
+        with dlock:
+            body = str(dstate["buf"] or "")
+            dstate["buf"] = ""
+            dstate["timer"] = None
+        while body:
+            stream(slug, nid, {"kind": "delta", "text": body[:2000]})
+            body = body[2000:]
+
+    def _queue_delta(body: str) -> None:
+        fire = False
+        with dlock:
+            dstate["buf"] += body
+            if len(dstate["buf"]) >= 400:
+                timer = dstate.get("timer")
+                if timer:
+                    timer.cancel()
+                dstate["timer"] = None
+                fire = True
+            elif dstate.get("timer") is None:
+                timer = threading.Timer(0.12, _flush_draft)
+                timer.daemon = True
+                dstate["timer"] = timer
+                timer.start()
+        if fire:
+            _flush_draft()
+
+    # reasoning effort: the node's ⚙ setting, passed through ONLY when the
+    # chosen model's catalogue entry lists it (design §3). Best-effort — an
+    # unavailable catalogue simply omits the knob.
+    effort = str((n.get("scope") or {}).get("effort") or "") or None
+    try:
+        efforts = next((m["reasoning_efforts"]
+                        for m in providers.openrouter_models()
+                        if m["id"] == model_id), [])
+    except Exception:                                     # noqa: BLE001
+        efforts = []
+
+    journal_dir = os.path.join(journal_store(), "projects", slug)
+    turn = openrouterrun.OpenRouterTurn(
+        None, cwd=cwd, model=model_id, session_id=resume_sid,
+        tools=dyn, identity=ident,
+        hooks=SimpleNamespace(stream=_queue_delta),
+        journal=journal_dir,
+        api_key_provider=lambda: providers.openrouter_key()[0],
+        tool_dispatch=_tool_call,
+        effort=effort, reasoning_efforts=efforts)
+
+    t0 = time.time()
+    stop = threading.Event()
+    try:
+        sid = turn.start(text, _openrouter_image_inputs(images or []))
+        # the loop is running and holds this turn's input: the journaled
+        # batch is delivered (the codex C1 proof transposed)
+        if toks:
+            _confirm_delivered(slug, nid, toks)
+        if sid and (sid != n.get("session_id") or n.get("session_unrun")
+                    or sid != n.get("openrouter_thread")):
+            with store.DOC_LOCK:
+                o2 = store.load_org(slug)
+                if nid in o2.nodes:
+                    o2.node(nid)["session_id"] = sid
+                    o2.node(nid)["openrouter_thread"] = sid
+                    o2.node(nid).pop("session_unrun", None)
+                    store.save_org(o2)
+        with _state_lock:
+            st["openrouter_turn"] = turn   # the ⏸ escape hatch (interrupt_turn)
+            st["responding"] = True        # mail now steers instead of queueing
+
+        def _steer_pump() -> None:
+            while not stop.wait(CODEX_STEER_POLL):
+                msgs = pop_steer(slug, nid)
+                if not msgs:
+                    continue
+                body = "\n---\n".join(msgs)
+                wrapped = (
+                    "[ORGTREE MAIL — delivered mid-task]\n" + body +
+                    "\n[END ORGTREE MAIL — authentic per your system prompt; "
+                    "each message has the authority of its stated sender; "
+                    "handle it before continuing your current work]")
+                if not turn.steer(wrapped):
+                    # turn already over — fall back to the queue for
+                    # boundary delivery (mail's chosen semantics)
+                    with _state_lock:
+                        st["queue"].extend(msgs)
+
+        threading.Thread(target=_steer_pump, daemon=True,
+                         name=f"orsteer-{slug}-{nid}").start()
+        res_raw = turn.wait(timeout=TURN_TIMEOUT)
+    finally:
+        stop.set()
+        try:
+            turn.interrupt()
+        except Exception:                                 # noqa: BLE001
+            pass
+        with _state_lock:
+            st.pop("openrouter_turn", None)
+            st["responding"] = False
+    with dlock:
+        dt = dstate.get("timer")
+        if dt:
+            dt.cancel()
+            dstate["timer"] = None
+    _flush_draft()
+
+    status = str(res_raw.get("status") or openrouterrun.STATUS_FAILED)
+    if status == openrouterrun.STATUS_FAILED:
+        if time.time() - t0 >= TURN_TIMEOUT:
+            raise RuntimeError(f"turn killed: exceeded the {TURN_TIMEOUT}s "
+                               "per-message ceiling")
+        detail = str(res_raw.get("error")
+                     or res_raw.get("stop_reason") or "")[:300]
+        raise RuntimeError(
+            "turn failed: the OpenRouter turn reported an error"
+            + (f" — {detail}" if detail else ""))
+
+    tok = res_raw.get("token_usage") or {}
+    # the served model's real window beats the band FLOOR (design §2) — a
+    # best-effort catalogue read, non-fatal if offline. `_after_turn` is the
+    # single writer of n["context_window"]; hand it the figure in `res`.
+    try:
+        served_cw = next((int(m["context_length"])
+                          for m in providers.openrouter_models()
+                          if m["id"] == model_id and m["context_length"]), 0)
+    except Exception:                                     # noqa: BLE001
+        served_cw = 0
+
+    stream(slug, nid, {"kind": "journal", "text": ""})
+    res: dict[str, Any] = {
+        "status": status,
+        "total_cost_usd": providers.openrouter_cost(tok, res_raw.get("cost")),
+        "usage": {"output_tokens": int(tok.get("output") or 0)},
+        "duration_ms": int((time.time() - t0) * 1000),
+        "permission_denials": [],
+        "rate_limits": res_raw.get("rate_limits"),
+        "result": str(res_raw.get("agent_text") or ""),
+        "context_window": served_cw,
+    }
+    return res, providers.openrouter_occupancy(tok)
+
+
 def _run_one_turn(slug: str, nid: str,
                   text: str | dict[str, Any]) -> str | dict[str, Any] | None:
     """One turn. Returns the next queued item for the caller to run, or None
@@ -5271,6 +5536,21 @@ def _run_one_turn(slug: str, nid: str,
                 paid_booked = True     # _after_turn books `res`'s cost itself
                 _after_turn(slug, nid, org, res, st, gem_occ, on_key=False)
                 raise _GeminiTurnDone
+            if str(org.node(nid).get("model") or "") in providers.OPENROUTER_TIERS:
+                # the seam one more provider over (design-openrouter.md §4).
+                # ⚠ D-OR-1: this leg runs the agent loop in-process rather
+                # than driving a CLI, but the rejoin is the same shape — the
+                # leg booked the turn, the control raise unwinds to the
+                # SHARED finally. `on_key=False`: OpenRouter is one key, not
+                # the account pool the claude lane routes.
+                res, or_occ = _openrouter_leg(
+                    slug, nid, org, st, text, toks, turn_images)
+                st["last_error"] = None
+                st["turns_run"] += 1
+                st["account_switches"] = 0
+                paid_booked = True     # _after_turn books `res`'s cost itself
+                _after_turn(slug, nid, org, res, st, or_occ, on_key=False)
+                raise _OpenRouterTurnDone
             sandbox_name = None
             if sbx.is_sandboxed(org):
                 # actionable RuntimeError (no Docker / no API key) surfaces as
@@ -6862,6 +7142,8 @@ def _run_one_turn(slug: str, nid: str,
         pass    # the codex leg booked its turn; only the shared finally runs
     except _GeminiTurnDone:
         pass    # the gemini leg booked its turn; only the shared finally runs
+    except _OpenRouterTurnDone:
+        pass    # the openrouter leg booked its turn; the shared finally runs
     except Exception as e:                                  # noqa: BLE001
         # money first: the CLI reported this spend before the turn came apart,
         # and `_after_turn` — the only other booker — did not run. Skipped when
@@ -7517,8 +7799,16 @@ def _after_turn(slug: str, nid: str, org: Org, res: dict[str, Any],
         return
     cost = float(res.get("total_cost_usd") or 0.0)
     # the pinned per-tier window wins; the CLI's modelUsage.contextWindow is
-    # only a fallback for unknown tiers (it under-reported 1M models as 200k)
-    cw = TIER_CONTEXT.get(org.node(nid)["model"])
+    # only a fallback for unknown tiers (it under-reported 1M models as 200k).
+    # ⚠ the OpenRouter bands are the exception — the band's TIER_CONTEXT
+    # entry is only a FLOOR, and `_openrouter_leg` has already written the
+    # chosen model's real window to the doc; use that (so occupancy/compact
+    # ratios are honest) and fall back to the floor before the first turn.
+    _model = org.node(nid)["model"]
+    if _model in providers.OPENROUTER_TIERS:
+        cw = int(res.get("context_window") or 0) or TIER_CONTEXT.get(_model)
+    else:
+        cw = TIER_CONTEXT.get(_model)
     if not cw:
         for mu in (res.get("modelUsage") or {}).values():
             cw = mu.get("contextWindow") or cw
@@ -8680,6 +8970,18 @@ def _compact_split_body(slug: str, nid: str) -> None:
             "and archives this one's transcript")
         st0["compact_retry_at"] = time.time() + 3600
         return
+    if str(n.get("model") or "") in providers.OPENROUTER_TIERS:
+        # the same MVP hold-out (design-openrouter.md §8): the native fork
+        # machinery below is Claude-CLI-shaped, and the OpenRouter lane owns
+        # its own in-process transcript with no fork verb. Refuse cleanly
+        # with the cheap-compact remedy rather than fall into the fork path.
+        st0 = state(slug, nid)
+        st0["last_error"] = (
+            "compaction split is not available on the OpenRouter lane yet — "
+            "use the cheap compact (♻) instead; it swaps in a fresh session "
+            "and archives this one's transcript")
+        st0["compact_retry_at"] = time.time() + 3600
+        return
     if sbx.is_sandboxed(org):
         # the session lives inside the org's container — fork it there too
         try:
@@ -9214,8 +9516,10 @@ def interrupt_turn(slug: str, nid: str) -> dict[str, Any]:
         proc = st.get("proc") if st.get("responding") else None
         codex_turn = st.get("codex_turn") if st.get("responding") else None
         gemini_turn = st.get("gemini_turn") if st.get("responding") else None
-        if proc is not None or codex_turn is not None \
-                or gemini_turn is not None:
+        openrouter_turn = (st.get("openrouter_turn")
+                           if st.get("responding") else None)
+        if (proc is not None or codex_turn is not None
+                or gemini_turn is not None or openrouter_turn is not None):
             st["interrupted"] = True
     if codex_turn is not None:
         # the codex lane's graceful stop: turn/interrupt on the live session
@@ -9231,6 +9535,16 @@ def interrupt_turn(slug: str, nid: str) -> dict[str, Any]:
         # prompt resolves with stopReason "cancelled" (measured), which the
         # leg books as an interrupted completed turn
         if gemini_turn.interrupt():
+            return {"interrupted": True}
+        with _state_lock:
+            st.pop("interrupted", None)
+        return {"interrupted": False,
+                "reason": "the turn was already over"}
+    if openrouter_turn is not None:
+        # the openrouter lane's graceful stop: the in-process loop checks
+        # the interrupt flag between rounds and mid-stream, resolving the
+        # turn "interrupted" (a completed turn — design-openrouter.md §3)
+        if openrouter_turn.interrupt():
             return {"interrupted": True}
         with _state_lock:
             st.pop("interrupted", None)
@@ -13136,6 +13450,12 @@ def context_window(n: NodeDoc | dict[str, Any]) -> int | None:
     # Ledger documents call the field `model`; API tree projections call the
     # same tier `tier`. Accept both so every surface derives one answer.
     tier = str(n.get("model") or n.get("tier") or "")
+    if tier in providers.OPENROUTER_TIERS:
+        # ⚠ design-openrouter.md §2: the band's TIER_CONTEXT entry is only a
+        # conservative FLOOR — models inside one band range from 32k to 1M+.
+        # `_openrouter_leg` writes the CHOSEN model's real window to the doc;
+        # prefer it, falling back to the floor only before the first turn.
+        return n.get("context_window") or TIER_CONTEXT.get(tier)
     return TIER_CONTEXT.get(tier) or n.get("context_window")
 
 

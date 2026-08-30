@@ -225,9 +225,10 @@ def main():
     providers.gemini_status(force=True)
     providers.codex_status(force=True)
     pay = providers.providers_payload({"installed": True, "connected": True})
-    check("three providers, claude first, gemini (id google) last",
+    check("providers in order, claude first, gemini (id google) before "
+          "openrouter (the HTTP provider, D-OR-1)",
           lambda: eq([p["id"] for p in pay["providers"]],
-                     ["claude", "openai", "google"], "order"))
+                     ["claude", "openai", "google", "openrouter"], "order"))
     gem = next(p for p in pay["providers"] if p["id"] == "google")
     check("the label is the CLI's product name, 'Gemini', cli 'Gemini CLI'",
           lambda: eq((gem["label"], gem["cli"]), ("Gemini", "Gemini CLI"),
