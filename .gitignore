@@ -12,3 +12,6 @@ hub/.env
 
 # machine-local secrets (OpenRouter recon, GitHub token)
 .env
+
+# run.ps1 detached-server pid tracking
+.run-pids
