@@ -229,18 +229,25 @@ def main():
           lambda: eq((claude["hire_enabled"], claude["status"]["installed"]),
                      (True, True), "claude entry"))
 
-    print("§5 the openrouter axis (design-openrouter.md, provider #4) — DATA "
-          "only until the runner + hire gate land (§4/§5)")
+    print("§5 the openrouter axis (design-openrouter.md, provider #4) — "
+          "LEDGER-hireable since hire enablement (§5)")
     # the price→band map: inclusive edges, open-ended nova, free ⇒ spark.
     check("band_for_price walks the five inclusive bands, nova catches the tail",
           lambda: eq([providers.band_for_price(x) for x in
                       (0.0, 0.5, 1.0, 1.01, 2.0, 5.0, 9.99, 10.0, 10.01, 999.0)],
                      ["spark", "spark", "spark", "ember", "ember", "flare",
                       "blaze", "blaze", "nova", "nova"], "bands"))
-    check("OPENROUTER_TIERS is the five static price-band seats",
+    check("OPENROUTER_TIERS is the five price-band seats, DERIVED from "
+          "ledger.TIERS (not a second copy)",
+          lambda: eq((providers.OPENROUTER_TIERS,
+                      providers.OPENROUTER_MODELS),
+                     ({t: TIERS[t] for t in providers.OPENROUTER_TIER_NAMES},
+                      {t: MODELS[t] for t in providers.OPENROUTER_TIER_NAMES}),
+                     "derived views"))
+    check("…and the derived seats still match the OPENROUTER_BANDS edges",
           lambda: eq(providers.OPENROUTER_TIERS,
-                     {"spark": 1, "ember": 2, "flare": 5, "blaze": 10,
-                      "nova": 20}, "seats"))
+                     {n: seat for n, _c, seat in providers.OPENROUTER_BANDS},
+                     "band/seat agreement"))
     check("OPENROUTER_TIER_NAMES is the flat ascending vocabulary",
           lambda: eq(tuple(providers.OPENROUTER_TIER_NAMES),
                      ("spark", "ember", "flare", "blaze", "nova"), "names"))
@@ -290,14 +297,25 @@ def main():
                       providers.band_for_slug("some/embedding-model")),
                      ("flare", None, None), "slug→band"))
 
-    # the negative invariant the codex axis shipped behind: nothing
-    # budget-bearing knows the tiers yet, so a hire is refused as unknown.
-    check("preview era: OpenRouter tiers are NOT in ledger.TIERS",
-          lambda: eq([t in TIERS for t in providers.OPENROUTER_TIER_NAMES],
-                     [False] * 5, "not budget-bearing"))
-    check("…so hiring 'flare' is refused with the same 'unknown tier' as junk",
-          lambda: raises(lambda: org.hire(USER, top, "flare", 0, "x-or"),
-                         "unknown tier", "flare refused"))
+    # FLIPPED at hire enablement (§5): the OpenRouter bands are now IN the
+    # budget-bearing tables, so a bare ledger hire works and prices the seat
+    # from the band — the connected-provider gate is api.py's
+    # (provider_hire_gate, exercised in its own suite).
+    check("OpenRouter bands ARE in ledger.TIERS with the price-band seats",
+          lambda: eq({t: TIERS.get(t) for t in providers.OPENROUTER_TIER_NAMES},
+                     {"spark": 1, "ember": 2, "flare": 5, "blaze": 10,
+                      "nova": 20}, "band rows"))
+    check("a 'flare' hire is a plain ledger hire, seat 5",
+          lambda: eq((org.hire(USER, top, "flare", 0, "x-or") and
+                      org.d["nodes"]["x-or"]["model"],
+                      org.seat_cost("x-or")), ("flare", 5), "flare hire"))
+    check("switch_model across a band re-prices the seat (blaze ⇒ 10)",
+          lambda: (org.switch_model(USER, "x-or", "blaze"),
+                   eq((org.d["nodes"]["x-or"]["model"],
+                       org.seat_cost("x-or")), ("blaze", 10), "band switch"))[1])
+    check("a truly unknown OpenRouter-ish tier is still refused",
+          lambda: raises(lambda: org.hire(USER, top, "supernova", 0, "x"),
+                         "unknown tier", "unknown"))
 
     # key resolution — presence only; org key wins over env.
     check("openrouter_key: env unset ⇒ (None, ''), env set ⇒ (…, 'env'), "
@@ -310,7 +328,7 @@ def main():
                      ((None, ""), ("sk-or-fake", "env"),
                       ("org-supplied", "org")), "key resolution"))
 
-    print("§6 the openrouter payload entry — preview shape")
+    print("§6 the openrouter payload entry")
     providers.openrouter_status(force=True)  # env now has the fake key
     p3 = providers.providers_payload({"installed": True, "connected": True})
     orr = next(p for p in p3["providers"] if p["id"] == "openrouter")
@@ -318,20 +336,45 @@ def main():
           lambda: eq((orr["cli"], "installed" in orr["status"],
                       orr["status"]["kind"]), (None, False, "api-key"),
                      "openrouter entry shape"))
-    check("hire_enabled is hard-False in the preview even with a key present",
-          lambda: eq((orr["hire_enabled"], orr["status"]["connected"]),
-                     (False, True), "preview hire lock"))
+    check("hire_enabled FOLLOWS connection: key present ⇒ hireable, no reason",
+          lambda: eq((orr["hire_enabled"], orr["reason"],
+                      orr["status"]["connected"]), (True, None, True),
+                     "connected entry"))
 
     def or_disconnected():
         os.environ.pop("OPENROUTER_API_KEY", None)
         providers.openrouter_status(force=True)
         p4 = providers.providers_payload({"installed": True})
         o2 = next(p for p in p4["providers"] if p["id"] == "openrouter")
-        eq((o2["status"]["connected"],
+        eq((o2["hire_enabled"], o2["status"]["connected"],
             "OPENROUTER_API_KEY" in (o2["reason"] or "")),
-           (False, True), "disconnected reason")
-    check("…and with no key the reason names OPENROUTER_API_KEY",
+           (False, False, True), "disconnected entry")
+    check("…and with no key: not hireable, reason names OPENROUTER_API_KEY",
           or_disconnected)
+
+    print("§7 the connected-provider hire gate for OpenRouter (api.py's, "
+          "D-OR-2: keyed by construction — no install ladder, no headless case)")
+    from orgtree.api import provider_hire_gate                     # noqa: E402
+
+    def or_gate():
+        gate_org = Org.create("or-gate-test")
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        providers.openrouter_status(force=True)
+        raises(lambda: provider_hire_gate(gate_org, "flare"),
+               "OPENROUTER_API_KEY", "no key refuses, naming the var")
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-fake"
+        providers.openrouter_status(force=True)
+        provider_hire_gate(gate_org, "flare")          # key present: passes
+        provider_hire_gate(gate_org, "fable")          # claude: never gated
+        provider_hire_gate(gate_org, None)             # no tier: not its job
+        gate_org.d["headless"] = True
+        provider_hire_gate(gate_org, "nova")           # keyed ⇒ headless OK
+        gate_org.d.pop("headless")
+        gate_org.d["kiosk"] = {"pin": "x"}
+        raises(lambda: provider_hire_gate(gate_org, "spark"),
+               "kiosk", "kiosk still held out")
+    check("gate: no key refuses; key present passes; headless OK (keyed); "
+          "kiosk refuses; claude ungated", or_gate)
 
     print(f"\n{PASS} checks passed")
 

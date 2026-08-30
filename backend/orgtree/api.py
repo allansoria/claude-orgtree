@@ -5320,10 +5320,12 @@ def provider_hire_gate(org: Org, tier: str | None) -> None:
     node across the axis by rehiring it. If you ever add one, gate it here.
 
     Two provider-specific rulings ride along (user, 2026-08-28):
-      · kiosks hold codex out until its sandbox story is settled;
+      · kiosks hold codex out until its sandbox story is settled — the same
+        holdout now covers gemini and OpenRouter;
       · a HEADLESS org may only hire tiers from KEYED providers — a
         subscription login is a person's plan, and headless means nobody is
-        present to answer for it.
+        present to answer for it. OpenRouter is keyed by construction
+        (⚠ D-OR-2), so this rule is satisfied there without a special case.
     """
     if not tier:
         return
@@ -5350,6 +5352,23 @@ def provider_hire_gate(org: Org, tier: str | None) -> None:
                 "a headless org may only hire tiers from KEYED providers "
                 "(user ruling 2026-08-28) — Gemini here is signed in with a "
                 "Google account login, not an API key")
+        return
+    if tier in providers.OPENROUTER_TIERS:
+        # ⚠ D-OR-2: OpenRouter is not a CLI — connect-state is just "is a key
+        # configured" (env, or a per-org key). No install ladder, and no
+        # headless case: a key IS the keyed-provider condition the headless
+        # rule wants, satisfied by construction.
+        key, _src = providers.openrouter_key()
+        if not key:
+            raise LedgerError(
+                f"tier '{tier}' is an OpenRouter tier and no OPENROUTER_API_"
+                f"KEY is configured — set it in the environment or as this "
+                f"org's API key (accounts panel → OpenRouter)")
+        if org.d.get("kiosk"):
+            raise LedgerError(
+                "kiosk orgs cannot hire OpenRouter tiers yet — held out "
+                "until the sandbox story is settled (the same holdout as "
+                "codex and gemini, user ruling 2026-08-28)")
         return
     if tier not in providers.CODEX_TIERS:
         return

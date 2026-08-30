@@ -42,13 +42,23 @@ from .schema import (AudienceGrant, DirGrant, MailEntry, NodeDoc, NoticeEntry,
 # through ≥2026-11-21), terra $2, luna $0.20 → floors to 1. The gemini family
 # (D-188): pro $2 standard (the ≤200K band — the >200K long-context surcharge
 # is a cost-dollars concern, never a seat), flash $1.50 → floors to 1 and
-# STAYS 1 when the tier's default model moves to 3.7-flash ($0.38). Existing
-# orgs migrate in the load hook below IF they still carry the old shipped
-# default; a customised table keeps its own number. Tier names are ONE flat
-# vocabulary — a tier implies its provider (providers.py owns that axis).
+# STAYS 1 when the tier's default model moves to 3.7-flash ($0.38). The
+# OpenRouter family (design-openrouter.md §9, user-approved 2026-08-29): FIVE
+# static PRICE BANDS, not per-model rows — spark ≤$1/M→1, ember ≤$2→2,
+# flare ≤$5→5, blaze ≤$10→10, nova >$10→20. A hired node records the BAND
+# here and its chosen model id in `or_slug`; the band (hence the seat) is a
+# function of that model's OpenRouter input $/M and can move under
+# switch_model (⚠ D-OR-3). Seats 1/2/5/10 deliberately echo the other
+# families so the kiosk max_tier ranking stays legible across providers.
+# Existing orgs migrate in the load hook below IF they still carry the old
+# shipped default; a customised table keeps its own number. Tier names are
+# ONE flat vocabulary — a tier implies its provider (providers.py owns that
+# axis).
 TIERS: Final[dict[str, int]] = {"fable": 10, "opus": 5, "sonnet": 2, "haiku": 1,
                                 "sol": 5, "terra": 2, "luna": 1,
-                                "flash": 1, "pro": 2}
+                                "flash": 1, "pro": 2,
+                                "spark": 1, "ember": 2, "flare": 5,
+                                "blaze": 10, "nova": 20}
 
 # №34 runaway insurance, and NOTHING else (user ruling 2026-08-04): "no need to
 # have any practical limit other than to prevent infinite recursion from a bug
@@ -79,6 +89,15 @@ MODELS: Final[dict[str, str]] = {
     # day 3.7 lands (user-approved recommendation, 2026-08-29).
     "flash": "gemini-3.5-flash",
     "pro": "gemini-3.1-pro-preview-customtools",
+    # the OpenRouter family — the band's DEFAULT model id, used when a node
+    # carries no `or_slug` (design-openrouter.md §9). Ids exactly as
+    # /api/v1/models reports them. The user normally overrides this with the
+    # hire picker (D-OR-4); the default just keeps a band usable bare.
+    "spark": "google/gemini-2.5-flash",
+    "ember": "moonshotai/kimi-k2",
+    "flare": "openai/gpt-5",
+    "blaze": "anthropic/claude-sonnet-4.5",
+    "nova": "anthropic/claude-opus-4.1",
 }
 
 # A TIER is a price band — four of them, four chips. A model VERSION is a

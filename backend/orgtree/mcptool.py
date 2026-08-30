@@ -606,6 +606,8 @@ TOOLS: list[dict[str, Any]] = [
             "hireable only while the Codex CLI is signed in on this machine); "
             "flash 1, pro 2 (Gemini — hireable only while the Gemini CLI is "
             "signed in on this machine); "
+            "spark 1, ember 2, flare 5, blaze 10, nova 20 (OpenRouter price "
+            "bands — hireable only while an OPENROUTER_API_KEY is set); "
             "seat + grant must fit within YOUR free credits. "
             "ONE CALL IS ENOUGH: this tool also takes the fields you would "
             "otherwise have to orgtree_retool in straight afterwards "
@@ -626,7 +628,9 @@ TOOLS: list[dict[str, Any]] = [
                 "name": {"type": "string", "description": "1-2 words, the node id"},
                 "tier": {"type": "string",
                          "enum": ["haiku", "sonnet", "opus", "fable",
-                                  "luna", "terra", "sol", "flash", "pro"]},
+                                  "luna", "terra", "sol", "flash", "pro",
+                                  "spark", "ember", "flare", "blaze",
+                                  "nova"]},
                 "grant": {"type": "integer", "minimum": 0,
                           "description": "credits it may spend on ITS OWN hires"},
                 "charter": {"type": "string",
@@ -1037,7 +1041,10 @@ TOOLS: list[dict[str, Any]] = [
             "whole chain lacks it. Tiers: haiku 1 · sonnet 2 · opus 5 · "
             "fable 10 (Claude); luna 1 · terra 2 · sol 5 (Codex, needs the "
             "CLI signed in); flash 1 · pro 2 (Gemini, needs the CLI signed "
-            "in)."),
+            "in); spark 1 · ember 2 · flare 5 · blaze 10 · nova 20 "
+            "(OpenRouter price bands, needs an OPENROUTER_API_KEY). A "
+            "switch that crosses an OpenRouter band IS a tier change "
+            "(⚠ D-OR-3)."),
         "inputSchema": {"type": "object",
                         "properties": {"node": {"type": "string"},
                                        "tier": {"type": "string",
@@ -1045,7 +1052,9 @@ TOOLS: list[dict[str, Any]] = [
                                                          "opus", "fable",
                                                          "luna", "terra",
                                                          "sol", "flash",
-                                                         "pro"]}},
+                                                         "pro", "spark",
+                                                         "ember", "flare",
+                                                         "blaze", "nova"]}},
                         "required": ["node", "tier"]},
     },
     {

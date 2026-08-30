@@ -645,23 +645,17 @@ OPENROUTER_BANDS: Final[tuple[tuple[str, float, int], ...]] = (
 #: · flash/pro (design-openrouter.md §2).
 OPENROUTER_TIER_NAMES: Final = tuple(b[0] for b in OPENROUTER_BANDS)
 
-# ⚠ PREVIEW-ERA LITERALS. Inc 4 (§5 hire enablement) moves these five rows
-# into ledger.TIERS / ledger.MODELS — the budget-bearing tables — and this
-# module then DERIVES its views the way CODEX_TIERS / GEMINI_TIERS already do,
-# so a seat price lives in exactly one place. Until then OpenRouter tiers are
-# DATA only and nothing budget-bearing may learn them (test_providers guards
-# the rejection, the same negative invariant the codex axis shipped behind).
-OPENROUTER_TIERS: Final[dict[str, int]] = {n: seat for n, _c, seat in OPENROUTER_BANDS}
-
-#: band → DEFAULT slug, used when a node carries no `or_slug` (design §9). Ids
-#: exactly as `/api/v1/models` reports them.
+#: band → seat and band → DEFAULT slug, DERIVED from ledger.TIERS /
+#: ledger.MODELS (the budget-bearing tables — the OpenRouter rows landed
+#: there at hire enablement, §5) exactly as CODEX_TIERS / GEMINI_TIERS are,
+#: so a seat price lives in one place. The band EDGES for the price→band map
+#: stay in OPENROUTER_BANDS above; a drift check pins the two seat views
+#: together. `OPENROUTER_MODELS` is the default used when a node has no
+#: `or_slug` (design §9).
+OPENROUTER_TIERS: Final[dict[str, int]] = {
+    n: _LEDGER_TIERS[n] for n in OPENROUTER_TIER_NAMES}
 OPENROUTER_MODELS: Final[dict[str, str]] = {
-    "spark": "google/gemini-2.5-flash",
-    "ember": "moonshotai/kimi-k2",
-    "flare": "openai/gpt-5",
-    "blaze": "anthropic/claude-sonnet-4.5",
-    "nova": "anthropic/claude-opus-4.1",
-}
+    n: _LEDGER_MODELS[n] for n in OPENROUTER_TIER_NAMES}
 
 #: band → a conservative context-window FLOOR. `_openrouter_leg` (§4) writes
 #: the real per-slug window to `n["context_window"]`, which wins via the
@@ -895,12 +889,11 @@ def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
             "cli": None,
             "tiers": openrouter_tiers(),
             "status": openrouter,
-            # PREVIEW: hard-False until the turn runner + hire gate land
-            # (§4/§5). It then becomes `bool(openrouter.get("connected"))` —
-            # the same predicate the api hire gate will enforce (D-OR-2:
-            # OpenRouter is keyed by construction, so "connected" == "a key
-            # is configured").
-            "hire_enabled": False,
+            # a CONNECTED provider is a hireable one — the same predicate the
+            # api hire gate enforces (provider_hire_gate). D-OR-2: OpenRouter
+            # is keyed by construction, so "connected" == "an OPENROUTER_API_
+            # KEY is configured", and there is no headless special case.
+            "hire_enabled": bool(openrouter.get("connected")),
             "reason": (
                 None if openrouter.get("connected")
                 else "no OPENROUTER_API_KEY — set it in the environment or "
