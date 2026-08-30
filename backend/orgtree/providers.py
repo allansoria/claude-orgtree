@@ -140,6 +140,8 @@ def provider_of(tier: str) -> str:
         return "google"
     if tier in OPENROUTER_TIERS:
         return "openrouter"
+    if tier in ANTIGRAVITY_TIERS:
+        return "antigravity"
     return "claude"
 
 
@@ -155,7 +157,10 @@ PROVIDER_LABEL: Final[dict[str, str]] = {
     # OpenRouter is not a CLI (design-openrouter.md §0) — the label is the
     # product's own name, the same §0 naming rule that made "Codex"/"Gemini"
     # the labels rather than the vendor.
-    "openrouter": "OpenRouter"}
+    "openrouter": "OpenRouter",
+    # Google's `agy` CLI, the replacement for individual Gemini Code Assist
+    # (design-antigravity.md §0). Its own product name, not "Gemini".
+    "antigravity": "Antigravity"}
 
 
 def provider_label(tier: str) -> str:
@@ -857,6 +862,193 @@ def openrouter_occupancy(token_usage: dict[str, Any] | None) -> int:
     return max(0, int(token_usage.get("prompt") or 0))
 
 
+# ── the antigravity axis (design-antigravity.md, provider #5) ──────────────
+# Google's `agy` CLI — the replacement for the deprecated individual Gemini
+# Code Assist OAuth. A FULL agentic CLI (Claude Code / Codex shape, NOT the
+# gemini ACP lane): --print / stream-json NDJSON, provider-issued
+# conversation_id resume, ~50 built-in tools, a multi-model router (Gemini
+# 3.7 Flash .. Claude Opus 4.6 .. GPT-OSS 120B). It reuses ~/.gemini's OAuth
+# creds for auth. PREVIEW: `hire_enabled` is hard-False here until the runner
+# + dispatch seam land — this increment ships the axis as read-only DATA,
+# exactly as the codex/gemini/openrouter axes first shipped.
+#
+# ⚠ deviations (design-antigravity.md): D-AG-1 the built-in toolset cannot be
+# narrowed, so a hired agy agent's scope.tools grants are NOT enforced (only
+# --add-dir folder bounds hold); D-AG-2 the wire reports token counts but no
+# cost, and Google has published no rates — turns book $0 with a note, and
+# the seat is a placeholder; D-AG-3 no system-prompt flag — identity rides
+# the first user message; D-AG-4 `agy mcp add` is global-only, so per-node
+# org powers depend on process-env passthrough.
+
+#: chip letter for the antigravity family — `A`, clear of the existing
+#: F/O/S/H · L/T/S · F/P · K/E/R/B/N.
+_ANTIGRAVITY_LETTER: Final[dict[str, str]] = {"orbit": "A"}
+
+#: PREVIEW-ERA placeholder. One flat tier `orbit` — Antigravity publishes no
+#: pricing, so the seat cannot be price-honest (playbook §0). Seat 2 mirrors
+#: terra/pro/ember (mid). Inc 4 moves this row into ledger.TIERS and revisits
+#: the number once Google publishes rates (⚠ D-AG-2).
+ANTIGRAVITY_TIER_NAMES: Final = ("orbit",)
+ANTIGRAVITY_TIERS: Final[dict[str, int]] = {"orbit": 2}
+
+#: tier → the `--model` id used when a node carries no explicit pick. Ids
+#: exactly as `agy models` reports them (effort is baked into the id).
+ANTIGRAVITY_MODELS: Final[dict[str, str]] = {"orbit": "gemini-3.7-flash-medium"}
+
+#: tier → a conservative context-window FLOOR (recon did not capture per-model
+#: windows; the served model's real window can be written to
+#: n["context_window"] by the leg later, §4).
+ANTIGRAVITY_CONTEXT: Final[dict[str, int]] = {"orbit": 200_000}
+
+_AGY_MODELS_TTL: Final = 3600.0
+_agy_models_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+
+def agy_path() -> tuple[str | None, str]:
+    """(resolved `agy` executable, how it was found) —
+    'env' | 'local' | 'path' | ''. Native binary, so no shim dance (codex's
+    rule, not gemini's)."""
+    env = os.environ.get("ORGTREE_AGY")
+    if env:
+        return env, "env"
+    local = os.path.join(
+        os.environ.get("LOCALAPPDATA")
+        or os.path.expanduser("~/AppData/Local"),
+        "agy", "bin", "agy.exe" if os.name == "nt" else "agy")
+    if os.path.exists(local):
+        return local, "local"
+    onpath = shutil.which("agy")
+    if onpath:
+        return onpath, "path"
+    return None, ""
+
+
+def agy_argv(exe: str) -> list[str]:
+    """argv HEAD for spawning `agy` — a `.py` path (the test double) runs
+    under this interpreter; the native binary is invoked directly."""
+    if exe.lower().endswith(".py"):
+        return [sys.executable, exe]
+    return [exe]
+
+
+def _agy_version(exe: str) -> str:
+    """`agy --version` with a hard timeout — the accounts panel must never
+    hang on a CLI."""
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True,
+                           text=True, timeout=15)
+        m = re.search(r"\d+\.\d+\.\d+", (r.stdout or "") + (r.stderr or ""))
+        if m:
+            return m.group(0)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "unknown"
+
+
+def _agy_home() -> str:
+    """Where `agy` keeps state. It REUSES the gemini CLI's `~/.gemini` OAuth
+    store (measured — `oauth_creds.json` written by a prior gemini login is
+    what authenticated `agy`), with its own `antigravity-cli/` subdir beside
+    it. Honour `ORGTREE_AGY_HOME`, else the same dir the gemini lane reads."""
+    return os.environ.get("ORGTREE_AGY_HOME") or _gemini_home()
+
+
+def _agy_account() -> dict[str, Any]:
+    """Connect state — EXISTENCE + display identity only, never credential
+    material. `agy` authenticates from `~/.gemini/oauth_creds.json` (Google
+    account OAuth only — no api-key/vertex path like the gemini CLI has), and
+    names the account in `google_accounts.json`."""
+    home = _agy_home()
+    out: dict[str, Any] = {"connected": False, "email": None, "kind": None}
+    if os.path.exists(os.path.join(home, "oauth_creds.json")):
+        out["connected"] = True
+        out["kind"] = "oauth"
+        try:
+            acct: dict[str, Any] = json.load(
+                open(os.path.join(home, "google_accounts.json"),
+                     encoding="utf-8"))
+            active = acct.get("active")
+            if isinstance(active, str) and active:
+                out["email"] = active
+        except (OSError, json.JSONDecodeError):
+            pass
+    return out
+
+
+_agy_status_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def agy_status(force: bool = False) -> dict[str, Any]:
+    """Install + connect state for the accounts panel, cached 60s — the same
+    contract as `codex_status` / `gemini_status`."""
+    global _agy_status_cache
+    now = time.time()
+    if not force and _agy_status_cache and now - _agy_status_cache[0] < 60:
+        return _agy_status_cache[1]
+    exe, source = agy_path()
+    exists = bool(exe) and os.path.exists(exe or "")
+    st: dict[str, Any] = {
+        "installed": exists,
+        "path": exe,
+        "source": source,
+        "version": _agy_version(exe) if exe and exists else None,
+        "agy_home": _agy_home(),
+    }
+    st.update(_agy_account())
+    _agy_status_cache = (now, st)
+    return st
+
+
+def agy_models(force: bool = False) -> list[dict[str, Any]]:
+    """The `agy models` catalogue for the hire picker (D-AG-4 corollary):
+    `{id, name, effort}`, effort parsed from the id suffix when present
+    (`gemini-3.7-flash-high`). Cached ~1h in memory. An `ORGTREE_AGY_MODELS`
+    env override points at a file of `id<TAB>name` lines so tests and offline
+    runs never spawn `agy`."""
+    global _agy_models_cache
+    now = time.time()
+    if not force and _agy_models_cache and now - _agy_models_cache[0] < _AGY_MODELS_TTL:
+        return _agy_models_cache[1]
+    lines: list[str] = []
+    override = os.environ.get("ORGTREE_AGY_MODELS")
+    if override:
+        try:
+            with open(override, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+    else:
+        exe, _src = agy_path()
+        if exe and os.path.exists(exe):
+            try:
+                r = subprocess.run([exe, "models"], capture_output=True,
+                                   text=True, timeout=20)
+                lines = (r.stdout or "").splitlines()
+            except (OSError, subprocess.TimeoutExpired):
+                lines = []
+    rows: list[dict[str, Any]] = []
+    for line in lines:
+        if "\t" not in line:
+            continue           # skips the "Fetching available models…" header
+        mid, _tab, name = line.partition("\t")
+        mid, name = mid.strip(), name.strip()
+        if not mid:
+            continue
+        m = re.search(r"-(high|medium|low)$", mid)
+        rows.append({"id": mid, "name": name or mid,
+                     "effort": m.group(1) if m else None})
+    _agy_models_cache = (now, rows)
+    return rows
+
+
+def antigravity_tiers() -> list[TierInfo]:
+    return [
+        {"tier": t, "provider": "antigravity", "seat": seat,
+         "model": ANTIGRAVITY_MODELS[t], "letter": _ANTIGRAVITY_LETTER[t]}
+        for t, seat in sorted(ANTIGRAVITY_TIERS.items(), key=lambda kv: kv[1])
+    ]
+
+
 def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
     """The /api/providers document. `claude_status` is composed by the API
     layer from state it already owns (accounts registry, cli_version) — this
@@ -864,6 +1056,7 @@ def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
     codex = codex_status()
     gemini = gemini_status()
     openrouter = openrouter_status()
+    antigravity = agy_status()
     return {"providers": [
         {
             "id": "claude",
@@ -930,5 +1123,24 @@ def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
                 None if openrouter.get("connected")
                 else "no OPENROUTER_API_KEY — set it in the environment or "
                      "as this org's API key"),
+        },
+        {
+            "id": "antigravity",
+            "label": PROVIDER_LABEL["antigravity"],
+            "cli": "Antigravity CLI",
+            "tiers": antigravity_tiers(),
+            "status": antigravity,
+            # PREVIEW: hard-False until the runner + dispatch seam land. It
+            # then becomes bool(connected), the same predicate the api hire
+            # gate will enforce. `agy` authenticates from ~/.gemini's OAuth
+            # store (D-AG-3), so "connected" == "oauth_creds.json present".
+            "hire_enabled": False,
+            "reason": (
+                None if antigravity.get("connected")
+                else "not signed in — the Antigravity CLI reuses the Gemini "
+                     "OAuth login (~/.gemini)"
+                if antigravity.get("installed")
+                else "Antigravity CLI not installed — "
+                     "irm https://antigravity.google/cli/install.ps1 | iex"),
         },
     ]}

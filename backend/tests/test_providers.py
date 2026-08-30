@@ -38,6 +38,23 @@ os.environ["ORGTREE_GEMINI"] = os.path.join(
     os.environ["ORGTREE_DATA"], "nowhere", "gemini.js")
 os.environ["ORGTREE_GEMINI_HOME"] = os.path.join(
     os.environ["ORGTREE_DATA"], "ghome")
+# hermetic on the antigravity axis too (design-antigravity.md): agy_status
+# probes an executable and reads ~/.gemini for OAuth creds; agy_models spawns
+# `agy models`. Pin the binary at nothing, the home at a temp dir this suite
+# authors, and the model list at a fixture.
+os.environ["ORGTREE_AGY"] = os.path.join(
+    os.environ["ORGTREE_DATA"], "nowhere", "agy.exe")
+os.environ["ORGTREE_AGY_HOME"] = os.path.join(os.environ["ORGTREE_DATA"], "agyhome")
+os.makedirs(os.environ["ORGTREE_AGY_HOME"], exist_ok=True)
+_AGY_MODELS_FIXTURE = os.path.join(os.environ["ORGTREE_DATA"], "agy-models.txt")
+os.environ["ORGTREE_AGY_MODELS"] = _AGY_MODELS_FIXTURE
+with open(_AGY_MODELS_FIXTURE, "w", encoding="utf-8") as _f:
+    _f.write("Fetching available models...\n"
+             "gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n"
+             "gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)\n"
+             "gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n"
+             "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n"
+             "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n")
 # hermetic on the openrouter axis too (design-openrouter.md): providers_payload
 # reads OPENROUTER_API_KEY for the connect state, and the model catalogue would
 # hit the network — pin both to this suite's own fixtures.
@@ -204,9 +221,10 @@ def main():
     pay = providers.providers_payload({"installed": True, "connected": True})
     # grew to three at D-184 (gemini) — the gemini entry's own behaviour is
     # test_gemini_providers.py's; here it only has to hold its place in line
-    check("exactly four providers, claude first, openrouter last",
+    check("exactly five providers, claude first, antigravity last",
           lambda: eq([p["id"] for p in pay["providers"]],
-                     ["claude", "openai", "google", "openrouter"], "order"))
+                     ["claude", "openai", "google", "openrouter",
+                      "antigravity"], "order"))
     codex = next(p for p in pay["providers"] if p["id"] == "openai")
     # FLIPPED at the MVP (M1–M8 standing): the vision live — a CONNECTED CLI
     # is a hireable provider, the same predicate the api hire gate enforces.
@@ -436,6 +454,63 @@ def main():
            ("spark", "openai/gpt-4o-mini"), "ceiling refusal is atomic")
     check("kiosk max_tier blocks a slug switch crossing upward",
           kiosk_band_ceiling)
+
+    print("§9 the antigravity axis (design-antigravity.md, provider #5) - "
+          "DATA only, hire disabled until the runner + seam land")
+    check("provider_of / provider_label route an antigravity tier to the axis",
+          lambda: eq((providers.provider_of("orbit"),
+                      providers.provider_label("orbit")),
+                     ("antigravity", "Antigravity"), "axis"))
+    check("antigravity_tiers(): the placeholder 'orbit' tier, seat 2, letter "
+          "A (clear of F/O/S/H/L/T/P/K/E/R/B/N)",
+          lambda: eq([(t["tier"], t["seat"], t["provider"], t["letter"])
+                      for t in providers.antigravity_tiers()],
+                     [("orbit", 2, "antigravity", "A")], "tiers"))
+    check("preview era: 'orbit' is NOT in ledger.TIERS (nothing budget-bearing "
+          "knows it), so a hire is refused as unknown",
+          lambda: (eq("orbit" in TIERS, False, "not budget-bearing"),
+                   raises(lambda: org.hire(USER, top, "orbit", 0, "x-agy"),
+                          "unknown tier", "orbit refused"))[0])
+    cat = providers.agy_models(force=True)
+    check("agy_models parses id<TAB>name, skips the header, pulls effort from "
+          "the id suffix",
+          lambda: eq([(m["id"], m["effort"]) for m in cat],
+                     [("gemini-3.7-flash-high", "high"),
+                      ("gemini-3.7-flash-medium", "medium"),
+                      ("gemini-3.1-pro-high", "high"),
+                      ("claude-sonnet-4-6", None),
+                      ("gpt-oss-120b-medium", "medium")], "catalogue"))
+
+    print("§10 the antigravity payload entry - preview shape")
+    providers._agy_status_cache = None  # noqa: SLF001
+    pay5 = providers.providers_payload({"installed": True, "connected": True})
+    agy = next(p for p in pay5["providers"] if p["id"] == "antigravity")
+    check("cli 'Antigravity CLI', hire_enabled hard-False in the preview, "
+          "reason names the install command (agy binary pinned at nothing)",
+          lambda: eq((agy["cli"], agy["hire_enabled"],
+                      agy["status"]["installed"],
+                      "install.ps1" in (agy["reason"] or "")),
+                     ("Antigravity CLI", False, False, True), "entry"))
+
+    def agy_signed_in():
+        # drop an oauth_creds.json into the pinned home -> connected, but
+        # hire_enabled STAYS False (preview) and the reason clears
+        with open(os.path.join(os.environ["ORGTREE_AGY_HOME"],
+                               "oauth_creds.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(os.environ["ORGTREE_AGY_HOME"],
+                               "google_accounts.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"active": "probe@example.test"}, f)
+        providers._agy_status_cache = None  # noqa: SLF001
+        p6 = providers.providers_payload({"installed": True})
+        a2 = next(p for p in p6["providers"] if p["id"] == "antigravity")
+        eq((a2["status"]["connected"], a2["status"]["email"],
+            a2["status"]["kind"], a2["hire_enabled"], a2["reason"]),
+           (True, "probe@example.test", "oauth", False, None),
+           "signed-in preview entry")
+    check("oauth_creds.json present -> connected + identity, hire still locked",
+          agy_signed_in)
 
     print(f"\n{PASS} checks passed")
 

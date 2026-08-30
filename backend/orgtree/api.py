@@ -2145,6 +2145,18 @@ async def openrouter_model_catalogue() -> dict[str, Any]:
     return {"models": rows}
 
 
+@app.get("/api/providers/antigravity/models")
+async def antigravity_model_catalogue() -> dict[str, Any]:
+    """The `agy models` catalogue for the hire picker (design-antigravity.md):
+    id, display name, and the reasoning effort baked into the id. A dozen-ish
+    rows (Gemini 3.x Flash/Pro, Claude, GPT-OSS); cached ~1h in providers.py.
+    Threadpooled — a cold call spawns `agy models` once."""
+    from fastapi.concurrency import run_in_threadpool
+
+    rows = await run_in_threadpool(providers.agy_models)
+    return {"models": rows}
+
+
 class Reorder(Body):
     before: str | None = None
     after: str | None = None
