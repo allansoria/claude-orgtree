@@ -2796,6 +2796,115 @@ documents the approximation); **(5)** account pooling/routing (Phase 2,
 same as codex) and kiosk admission (the sandbox story owns it). Each is
 named in code where a reader would otherwise assume the capability.
 
+> **The `D-OR-N` series** is the OpenRouter provider's own namespace, the way
+> `docs/interim-docket.md` carries `D-NN`. It is used because
+> [docs/design-openrouter.md](docs/design-openrouter.md) canonicalised these
+> deviations as `D-OR-1..4` before the build and ~20 code comments cite them
+> by that name; `test_decisions_index.py`'s `D-NNN` uniqueness/citation
+> checks deliberately do not reach this series (§4 of that suite).
+
+### D-OR-1 · the OpenRouter lane runs its own agent loop and owns the transcript
+Decision (openrouter-provider, 2026-08-29): providers #1–#3 are locally
+installed CLIs with a structured-IO server; OpenRouter is a hosted
+OpenAI-compatible HTTP aggregator with no binary, no auth store, and no
+provider-issued session. So `_openrouter_leg` does NOT delegate the tool
+loop — `openrouterrun.OpenRouterTurn` runs the round-by-round loop against
+`/chat/completions` IN the supervisor process, and orgtree owns the
+transcript. The session id is a uuid orgtree mints; the journal file under
+`journal_store()` (the same `journals/projects/<org>/<sid>.jsonl` layout
+every reader knows) IS both the durable transcript and the resume substrate
+— "resume" is re-open the file, replay its messages, append the new user
+turn. Why it is safe: the seam contract is unchanged — dispatch on tier
+membership after the provider-neutral prologue, the shared success tail,
+`_OpenRouterTurnDone` unwinding to the shared `finally` that owns the queue
+handoff (D-186's shape); the in-process tool dispatcher is the same loopback
+`/api/agent` call the codex `dynamicTools` lane makes, so the ledger
+enforces authority identically. Bounds: streaming SSE only — the reader must
+consume the trailing `usage`/`cost` chunk that arrives AFTER `finish_reason`
+(measured); a hard 128-round cap fails the turn closed.
+
+### D-OR-2 · "installed" has no meaning for OpenRouter — connect-state is "a key is configured"
+Decision (openrouter-provider, 2026-08-29): the install→signed-in→… ladder
+every CLI provider climbs collapses to one predicate for OpenRouter — is an
+`OPENROUTER_API_KEY` set (environment, or a per-org key). `openrouter_status`
+carries `{kind: "api-key", connected, source}` and deliberately no
+`installed`/`path`/`version`; `providers_payload`'s `hire_enabled` follows
+`connected`. `provider_hire_gate`'s OpenRouter arm is therefore two checks,
+not four: key present (else refuse, naming the variable) and the kiosk
+holdout — and the headless rule ("a headless org may only hire KEYED
+providers") is satisfied BY CONSTRUCTION, so this arm removes a special case
+rather than adding one. Why: there is nothing local to detect; a key that
+does not work fails the first turn loudly with OpenRouter's own 401. A live
+`GET /key` 200 is a stronger check and is the telemetry surface for a later
+limit-freeze P2, but it is not run in the hot path (no network in a panel
+poll).
+
+### D-OR-3 · an OpenRouter node's band is a function of its chosen model, and can move under switch_model
+Decision (openrouter-provider, 2026-08-29): there is no curated OpenRouter
+model list. The user picks any tool-capable model; orgtree reads that
+model's OpenRouter input $/M and binds it to one of five STATIC price bands
+— `spark ≤$1→1`, `ember ≤$2→2`, `flare ≤$5→5`, `blaze ≤$10→10`,
+`nova >$10→20` (`providers.band_for_price`, the one implementation).
+`n["model"]` records the BAND (drives seat, chip, theme, kiosk rank);
+`n["or_slug"]` records the chosen model id (drives the call and the context
+window). For every other provider `tier` is fixed at hire; here a
+`switch_model` that lands in a different band IS a tier change and re-runs
+the full hire gate — key, kiosk holdout, and the kiosk `max_tier` ceiling —
+before it commits. Contained: `provider_hire_gate` is already the single
+choke point for all five doors, and the seat table `spark..nova` stays
+static — only the node↔band binding is dynamic. Bounds: overcharging inside
+a band is the safe direction (a seat is never understated within a band);
+the extreme tail (models to ~$150/M) sits in `nova` at seat 20, which
+undercharges — accepted, exotic. Status: the band rows, the gate arm and the
+price→band map ship with hire enablement; the `or_slug` field, slug→band
+resolution at hire/switch and the re-gate land with the model picker
+(D-OR-4). Until then a hired band runs its default model id.
+
+### D-OR-4 · the OpenRouter hire surface is a searchable model picker, not tier chips
+Decision (openrouter-provider, 2026-08-29): every other provider's hire
+surface is 2–4 tier chips. OpenRouter needs a searchable list over the
+~310 tool-capable models (of ~396) — name, price, context, reasoning
+support — served from `GET /api/providers/openrouter/models` (the live
+`/models` payload, filtered to `"tools" in supported_parameters`, trimmed
+and cached ~1h in memory and on disk, keyless fetch). The five band chips
+still exist: they show which band the current pick landed in and carry the
+theme colour. The act of choosing is a search box, and this REPLACES the
+`MODEL_VERSIONS` gear-menu mechanism for this provider. Why: 86 models
+carry no tool support and cannot run org powers — they are filtered out, not
+shown and refused.
+
+### D-OR-5 · the OpenRouter context window is per-model; the band value is only a floor
+Decision (openrouter-provider, 2026-08-29): models inside one band range
+from 32k to 1M+ windows, so `TIER_CONTEXT` carries only a conservative
+FLOOR per band (spark/ember 32k, flare/blaze/nova 128k). The served model's
+real `context_length` (from the `/models` catalogue) is the truth:
+`_openrouter_leg` reads it and hands it to `_after_turn` in
+`res["context_window"]`, which stays the single writer of the doc field,
+and `context_window()` prefers the doc value over the band floor for
+OpenRouter tiers. Why this is a decision and not just code: the design
+first assumed the per-slug window would "win via the existing `_ctx_for`
+fallback", but `_ctx_for`/`context_window()` prefer `TIER_CONTEXT` — so
+without this the 32k floor silently masked real 128k+ windows and forced
+early compaction. Bounds: before the first turn the doc has no window and
+the floor applies; that is the only time it does.
+
+### D-OR-6 · what stays deliberately OUT of the OpenRouter MVP
+Decision (openrouter-provider, 2026-08-29), so the gaps are chosen: **(1)**
+the generation split — the native fork machinery is Claude-CLI-shaped and
+this lane owns an in-process transcript with no fork verb, so
+`_compact_split_body` refuses cleanly with the cheap-compact remedy (the
+same §8 hold-out D-186/D-190 shipped); **(2)** a per-model price table with
+long-context bands — OpenRouter returns a computed `cost` on every request
+(`usage:{include:true}`), so the turn is priced from that; only a response
+that carries `usage` but no `cost` falls back to a deliberately
+over-stating flat `OPENROUTER_PRICE_FALLBACK`; **(3)** account
+pooling/routing — there is one key, and `provider:{order,allow_fallbacks}`
+request-body routing is a later knob; **(4)** rate-limit-driven freezes —
+`GET /key` telemetry is normalized and carried in the turn result for a
+later P2; 429s surface as loud turn errors; **(5)** kiosk admission — the
+same sandbox-story hold-out as codex/gemini. Each is named in code where a
+reader would otherwise assume the capability.
+
 ---
 
 ## Mail & messaging

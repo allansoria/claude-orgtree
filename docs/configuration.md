@@ -44,10 +44,12 @@ Set before the backend starts. Not visible in the UI, not per-org. A change requ
 | `CODEX_HOME` | `~/.codex` | Codex CLI home, including its own login state; orgtree passes it through and does not copy credentials |
 | `ORGTREE_GEMINI` | auto-detected | path to the Gemini CLI; resolution is override → private install under `<data>/gemini` → `PATH` |
 | `ORGTREE_GEMINI_HOME` | `~/.gemini` | Gemini CLI configuration and login home; useful when the CLI uses a non-default profile |
+| `OPENROUTER_API_KEY` | — | the OpenRouter API key. Its PRESENCE is the whole connect-state for the OpenRouter provider — there is no CLI to install or log in to. Read for existence only; never logged or serialised |
+| `ORGTREE_OPENROUTER_MODELS` | — | test/offline escape hatch: a path to a local `/api/v1/models` JSON payload, used instead of fetching the live model catalogue |
 
 ### Provider CLIs and tier availability
 
-The installed backend supports three provider families. A tier name is global
+The installed backend supports four provider families. A tier name is global
 within an org, so it already identifies its provider; do not supply a separate
 provider argument to a hire or model switch.
 
@@ -56,16 +58,28 @@ provider argument to a hire or model switch.
 | Claude Code | haiku (1), sonnet (2), opus (5), fable (10) | the Claude CLI can run turns |
 | Codex | luna (1), terra (2), sol (5) | Codex CLI is installed and signed in |
 | Gemini | flash (1), pro (2) | Gemini CLI is installed and signed in |
+| OpenRouter | spark (1), ember (2), flare (5), blaze (10), nova (20) | `OPENROUTER_API_KEY` is set |
 
-Provider detection is read-only. It checks the CLI installation and its own
-login records, but never copies or alters credentials. The Accounts panel and
-the disabled hire-chip tooltip show the next required action.
+Provider detection is read-only. For the CLI providers it checks the
+installation and their own login records; for OpenRouter it checks only
+whether a key is configured. It never copies or alters credentials. The
+Accounts panel and the disabled hire-chip tooltip show the next required
+action.
 
-Codex and Gemini are not available in kiosk orgs while their sandbox support
-is intentionally held back. In a headless org, their personal-login modes are
-also unavailable: Codex requires an API-key login, while Gemini requires an
-API-key or Vertex AI login. Provider tiers otherwise use the same credit,
-scope, charter, and MCP-grant rules as Claude tiers.
+The OpenRouter tiers are five **price bands**, not per-model rows. A hired
+node picks any tool-capable OpenRouter model; its seat is the band that
+model's input $/M falls into, and a later model switch that crosses a band
+is a tier change (re-gated, ceiling re-checked). Cost is taken from
+OpenRouter's own per-request figure. This lane has no generation-split
+(compaction) support yet — the cheap compact is the path.
+
+Codex, Gemini and OpenRouter are not available in kiosk orgs while their
+sandbox support is intentionally held back. In a headless org, the CLI
+providers' personal-login modes are also unavailable: Codex requires an
+API-key login, while Gemini requires an API-key or Vertex AI login;
+OpenRouter is key-only by construction, so a headless org may always hire
+it. Provider tiers otherwise use the same credit, scope, charter, and
+MCP-grant rules as Claude tiers.
 
 ### Turn behaviour
 
@@ -222,7 +236,7 @@ these; ⚠ **an agent hiring must state every one explicitly** — no defaults a
 | `default_visibility` | `self` \| `team` \| `subtree` \| `full` | how much of the org chart a hire can see |
 | `default_effort` | `""` (CLI default) \| `low`…`max` | thinking effort; resolved **live** at turn start, so changing it moves existing agents too |
 | `permission_mode` | `acceptEdits` (default) | the CLI permission mode |
-| `tiers` / `models` | Claude: fable 10, opus 5, sonnet 2, haiku 1; Codex: sol 5, terra 2, luna 1; Gemini: pro 2, flash 1 | credit cost per tier and the model each maps to (`ledger.py:49-80`) |
+| `tiers` / `models` | Claude: fable 10, opus 5, sonnet 2, haiku 1; Codex: sol 5, terra 2, luna 1; Gemini: pro 2, flash 1; OpenRouter: nova 20, blaze 10, flare 5, ember 2, spark 1 | credit cost per tier and the model each maps to (`ledger.py`) |
 
 MCP servers are discovered from the user's own `~/.claude.json` → `mcpServers`
 (`supervisor.py:466-472`), so orgtree grants from that list rather than defining servers itself.

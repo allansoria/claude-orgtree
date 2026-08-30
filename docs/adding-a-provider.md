@@ -14,6 +14,16 @@ where the third walk added a variant or corrected a prediction. Its probe
 record is the implementing agent's scratch (`gemini-provider/breadcrumbs.md`
 + banked probe logs).
 
+Provider #4 (OpenRouter, five PRICE-BAND tiers spark·ember·flare·blaze·nova,
+`D-OR-1…D-OR-6`) is the first one that is **not a CLI** — a hosted
+OpenAI-compatible HTTP aggregator. Its full design, and where it deviates
+from this playbook, is [design-openrouter.md](design-openrouter.md): orgtree
+runs the agent loop in-process and owns the transcript (no CLI to delegate
+to), "installed" collapses to "a key is configured", the tier is a function
+of the chosen model's price and can move under `switch_model`, and the hire
+surface is a model picker rather than chips. Read that doc alongside this one
+when the next provider is also API-only.
+
 Maintained live: every increment that lands for a provider updates the
 matching section here. If you are adding provider #4 and a step below didn't
 match reality, fix the step — this document is only worth what it predicts.
