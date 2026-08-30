@@ -2145,6 +2145,18 @@ async def openrouter_model_catalogue() -> dict[str, Any]:
     return {"models": rows}
 
 
+@app.get("/api/providers/antigravity/models")
+async def antigravity_model_catalogue() -> dict[str, Any]:
+    """The `agy models` catalogue for the hire picker (design-antigravity.md):
+    id, display name, and the reasoning effort baked into the id. A dozen-ish
+    rows (Gemini 3.x Flash/Pro, Claude, GPT-OSS); cached ~1h in providers.py.
+    Threadpooled — a cold call spawns `agy models` once."""
+    from fastapi.concurrency import run_in_threadpool
+
+    rows = await run_in_threadpool(providers.agy_models)
+    return {"models": rows}
+
+
 class Reorder(Body):
     before: str | None = None
     after: str | None = None
@@ -5386,6 +5398,28 @@ def provider_hire_gate(org: Org, tier: str | None,
                 "kiosk orgs cannot hire OpenRouter tiers yet — held out "
                 "until the sandbox story is settled (the same holdout as "
                 "codex and gemini, user ruling 2026-08-28)")
+        return tier
+    if tier in providers.ANTIGRAVITY_TIERS:
+        ast = providers.agy_status()
+        if not ast.get("installed"):
+            raise LedgerError(
+                f"tier '{tier}' is an Antigravity tier and the `agy` CLI is "
+                f"not installed — irm https://antigravity.google/cli/"
+                f"install.ps1 | iex (accounts panel → Antigravity)")
+        if not ast.get("connected"):
+            raise LedgerError(
+                f"tier '{tier}' is an Antigravity tier and it is not signed "
+                f"in — the Antigravity CLI reuses the Gemini OAuth login "
+                f"(~/.gemini)")
+        if org.d.get("kiosk"):
+            raise LedgerError(
+                "kiosk orgs cannot hire Antigravity tiers yet — the same "
+                "sandbox holdout as codex and gemini")
+        if org.d.get("headless"):
+            raise LedgerError(
+                "a headless org may only hire tiers from KEYED providers "
+                "(user ruling 2026-08-28) — Antigravity is a Google-account "
+                "OAuth login only, with no API-key path")
         return tier
     if tier not in providers.CODEX_TIERS:
         return tier

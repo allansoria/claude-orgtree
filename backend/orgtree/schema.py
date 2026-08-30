@@ -202,6 +202,10 @@ class NodeDoc(TypedDict):
     # stays the band (seat/chip/rank); this drives the /chat/completions call
     # and the context window. Absent ⇒ the band's default model.
     or_slug: NotRequired[str]
+    # Antigravity: the chosen `agy` model id (band stays in `model`), and the
+    # provider-issued conversation id the leg resumes on (design-antigravity).
+    agy_slug: NotRequired[str]
+    agy_thread: NotRequired[str]
     parent: str | None              # None = top level (§7.4: the user is root)
     grant: int
     state: NodeState

@@ -18,7 +18,7 @@ import { pickFolder } from '../picker'
 import {
   CloseIcon, DeleteIcon, FolderIcon, LayersIcon, SettingsIcon,
 } from '../icons'
-import { ago, CODEX_TIER_SEAT, CODEX_TIERS, GEMINI_TIER_SEAT, GEMINI_TIERS, MODEL_VERSIONS, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, pileOrder, PROVIDER_LABEL, providerOf, TIER_LETTER, TIER_SEAT, TIERS, USER, useEsc } from './shared'
+import { ago, ANTIGRAVITY_TIER_SEAT, ANTIGRAVITY_TIERS, CODEX_TIER_SEAT, CODEX_TIERS, GEMINI_TIER_SEAT, GEMINI_TIERS, MODEL_VERSIONS, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, pileOrder, PROVIDER_LABEL, providerOf, TIER_LETTER, TIER_SEAT, TIERS, USER, useEsc } from './shared'
 import type { CanvasNode, DraftScope, DraftState, OpFn, Pile } from './shared'
 import { OpenRouterModelPicker } from './accounts'
 
@@ -573,11 +573,12 @@ interface NodeConfigProps {
   codexProvider?: ProviderInfo | null
   geminiProvider?: ProviderInfo | null
   openrouterProvider?: ProviderInfo | null
+  antigravityProvider?: ProviderInfo | null
   close: () => void
 }
 
 export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
-  geminiProvider, openrouterProvider, close }: NodeConfigProps) {
+  geminiProvider, openrouterProvider, antigravityProvider, close }: NodeConfigProps) {
   useEsc(close)
   const [asking, setAsking] =
     useState<'delete' | 'dissolve' | 'retire' | 'rescind' | 'crossprovider' | null>(null)
@@ -727,7 +728,7 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
   // axis over that one flat tier vocabulary, never a second price table.
   const tierSeat = (t: string) => tree.tiers?.[t]
     ?? TIER_SEAT[t] ?? CODEX_TIER_SEAT[t] ?? GEMINI_TIER_SEAT[t]
-    ?? OPENROUTER_TIER_SEAT[t] ?? 0
+    ?? OPENROUTER_TIER_SEAT[t] ?? ANTIGRAVITY_TIER_SEAT[t] ?? 0
   // Keep the same refusal order as provider_hire_gate: provider presence and
   // login first, then org policy, then the headless authentication rule.
   const codexUnavailable = !codexProvider?.hire_enabled
@@ -748,6 +749,10 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
   const openrouterUnavailable = !openrouterProvider?.hire_enabled
     ? openrouterProvider?.reason ?? 'provider state unavailable'
     : tree.kiosk ? 'unavailable in kiosk orgs' : null
+  const antigravityUnavailable = !antigravityProvider?.hire_enabled
+    ? antigravityProvider?.reason ?? 'provider state unavailable'
+    : tree.kiosk ? 'unavailable in kiosk orgs'
+      : tree.headless ? 'headless orgs cannot hire Antigravity' : null
   const unavailable = (t: string): string | null => {
     // The current tier remains a truthful selected no-op even if policy has
     // since tightened around it; save does not call switch_model for a no-op.
@@ -756,6 +761,8 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
     if (GEMINI_TIERS.includes(t) && geminiUnavailable) return geminiUnavailable
     if (OPENROUTER_TIERS.includes(t) && openrouterUnavailable)
       return openrouterUnavailable
+    if (ANTIGRAVITY_TIERS.includes(t) && antigravityUnavailable)
+      return antigravityUnavailable
     const cap = tree.kiosk?.max_tier
     if (cap && tierSeat(t) > tierSeat(cap)) return `above kiosk cap (${cap})`
     return null
@@ -964,6 +971,9 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
                 {t} · seat {tierSeat(t)}
               </option>
             ))}
+          </optgroup>
+          <optgroup label="Antigravity">
+            <option value="orbit">orbit · seat {tierSeat('orbit')}</option>
           </optgroup>
         </select>
         {!tree.kiosk && <div className="or-config-pick">

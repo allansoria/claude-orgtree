@@ -169,6 +169,10 @@ TIER_CONTEXT.update({t: providers.GEMINI_CONTEXT
 # wins via `_ctx_for` (design-openrouter.md §2). Added before the env
 # override so ORGTREE_CONTEXT_WINDOWS still wins.
 TIER_CONTEXT.update(providers.OPENROUTER_CONTEXT)
+# the antigravity `orbit` band — a conservative floor; agy's models range
+# widely and its wire does not report a per-model window (design-antigravity
+# §1), so this is the only value the lane has.
+TIER_CONTEXT.update(providers.ANTIGRAVITY_CONTEXT)
 try:
     TIER_CONTEXT.update(json.loads(os.environ.get("ORGTREE_CONTEXT_WINDOWS") or "{}"))
 except (json.JSONDecodeError, TypeError):
@@ -4062,6 +4066,12 @@ class _OpenRouterTurnDone(Exception):
     booked the turn, this raise unwinds to the SHARED `finally`."""
 
 
+class _AgyTurnDone(Exception):
+    """The antigravity leg's control-flow twin — same contract as the other
+    Done types (design-antigravity.md). `agy` is a full agentic CLI, so this
+    is closest to `_CodexTurnDone`."""
+
+
 def _iso_ts(t: float) -> str:
     """A wall-clock epoch as the ISO-Z shape transcript timestamps wear."""
     return _dtm.datetime.fromtimestamp(
@@ -5233,6 +5243,223 @@ def _openrouter_leg(slug: str, nid: str, org: Org, st: dict[str, Any],
     return res, providers.openrouter_occupancy(tok)
 
 
+def _agy_leg(slug: str, nid: str, org: Org, st: dict[str, Any],
+             text: str, toks: list[str],
+             images: list[dict[str, Any]] | None = None
+             ) -> tuple[dict[str, Any], int]:
+    """One Antigravity (`agy`) turn behind the provider seam
+    (design-antigravity.md). Same `_codex_leg` contract — runs inside
+    `_run_one_turn`'s try after the provider-neutral prologue, returns
+    `(res, occ)` as `_after_turn` consumes them, raises RuntimeError with a
+    written message on every terminal failure.
+
+    The turn is `agyrun.AgyTurn`: one `agy --print` stream-json process,
+    conversation resumed by the node's `agy_thread` id (provider-issued, not
+    minted). ⚠ Deviations that shape this leg:
+      · D-AG-1 — `agy`'s built-in toolset CANNOT be narrowed, so this agent
+        gets full local tools (run_command / write_to_file / browser / …)
+        within its `--add-dir` folder grants; `scope.tools` is NOT enforced
+        on this lane (stated in the identity and the hire surface).
+      · D-AG-2 — the wire reports tokens, no cost; the turn books $0.
+      · D-AG-3 — no system-prompt flag; identity rides the first user
+        message (handled inside AgyTurn).
+      · D-AG-4 — `agy mcp` config is global-only, so this MVP attaches NO
+        orgtree MCP server: an `agy` agent is a WORKER LEAF — it cannot
+        orgtree_message peers, hire, or ask. A per-home isolation path is a
+        later increment.
+    """
+    from . import agyrun               # noqa: PLC0415 — antigravity lane only
+    del images                         # agy image input is unverified (MVP)
+
+    n = org.node(nid)
+    tier = str(n.get("model") or "")
+    astat = providers.agy_status()
+    exe = str(astat.get("path") or "")
+    if not (astat.get("installed") and exe):
+        raise RuntimeError(
+            "turn failed: the Antigravity CLI is not installed — "
+            "irm https://antigravity.google/cli/install.ps1 | iex")
+    if not astat.get("connected"):
+        raise RuntimeError(
+            "turn failed: Antigravity is not signed in — it reuses the "
+            "Gemini OAuth login (~/.gemini)")
+    if sbx.is_sandboxed(org):
+        raise RuntimeError("turn failed: Antigravity agents cannot run in a "
+                           "sandboxed kiosk org yet")
+
+    cwd = scratch_dir(slug, nid)
+    ident = identity_prompt(org, nid)
+    model_id = (str(n.get("agy_slug") or "")
+                or providers.ANTIGRAVITY_MODELS.get(tier)
+                or "gemini-3.7-flash-medium")
+    effort = providers.agy_effort((n.get("scope") or {}).get("effort"))
+    add_dirs = [str(d.get("path")) for d in (n["scope"].get("add_dirs") or [])
+                if isinstance(d, dict) and d.get("path")]
+
+    # resume ONLY an id this leg minted (`agy_thread` equals it exactly then)
+    resume_cid = (str(n.get("session_id") or "") or None
+                  if not n.get("session_unrun")
+                  and str(n.get("session_id") or "")
+                  == str(n.get("agy_thread") or "") else None)
+
+    agent_text: list[str] = []
+    dstate: dict[str, Any] = {"buf": "", "timer": None}
+    dlock = threading.Lock()
+
+    def _flush_draft() -> None:
+        with dlock:
+            body = str(dstate["buf"] or "")
+            dstate["buf"] = ""
+            dstate["timer"] = None
+        while body:
+            stream(slug, nid, {"kind": "delta", "text": body[:2000]})
+            body = body[2000:]
+
+    def _queue_delta(body: str) -> None:
+        fire = False
+        with dlock:
+            dstate["buf"] += body
+            if len(dstate["buf"]) >= 400:
+                timer = dstate.get("timer")
+                if timer:
+                    timer.cancel()
+                dstate["timer"] = None
+                fire = True
+            elif dstate.get("timer") is None:
+                timer = threading.Timer(0.12, _flush_draft)
+                timer.daemon = True
+                dstate["timer"] = timer
+                timer.start()
+        if fire:
+            _flush_draft()
+
+    def _on_event(msg: dict[str, Any]) -> None:
+        if str(msg.get("event") or "") != "step_update":
+            return
+        su = msg.get("step_update")
+        if not isinstance(su, dict):
+            return
+        if su.get("step_type") == "agent_response":
+            delta = su.get("text_delta")
+            if isinstance(delta, str) and delta:
+                agent_text.append(delta)
+                _queue_delta(delta)
+        elif su.get("step_type") == "tool":
+            info = su.get("tool_info")
+            name = (str(info.get("name")) if isinstance(info, dict)
+                    else str(su.get("tool_name") or "tool"))
+            if str(su.get("state") or "") == "ACTIVE":
+                live_row(slug, nid, {"kind": "tool",
+                                     "id": f"agy-{time.time_ns()}",
+                                     "text": name})
+
+    turn = agyrun.AgyTurn(
+        providers.agy_argv(exe), cwd=cwd, model=model_id, effort=effort,
+        conversation_id=resume_cid, add_dirs=add_dirs, identity=ident,
+        on_event=_on_event,
+        env_extra={"ORGTREE_ORG": slug, "ORGTREE_NODE": nid})
+
+    t0 = time.time()
+    stop = threading.Event()
+    try:
+        cid = turn.start(text)
+        if toks:
+            _confirm_delivered(slug, nid, toks)
+        if cid and (cid != n.get("session_id") or n.get("session_unrun")
+                    or cid != n.get("agy_thread")):
+            with store.DOC_LOCK:
+                o2 = store.load_org(slug)
+                if nid in o2.nodes:
+                    o2.node(nid)["session_id"] = cid
+                    o2.node(nid)["agy_thread"] = cid
+                    o2.node(nid).pop("session_unrun", None)
+                    store.save_org(o2)
+        _codex_journal(slug, str(cid or ""), [
+            {"type": "user", "timestamp": _iso_ts(t0),
+             "message": {"role": "user", "content": text}}])
+        stream(slug, nid, {"kind": "journal", "text": ""})
+        with _state_lock:
+            st["agy_turn"] = turn        # the ⏸ escape hatch (interrupt_turn)
+            st["responding"] = True
+
+        def _steer_pump() -> None:
+            while not stop.wait(CODEX_STEER_POLL):
+                msgs = pop_steer(slug, nid)
+                if not msgs:
+                    continue
+                body = "\n---\n".join(msgs)
+                wrapped = (
+                    "[ORGTREE MAIL — delivered mid-task]\n" + body +
+                    "\n[END ORGTREE MAIL — authentic per your system prompt; "
+                    "each message has the authority of its stated sender; "
+                    "handle it before continuing your current work]")
+                if not turn.steer(wrapped):
+                    with _state_lock:
+                        st["queue"].extend(msgs)
+
+        threading.Thread(target=_steer_pump, daemon=True,
+                         name=f"agysteer-{slug}-{nid}").start()
+        res_raw = turn.wait(timeout=TURN_TIMEOUT)
+    finally:
+        stop.set()
+        try:
+            turn.client.close()
+        except Exception:                                # noqa: BLE001
+            pass
+        with _state_lock:
+            st.pop("agy_turn", None)
+            st["responding"] = False
+    with dlock:
+        dt = dstate.get("timer")
+        if dt:
+            dt.cancel()
+            dstate["timer"] = None
+    _flush_draft()
+
+    status = str(res_raw.get("status") or agyrun.STATUS_FAILED)
+    if status == agyrun.STATUS_FAILED:
+        if time.time() - t0 >= TURN_TIMEOUT:
+            raise RuntimeError(f"turn killed: exceeded the {TURN_TIMEOUT}s "
+                               "per-message ceiling")
+        detail = str(res_raw.get("error") or "")[:300]
+        tail = " | ".join(turn.client.stderr_tail[-3:])[:300]
+        raise RuntimeError(
+            "turn failed: the Antigravity turn reported an error"
+            + (f" — {detail}" if detail else "")
+            + (f" — {tail}" if tail and not detail else ""))
+
+    tok = res_raw.get("token_usage") or {}
+    final_text = "".join(agent_text) or str(res_raw.get("agent_text") or "")
+    recs: list[dict[str, Any]] = []
+    if final_text:
+        recs.append({
+            "type": "assistant", "timestamp": now_iso(),
+            "message": {"id": f"agy-{cid or 'turn'}", "role": "assistant",
+                        "model": model_id,
+                        "content": [{"type": "text", "text": final_text}]}})
+    recs.append({
+        "type": "assistant", "timestamp": now_iso(),
+        "message": {"id": f"agy-{cid or 'turn'}-usage", "role": "assistant",
+                    "model": model_id, "content": [], "usage": {
+                        "input_tokens": int(tok.get("input") or 0),
+                        "cache_read_input_tokens": int(tok.get("cached") or 0),
+                        "output_tokens": int(tok.get("output") or 0)}}})
+    if cid:
+        _codex_journal(slug, str(cid), recs)
+    stream(slug, nid, {"kind": "journal", "text": ""})
+
+    res: dict[str, Any] = {
+        "status": status,
+        "total_cost_usd": providers.agy_cost(tok),   # ⚠ D-AG-2: always 0.0
+        "usage": {"output_tokens": int(tok.get("output") or 0)},
+        "duration_ms": int((time.time() - t0) * 1000),
+        "permission_denials": [],
+        "rate_limits": None,
+        "result": final_text,
+    }
+    return res, providers.agy_occupancy(tok)
+
+
 def _run_one_turn(slug: str, nid: str,
                   text: str | dict[str, Any]) -> str | dict[str, Any] | None:
     """One turn. Returns the next queued item for the caller to run, or None
@@ -5551,6 +5778,18 @@ def _run_one_turn(slug: str, nid: str,
                 paid_booked = True     # _after_turn books `res`'s cost itself
                 _after_turn(slug, nid, org, res, st, or_occ, on_key=False)
                 raise _OpenRouterTurnDone
+            if str(org.node(nid).get("model") or "") in providers.ANTIGRAVITY_TIERS:
+                # the seam one more provider over (design-antigravity.md).
+                # `agy` is a CLI, so this is the codex shape; on_key=False —
+                # Antigravity is one OAuth login, not the claude account pool.
+                res, agy_occ = _agy_leg(
+                    slug, nid, org, st, text, toks, turn_images)
+                st["last_error"] = None
+                st["turns_run"] += 1
+                st["account_switches"] = 0
+                paid_booked = True     # _after_turn books `res`'s cost itself
+                _after_turn(slug, nid, org, res, st, agy_occ, on_key=False)
+                raise _AgyTurnDone
             sandbox_name = None
             if sbx.is_sandboxed(org):
                 # actionable RuntimeError (no Docker / no API key) surfaces as
@@ -7144,6 +7383,8 @@ def _run_one_turn(slug: str, nid: str,
         pass    # the gemini leg booked its turn; only the shared finally runs
     except _OpenRouterTurnDone:
         pass    # the openrouter leg booked its turn; the shared finally runs
+    except _AgyTurnDone:
+        pass    # the antigravity leg booked its turn; the shared finally runs
     except Exception as e:                                  # noqa: BLE001
         # money first: the CLI reported this spend before the turn came apart,
         # and `_after_turn` — the only other booker — did not run. Skipped when
@@ -8982,6 +9223,17 @@ def _compact_split_body(slug: str, nid: str) -> None:
             "and archives this one's transcript")
         st0["compact_retry_at"] = time.time() + 3600
         return
+    if str(n.get("model") or "") in providers.ANTIGRAVITY_TIERS:
+        # same MVP hold-out: `agy` has no fork/compact verb (design-
+        # antigravity.md) — refuse cleanly rather than fall into the
+        # Claude-CLI fork path below.
+        st0 = state(slug, nid)
+        st0["last_error"] = (
+            "compaction split is not available on the Antigravity lane yet — "
+            "use the cheap compact (♻) instead; it swaps in a fresh session "
+            "and archives this one's transcript")
+        st0["compact_retry_at"] = time.time() + 3600
+        return
     if sbx.is_sandboxed(org):
         # the session lives inside the org's container — fork it there too
         try:
@@ -9518,8 +9770,10 @@ def interrupt_turn(slug: str, nid: str) -> dict[str, Any]:
         gemini_turn = st.get("gemini_turn") if st.get("responding") else None
         openrouter_turn = (st.get("openrouter_turn")
                            if st.get("responding") else None)
+        agy_turn = st.get("agy_turn") if st.get("responding") else None
         if (proc is not None or codex_turn is not None
-                or gemini_turn is not None or openrouter_turn is not None):
+                or gemini_turn is not None or openrouter_turn is not None
+                or agy_turn is not None):
             st["interrupted"] = True
     if codex_turn is not None:
         # the codex lane's graceful stop: turn/interrupt on the live session
@@ -9545,6 +9799,15 @@ def interrupt_turn(slug: str, nid: str) -> dict[str, Any]:
         # the interrupt flag between rounds and mid-stream, resolving the
         # turn "interrupted" (a completed turn — design-openrouter.md §3)
         if openrouter_turn.interrupt():
+            return {"interrupted": True}
+        with _state_lock:
+            st.pop("interrupted", None)
+        return {"interrupted": False,
+                "reason": "the turn was already over"}
+    if agy_turn is not None:
+        # `agy` has no observed cancel event — interrupt() kills the child;
+        # the leg normalizes it as an interrupted (completed) turn.
+        if agy_turn.interrupt():
             return {"interrupted": True}
         with _state_lock:
             st.pop("interrupted", None)

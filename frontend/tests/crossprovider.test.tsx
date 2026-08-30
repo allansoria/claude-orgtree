@@ -51,7 +51,7 @@ function tree(): TreePayload {
     slug: 'org', dirs: [], tiers: {
       haiku: 1, sonnet: 2, opus: 5, fable: 10,
       luna: 1, terra: 2, sol: 5, flash: 1, pro: 2,
-      spark: 1, ember: 2, flare: 5, blaze: 10, nova: 20,
+      spark: 1, ember: 2, flare: 5, blaze: 10, nova: 20, orbit: 2,
     }, max_top_grant: 100, default_effort: '', effort_default: 'high',
     cascade_hire: true, sandboxed: false,
   } as unknown as TreePayload

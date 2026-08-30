@@ -13,7 +13,7 @@ import {
   FullscreenIcon, PublicIcon, RemoveIcon, ViewListIcon,
 } from '../icons'
 import {
-  ago, attentionPip, CODEX_TIER_LETTER, CODEX_TIER_SEAT, CODEX_TIERS, DOG_H, DOG_W, DRAFT, ease, edgeJumpPlacement, type EJForm, EXTERN, fallbackActive, flatten, GEMINI_TIER_LETTER, GEMINI_TIER_SEAT, GEMINI_TIERS, INBOX, INBOX_H, layout, NODE_H, NODE_W, OPENROUTER_TIER_LETTER, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, orgPxc, segD,
+  ago, ANTIGRAVITY_TIER_LETTER, ANTIGRAVITY_TIER_SEAT, ANTIGRAVITY_TIERS, attentionPip, CODEX_TIER_LETTER, CODEX_TIER_SEAT, CODEX_TIERS, DOG_H, DOG_W, DRAFT, ease, edgeJumpPlacement, type EJForm, EXTERN, fallbackActive, flatten, GEMINI_TIER_LETTER, GEMINI_TIER_SEAT, GEMINI_TIERS, INBOX, INBOX_H, layout, NODE_H, NODE_W, OPENROUTER_TIER_LETTER, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, orgPxc, segD,
   segPoint, sizeOf, smooth, SPRING_C, SPRING_K, TIER_LETTER, TIERS, useCrowdPiles, USER, USER_H,
   USER_W, withDraftTree, Z_DESK, Z_MAX, Z_MINI,
 } from './shared'
@@ -83,7 +83,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
   // The seen-stamp bookkeeping stays: the inbox count badge still uses it.
   const [, setInboxSeen] = useState(
     () => localStorage.getItem('orgtree-inbox-seen-' + slug) ?? '')
-  const seats = tree.tiers ?? { haiku: 1, sonnet: 2, opus: 5, fable: 10, luna: 1, terra: 2, sol: 5, flash: 1, pro: 2, spark: 1, ember: 2, flare: 5, blaze: 10, nova: 20 }
+  const seats = tree.tiers ?? { haiku: 1, sonnet: 2, opus: 5, fable: 10, luna: 1, terra: 2, sol: 5, flash: 1, pro: 2, spark: 1, ember: 2, flare: 5, blaze: 10, nova: 20, orbit: 2 }
   // FR-15 M8: hire surfaces render from the provider payload — whether the
   // codex family is hireable HERE and NOW (CLI installed + signed in) or
   // still a disabled preview, with the payload's own reason as the tooltip.
@@ -94,6 +94,8 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
     useState<ProviderInfo | null>(null)
   const [openrouterProvider, setOpenrouterProvider] =
     useState<ProviderInfo | null>(null)
+  const [antigravityProvider, setAntigravityProvider] =
+    useState<ProviderInfo | null>(null)
   useEffect(() => {
     getProviders().then((p) => {
       const cx = p.providers.find((v) => v.id === 'openai')
@@ -102,6 +104,8 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
       if (gm) setGeminiProvider(gm)
       const or = p.providers.find((v) => v.id === 'openrouter')
       if (or) setOpenrouterProvider(or)
+      const ag = p.providers.find((v) => v.id === 'antigravity')
+      if (ag) setAntigravityProvider(ag)
     }).catch(() => {})
   }, [slug])
   const codexHire = codexProvider && {
@@ -115,6 +119,10 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
   const openrouterHire = openrouterProvider && {
     enabled: !!openrouterProvider.hire_enabled,
     reason: openrouterProvider.reason,
+  }
+  const antigravityHire = antigravityProvider && {
+    enabled: !!antigravityProvider.hire_enabled,
+    reason: antigravityProvider.reason,
   }
   // canonical retired-stack slot (user note 2026-08-06): display-order every
   // parent's children so archived siblings sit CONTIGUOUSLY at the first
@@ -1709,6 +1717,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
             return <UserNode key={USER} pos={p} isDrop={dropId === USER} seats={seats}
               codexHire={codexHire} geminiHire={geminiHire}
               openrouterHire={openrouterHire}
+              antigravityHire={antigravityHire}
               stats={orgStats}
               kiosk={tree.kiosk} pub={!!tree.public} kioskRemaining={kioskRemaining}
               kioskSegs={tree.roots.filter((n) => n.state === 'live')
@@ -1755,6 +1764,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
               isDrop={dropId === n.id}
               seats={seats} codexHire={codexHire} geminiHire={geminiHire}
               openrouterHire={openrouterHire}
+              antigravityHire={antigravityHire}
               map={map} op={op} slug={slug} toast={toast}
               pxc={pxPerCredit} zoom={view.z}
               onSpawn={(t, m) => spawn(n.id, t, m)}
@@ -2005,7 +2015,9 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
                        : n.tier && GEMINI_TIERS.includes(n.tier)
                          ? ' prov-google'
                          : n.tier && OPENROUTER_TIERS.includes(n.tier)
-                           ? ' prov-openrouter' : '')}
+                           ? ' prov-openrouter'
+                           : n.tier && ANTIGRAVITY_TIERS.includes(n.tier)
+                             ? ' prov-antigravity' : '')}
                   style={{ paddingLeft: 8 + depth * 14 }}
                   title={ghost
                     ? 'shown for context — this row does not match the '
@@ -2061,6 +2073,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
         <MaybePortal><NodeConfig node={map.get(configId)!} map={map} tree={tree} slug={slug}
           op={op} toast={toast} codexProvider={codexProvider}
           geminiProvider={geminiProvider} openrouterProvider={openrouterProvider}
+          antigravityProvider={antigravityProvider}
           close={() => setConfigId(null)} /></MaybePortal>
       )}
       {lineageId && map.get(lineageId) && (
@@ -2159,6 +2172,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
         <MaybePortal>
           <HireSheet anchor={map.get(sheetId)!} seats={seats} codexHire={codexHire}
             geminiHire={geminiHire} openrouterHire={openrouterHire}
+            antigravityHire={antigravityHire}
             showOpenrouter={!tree.kiosk}
             defaultGrant={!map.get(sheetId)!.parent ? (tree.default_top_grant ?? 50) : 0}
             onClose={() => setHireOpen(false)}
@@ -2201,7 +2215,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
  *  and FR-25 splice semantics survive: below (report), left/right (coworker
  *  ordering), above (new superior — the anchor moves under the hire). */
 function HireSheet({ anchor, seats, codexHire, geminiHire, openrouterHire,
-  showOpenrouter, defaultGrant,
+  antigravityHire, showOpenrouter, defaultGrant,
   onHire,
   onClose }: {
   anchor: CanvasNode
@@ -2209,6 +2223,7 @@ function HireSheet({ anchor, seats, codexHire, geminiHire, openrouterHire,
   codexHire?: { enabled: boolean; reason: string | null } | null
   geminiHire?: { enabled: boolean; reason: string | null } | null
   openrouterHire?: { enabled: boolean; reason: string | null } | null
+  antigravityHire?: { enabled: boolean; reason: string | null } | null
   showOpenrouter: boolean
   defaultGrant: number
   onHire: (tier: string, name: string, grant: number,
@@ -2289,6 +2304,29 @@ function HireSheet({ anchor, seats, codexHire, geminiHire, openrouterHire,
             </button>
           ))}
         </div>
+        {!showOpenrouter ? null : (
+          <>
+            <div className="field-label">
+              {antigravityHire?.enabled ? 'Antigravity'
+                : 'Antigravity — unavailable'}</div>
+            <div className="hs-tiers">
+              {ANTIGRAVITY_TIERS.map((t) => (
+                <button key={t}
+                  className={'hs-tier t-' + t + (tier === t ? ' on' : '')}
+                  disabled={!antigravityHire?.enabled}
+                  title={antigravityHire?.enabled
+                    ? 'a worker leaf: full local tools in its folders, no '
+                      + 'message/hire/ask'
+                    : (antigravityHire?.reason ?? 'hiring is not enabled yet')}
+                  onClick={() => setTier(t)}>
+                  <span className={'tier t-' + t}>
+                    {ANTIGRAVITY_TIER_LETTER[t]}</span>
+                  {t} · seat {seats[t] ?? ANTIGRAVITY_TIER_SEAT[t]}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
         <div className="field-label">placement</div>
         <div className="hs-place">
           {([['below', 'report — under ' + anchor.id],

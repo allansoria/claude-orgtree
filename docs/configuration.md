@@ -46,10 +46,13 @@ Set before the backend starts. Not visible in the UI, not per-org. A change requ
 | `ORGTREE_GEMINI_HOME` | `~/.gemini` | Gemini CLI configuration and login home; useful when the CLI uses a non-default profile |
 | `OPENROUTER_API_KEY` | — | the OpenRouter API key. Its PRESENCE is the whole connect-state for the OpenRouter provider — there is no CLI to install or log in to. Read for existence only; never logged or serialised |
 | `ORGTREE_OPENROUTER_MODELS` | — | test/offline escape hatch: a path to a local `/api/v1/models` JSON payload, used instead of fetching the live model catalogue |
+| `ORGTREE_AGY` | auto-detected | path to the Antigravity `agy` CLI; resolution is override → `%LOCALAPPDATA%\agy\bin\agy.exe` → `PATH` |
+| `ORGTREE_AGY_HOME` | `~/.gemini` | where `agy` keeps its OAuth creds (it REUSES the Gemini CLI's `~/.gemini` store) and `antigravity-cli/` state |
+| `ORGTREE_AGY_MODELS` | — | test/offline escape hatch: a file of `id<TAB>name` lines used instead of spawning `agy models` |
 
 ### Provider CLIs and tier availability
 
-The installed backend supports four provider families. A tier name is global
+The installed backend supports five provider families. A tier name is global
 within an org, so it already identifies its provider; do not supply a separate
 provider argument to a hire or model switch.
 
@@ -59,12 +62,25 @@ provider argument to a hire or model switch.
 | Codex | luna (1), terra (2), sol (5) | Codex CLI is installed and signed in |
 | Gemini | flash (1), pro (2) | Gemini CLI is installed and signed in |
 | OpenRouter | spark (1), ember (2), flare (5), blaze (10), nova (20) | `OPENROUTER_API_KEY` is set |
+| Antigravity | orbit (2) | the `agy` CLI is installed and signed in (reuses the Gemini `~/.gemini` OAuth) |
 
 Provider detection is read-only. For the CLI providers it checks the
 installation and their own login records; for OpenRouter it checks only
 whether a key is configured. It never copies or alters credentials. The
 Accounts panel and the disabled hire-chip tooltip show the next required
 action.
+
+Antigravity (`agy`) is Google's replacement for individual Gemini Code
+Assist — a full agentic CLI, not the Gemini ACP lane. Its one `orbit` tier
+is a **placeholder**: Google publishes no rates, so turn cost books **$0**
+(shown with a "not tracked" note) and the seat is a stand-in `2`. Two
+limits, stated in the hire surface and the agent's own identity: an `agy`
+agent gets **full local tools within its folder grants** (`scope.tools` is
+not enforceable — the CLI's built-ins can't be narrowed), and it is a
+**worker leaf** — it does real work in its folders but cannot message
+peers, hire, or ask (its MCP config is global-only). Not available in kiosk
+orgs, and — because `agy` is an account-OAuth login with no keyed path —
+not in headless orgs either.
 
 The OpenRouter tiers are five **price bands**, not per-model rows. A hired
 node picks any tool-capable OpenRouter model; its seat is the band that
@@ -236,7 +252,7 @@ these; ⚠ **an agent hiring must state every one explicitly** — no defaults a
 | `default_visibility` | `self` \| `team` \| `subtree` \| `full` | how much of the org chart a hire can see |
 | `default_effort` | `""` (CLI default) \| `low`…`max` | thinking effort; resolved **live** at turn start, so changing it moves existing agents too |
 | `permission_mode` | `acceptEdits` (default) | the CLI permission mode |
-| `tiers` / `models` | Claude: fable 10, opus 5, sonnet 2, haiku 1; Codex: sol 5, terra 2, luna 1; Gemini: pro 2, flash 1; OpenRouter: nova 20, blaze 10, flare 5, ember 2, spark 1 | credit cost per tier and the model each maps to (`ledger.py`) |
+| `tiers` / `models` | Claude: fable 10, opus 5, sonnet 2, haiku 1; Codex: sol 5, terra 2, luna 1; Gemini: pro 2, flash 1; OpenRouter: nova 20, blaze 10, flare 5, ember 2, spark 1; Antigravity: orbit 2 | credit cost per tier and the model each maps to (`ledger.py`) |
 
 MCP servers are discovered from the user's own `~/.claude.json` → `mcpServers`
 (`supervisor.py:466-472`), so orgtree grants from that list rather than defining servers itself.

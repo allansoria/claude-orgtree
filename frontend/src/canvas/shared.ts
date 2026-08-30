@@ -27,6 +27,7 @@ export const TIER_LETTER: Record<string, string> = {
   // S — the chip class carries the family
   flash: 'F', pro: 'P',
   spark: 'K', ember: 'E', flare: 'R', blaze: 'B', nova: 'N',
+  orbit: 'A',
 }
 export const TIERS = ['haiku', 'sonnet', 'opus', 'fable']
 /** seat cost per tier — mirrors ledger.TIERS. One table, four tiers; the
@@ -65,10 +66,17 @@ export const OPENROUTER_TIER_LETTER: Record<string, string> = {
 export const OPENROUTER_TIER_SEAT: Record<string, number> = {
   spark: 1, ember: 2, flare: 5, blaze: 10, nova: 20,
 }
+/** Antigravity (`agy`) — one placeholder band `orbit` (D-AG-2: no published
+ *  rates, so the seat is a stand-in 2). No model picker: `orbit` runs its
+ *  default model. Same separate-list rule as the other families. */
+export const ANTIGRAVITY_TIERS = ['orbit']
+export const ANTIGRAVITY_TIER_LETTER: Record<string, string> = { orbit: 'A' }
+export const ANTIGRAVITY_TIER_SEAT: Record<string, number> = { orbit: 2 }
 /** Provider-neutral surfaces (for example the live-agent summary) use this;
  * provider-specific controls keep using their family list. */
 export const ALL_TIERS = [
   ...TIERS, ...CODEX_TIERS, ...GEMINI_TIERS, ...OPENROUTER_TIERS,
+  ...ANTIGRAVITY_TIERS,
 ]
 
 /** Which PROVIDER a tier runs on — the UI mirror of backend
@@ -85,16 +93,18 @@ export const ALL_TIERS = [
  *  at risk. */
 export const providerOf = (
   tier: string,
-): 'openai' | 'google' | 'openrouter' | 'claude' =>
+): 'openai' | 'google' | 'openrouter' | 'antigravity' | 'claude' =>
   (CODEX_TIERS.includes(tier) ? 'openai'
     : GEMINI_TIERS.includes(tier) ? 'google'
-      : OPENROUTER_TIERS.includes(tier) ? 'openrouter' : 'claude')
+      : OPENROUTER_TIERS.includes(tier) ? 'openrouter'
+        : ANTIGRAVITY_TIERS.includes(tier) ? 'antigravity' : 'claude')
 
 /** How a provider is named to the user in prose. The dialog says "Codex",
  *  not "openai" — the user picks tiers by the product name they see on the
  *  chips and in the accounts panel. */
 export const PROVIDER_LABEL: Record<string, string> = {
-  openai: 'Codex', google: 'Gemini', openrouter: 'OpenRouter', claude: 'Claude' }
+  openai: 'Codex', google: 'Gemini', openrouter: 'OpenRouter',
+  antigravity: 'Antigravity', claude: 'Claude' }
 
 // ---------------------------------------------------------------- view types
 // The canvas overlays the payload's TreeNode with synthetic cards — the eye

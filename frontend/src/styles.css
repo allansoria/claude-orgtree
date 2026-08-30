@@ -358,6 +358,7 @@ button.badge.retired-fold:hover { border-color: var(--accent); }
 .chip.agents b.t-flare { color: var(--tier-flare); }
 .chip.agents b.t-blaze { color: var(--tier-blaze); }
 .chip.agents b.t-nova { color: var(--tier-nova); }
+.chip.agents b.t-orbit { color: var(--tier-orbit); }
 /* credit requests (inbox panel): old → new (+Δ), reason, one-click verdict */
 .credreq {
   background: var(--bg); border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line-soft));
@@ -415,6 +416,7 @@ button.badge.retired-fold:hover { border-color: var(--accent); }
 .sq.tier-flare { border-top-color: color-mix(in srgb, var(--tier-flare) 55%, var(--line)); }
 .sq.tier-blaze { border-top-color: color-mix(in srgb, var(--tier-blaze) 55%, var(--line)); }
 .sq.tier-nova { border-top-color: color-mix(in srgb, var(--tier-nova) 55%, var(--line)); }
+.sq.tier-orbit { border-top-color: color-mix(in srgb, var(--tier-orbit) 55%, var(--line)); }
 .sq.mini.tier-luna { --mini-tier: var(--tier-luna); }
 .sq.mini.tier-terra { --mini-tier: var(--tier-terra); }
 .sq.mini.tier-sol { --mini-tier: var(--tier-sol); }
@@ -425,6 +427,7 @@ button.badge.retired-fold:hover { border-color: var(--accent); }
 .sq.mini.tier-flare { --mini-tier: var(--tier-flare); }
 .sq.mini.tier-blaze { --mini-tier: var(--tier-blaze); }
 .sq.mini.tier-nova { --mini-tier: var(--tier-nova); }
+.sq.mini.tier-orbit { --mini-tier: var(--tier-orbit); }
 /* At map zoom the old provider signal collapsed to a sub-pixel busy border,
    so provider could only be inferred from the tier token. Give the mini card
    a large-area family wash plus a solid rail: orange for Claude, teal for
@@ -509,6 +512,24 @@ button.badge.retired-fold:hover { border-color: var(--accent); }
 .sq.prov-openrouter.desk.tier-flare { border-top-color: var(--tier-flare); }
 .sq.prov-openrouter.desk.tier-blaze { border-top-color: var(--tier-blaze); }
 .sq.prov-openrouter.desk.tier-nova { border-top-color: var(--tier-nova); }
+/* Antigravity follows D-189's family-root contract: one amber provider
+   accent rebinds all inherited desk chrome; the lone orbit tier hue is
+   independent. */
+.sq.prov-antigravity.busy {
+  border-color: color-mix(in srgb, var(--prov-antigravity) 55%, transparent);
+}
+.sq.prov-antigravity.desk {
+  border-color: var(--prov-antigravity);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, .55),
+    0 0 0 1px color-mix(in srgb, var(--prov-antigravity) 25%, transparent);
+}
+.sq.prov-antigravity {
+  --provider-accent: var(--prov-antigravity);
+  --accent: var(--prov-antigravity);
+  --accent-soft: color-mix(in srgb, var(--prov-antigravity) 16%, transparent);
+  --accent-hover: color-mix(in srgb, var(--prov-antigravity) 82%, white);
+}
+.sq.prov-antigravity.desk.tier-orbit { border-top-color: var(--tier-orbit); }
 /* status never rides color alone (dataviz rule): the dots carry a SHAPE
    channel too — done is a filled circle, working pulses, blocked is a diamond,
    idle is a hollow ring */
@@ -990,6 +1011,10 @@ button.cc-name:hover {
   --tier-flare: #f43f5e;
   --tier-blaze: #facc15;
   --tier-nova: #c084fc;
+  /* Antigravity's lone placeholder band `orbit` — a warm gold, a shade
+     lighter than the amber provider accent below so the chip reads on the
+     dark card. O letter stays the redundant glyph. */
+  --tier-orbit: #f0b03e;
   /* the provider ACCENT — the blue counterpart of --accent: desk border,
      desk shadow ring and busy border for codex agents (dormant until codex
      hire lands; the class comes from cards.tsx `prov-openai`) */
@@ -998,6 +1023,10 @@ button.cc-name:hover {
      (the pro chip is more violet than blue; user spec 2026-08-29) */
   --prov-google: #5f6fdb;
   --prov-openrouter: #7c3aed;
+  /* the Antigravity provider accent — a warm amber, clear of claude
+     terracotta, codex/openai cyan, gemini blue-violet and openrouter
+     violet (D-189 family-root; class `prov-antigravity` from cards.tsx) */
+  --prov-antigravity: #d97706;
   --ice: #a8d4ea;           /* frozen (usage limit) — pale ice, deliberately
                                whiter than the saturated credit-bar cyans */
 }
@@ -1020,6 +1049,7 @@ button.cc-name:hover {
 .tier.t-flare { color: var(--tier-flare); border-color: color-mix(in srgb, var(--tier-flare) 45%, var(--line)); }
 .tier.t-blaze { color: var(--tier-blaze); border-color: color-mix(in srgb, var(--tier-blaze) 45%, var(--line)); }
 .tier.t-nova { color: var(--tier-nova); border-color: color-mix(in srgb, var(--tier-nova) 45%, var(--line)); }
+.tier.t-orbit { color: var(--tier-orbit); border-color: color-mix(in srgb, var(--tier-orbit) 45%, var(--line)); }
 /* lifecycle fills: archived fades (existing); knowledge bearers wash grey.
 
    ⚠ THE WASH IS A LIFECYCLE FILL, SO IT ONLY BELONGS ON A CARD THAT IS NOT
@@ -1864,6 +1894,7 @@ button.cc-name:hover {
 .hsof button.t-flare { color: var(--tier-flare); border-color: color-mix(in srgb, var(--tier-flare) 45%, var(--line)); }
 .hsof button.t-blaze { color: var(--tier-blaze); border-color: color-mix(in srgb, var(--tier-blaze) 45%, var(--line)); }
 .hsof button.t-nova { color: var(--tier-nova); border-color: color-mix(in srgb, var(--tier-nova) 45%, var(--line)); }
+.hsof button.t-orbit { color: var(--tier-orbit); border-color: color-mix(in srgb, var(--tier-orbit) 45%, var(--line)); }
 .hsof button.codex-preview:disabled { opacity: .45; border-style: dashed; }
 /* (the desk needs no special case — the universal --invz counter-scale keeps
    the chips screen-constant below the card border at any zoom) */
@@ -3453,6 +3484,11 @@ html.mobile .md table { display: block; overflow-x: auto; max-width: 100%; }
 .acct-provider-head.prov-openrouter {
   border-bottom-color: color-mix(in srgb, var(--prov-openrouter) 45%, var(--line));
 }
+.acct-provider-head.prov-antigravity {
+  border-bottom-color: color-mix(in srgb, var(--prov-antigravity) 45%, var(--line));
+}
+.acct-provider-head.prov-antigravity .acct-preview-tag { color: var(--prov-antigravity);
+  border-color: color-mix(in srgb, var(--prov-antigravity) 45%, var(--line)); }
 .acct-prov-note { font-size: 12.5px; line-height: 1.5; }
 .acct-prov-note code { font-size: 11px; }
 .acct-prov-tiers { display: flex; flex-wrap: wrap; gap: 6px 14px;

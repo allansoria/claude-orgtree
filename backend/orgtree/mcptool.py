@@ -608,6 +608,9 @@ TOOLS: list[dict[str, Any]] = [
             "signed in on this machine); "
             "spark 1, ember 2, flare 5, blaze 10, nova 20 (OpenRouter price "
             "bands — hireable only while an OPENROUTER_API_KEY is set); "
+            "orbit 2 (Antigravity `agy` — hireable while it is signed in; a "
+            "worker leaf: full local tools in its folders, but no "
+            "message/hire/ask); "
             "seat + grant must fit within YOUR free credits. "
             "ONE CALL IS ENOUGH: this tool also takes the fields you would "
             "otherwise have to orgtree_retool in straight afterwards "
@@ -630,7 +633,7 @@ TOOLS: list[dict[str, Any]] = [
                          "enum": ["haiku", "sonnet", "opus", "fable",
                                   "luna", "terra", "sol", "flash", "pro",
                                   "spark", "ember", "flare", "blaze",
-                                  "nova"]},
+                                  "nova", "orbit"]},
                 "model": {
                     "type": "string",
                     "description": "OpenRouter model id (only for OpenRouter "
@@ -1047,9 +1050,9 @@ TOOLS: list[dict[str, Any]] = [
             "fable 10 (Claude); luna 1 · terra 2 · sol 5 (Codex, needs the "
             "CLI signed in); flash 1 · pro 2 (Gemini, needs the CLI signed "
             "in); spark 1 · ember 2 · flare 5 · blaze 10 · nova 20 "
-            "(OpenRouter price bands, needs an OPENROUTER_API_KEY). A "
-            "switch that crosses an OpenRouter band IS a tier change "
-            "(⚠ D-OR-3)."),
+            "(OpenRouter price bands, needs an OPENROUTER_API_KEY); orbit 2 "
+            "(Antigravity `agy`, needs it signed in). A switch that crosses "
+            "an OpenRouter band IS a tier change (⚠ D-OR-3)."),
         "inputSchema": {"type": "object",
                         "properties": {"node": {"type": "string"},
                                        "tier": {"type": "string",
@@ -1059,7 +1062,8 @@ TOOLS: list[dict[str, Any]] = [
                                                          "sol", "flash",
                                                          "pro", "spark",
                                                          "ember", "flare",
-                                                         "blaze", "nova"]},
+                                                         "blaze", "nova",
+                                                         "orbit"]},
                                        "model": {
                                            "type": "string",
                                            "description": "OpenRouter model id (only for OpenRouter band tiers); the seat band is derived from its price"}},
