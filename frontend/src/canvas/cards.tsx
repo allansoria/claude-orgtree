@@ -14,7 +14,7 @@ import {
   LockIcon, MailIcon, RetireIcon, SettingsIcon,
 } from '../icons'
 import {
-  ago, CODEX_TIER_LETTER, CODEX_TIER_SEAT, CODEX_TIERS, DESK_SCALE, deskDpi, DRAFT, freezeKind, FREEZE_LABEL_SHORT, GEMINI_TIER_LETTER, GEMINI_TIER_SEAT, GEMINI_TIERS, NODE_H, NODE_W, OPENROUTER_TIER_LETTER, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, TIER_LETTER, TIERS, USER,
+  ago, ANTIGRAVITY_TIER_LETTER, ANTIGRAVITY_TIER_SEAT, ANTIGRAVITY_TIERS, CODEX_TIER_LETTER, CODEX_TIER_SEAT, CODEX_TIERS, DESK_SCALE, deskDpi, DRAFT, freezeKind, FREEZE_LABEL_SHORT, GEMINI_TIER_LETTER, GEMINI_TIER_SEAT, GEMINI_TIERS, NODE_H, NODE_W, OPENROUTER_TIER_LETTER, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, TIER_LETTER, TIERS, USER,
   USER_H, USER_W,
 } from './shared'
 import type {
@@ -41,6 +41,7 @@ interface UserNodeProps {
   codexHire?: { enabled: boolean; reason: string | null } | null
   geminiHire?: { enabled: boolean; reason: string | null } | null
   openrouterHire?: { enabled: boolean; reason: string | null } | null
+  antigravityHire?: { enabled: boolean; reason: string | null } | null
   kiosk: TreePayload['kiosk']
   pub: boolean
   kioskRemaining: number | null
@@ -71,7 +72,7 @@ interface UserNodeProps {
 }
 
 export function UserNode({ pos, isDrop, stats, pip, seats, codexHire,
-  geminiHire, openrouterHire,
+  geminiHire, openrouterHire, antigravityHire,
   kiosk, pub, kioskRemaining, kioskSegs, pxc, zoom, onInbox, onGear, onSpawn,
   onMailLink,
   focused, eyeW, onFocus, posX, onJump, map, op, slug, toast,
@@ -163,7 +164,7 @@ export function UserNode({ pos, isDrop, stats, pip, seats, codexHire,
           to tell it apart from anything */}
       <SpawnChips onSpawn={onSpawn} free={kioskRemaining ?? Infinity} seats={seats}
         maxTier={kiosk?.max_tier} soleHire codexHire={codexHire}
-        geminiHire={geminiHire} openrouterHire={openrouterHire} />
+        geminiHire={geminiHire} openrouterHire={openrouterHire} antigravityHire={antigravityHire} />
       {focused && (
         <EyeDesk map={map} op={op} slug={slug} toast={toast}
           /* `onFocus` IS `centerOn(USER)` — the very glide an unfocused eye
@@ -398,10 +399,11 @@ interface SpawnChipsProps {
   geminiHire?: { enabled: boolean; reason: string | null } | null
   /** D-OR-4: enabled bands open the searchable model picker. */
   openrouterHire?: { enabled: boolean; reason: string | null } | null
+  antigravityHire?: { enabled: boolean; reason: string | null } | null
 }
 
 function SpawnChips({ onSpawn, free, seats, maxTier, side, soleHire,
-  codexHire, geminiHire, openrouterHire }: SpawnChipsProps) {
+  codexHire, geminiHire, openrouterHire, antigravityHire }: SpawnChipsProps) {
   const [orBand, setOrBand] = useState<string | null>(null)
   // kiosk tier cap (user spec): tokens above the cap DISAPPEAR entirely —
   // seat cost doubles as the tier rank, so the cap is a simple cost compare
@@ -524,6 +526,33 @@ function SpawnChips({ onSpawn, free, seats, maxTier, side, soleHire,
             + (openrouterHire?.reason ?? 'hiring is not enabled yet')
             + ` (-${seats[t] ?? OPENROUTER_TIER_SEAT[t]})`}>
           {OPENROUTER_TIER_LETTER[t]}</button>
+      )),
+    })
+  // Antigravity: one `orbit` chip, no picker — click hires it directly.
+  // Kiosks render no antigravity row.
+  if (!maxTier && antigravityHire?.enabled)
+    fams.push({
+      key: 'antigravity', tiers: ANTIGRAVITY_TIERS,
+      body: ANTIGRAVITY_TIERS.map((t) => {
+        const seat = seats[t] ?? ANTIGRAVITY_TIER_SEAT[t] ?? 0
+        const cant = Number.isFinite(free) && free < seat
+        return <button key={t} disabled={cant} className={'t-' + t}
+          title={cant ? `${t}: needs ${seat} free (has ${free})`
+            : `hire an Antigravity ${t} agent — worker leaf, full local `
+              + `tools in its folders, no message/hire/ask (-${seat})`}
+          onClick={(e) => { e.stopPropagation(); onSpawn(t) }}>
+          {ANTIGRAVITY_TIER_LETTER[t]}</button>
+      }),
+    })
+  else if (!maxTier && !side)
+    fams.push({
+      key: 'antigravity', tiers: ANTIGRAVITY_TIERS,
+      body: ANTIGRAVITY_TIERS.map((t) => (
+        <button key={t} disabled className={'t-' + t + ' codex-preview'}
+          title={`${t} — Antigravity; `
+            + (antigravityHire?.reason ?? 'hiring is not enabled yet')
+            + ` (-${seats[t] ?? ANTIGRAVITY_TIER_SEAT[t]})`}>
+          {ANTIGRAVITY_TIER_LETTER[t]}</button>
       )),
     })
   fams.sort((a, b) => b.tiers.length - a.tiers.length)   // inward-first
@@ -777,7 +806,8 @@ export function DraftNode({ pos, draft, map, seats, maxTop, defaultTop, kioskRem
   // Claude terracotta and flips to teal only after creation.
   const providerClass = CODEX_TIERS.includes(draft.tier) ? ' prov-openai'
     : GEMINI_TIERS.includes(draft.tier) ? ' prov-google'
-      : OPENROUTER_TIERS.includes(draft.tier) ? ' prov-openrouter' : ''
+      : OPENROUTER_TIERS.includes(draft.tier) ? ' prov-openrouter'
+      : ANTIGRAVITY_TIERS.includes(draft.tier) ? ' prov-antigravity' : ''
   return (
     <div className={'sq draft' + providerClass} style={{
       transform: `translate(${pos.x}px, ${pos.y}px)`, width: NODE_W, height: NODE_H,
@@ -878,6 +908,7 @@ interface NodeSquareProps {
   codexHire?: { enabled: boolean; reason: string | null } | null
   geminiHire?: { enabled: boolean; reason: string | null } | null
   openrouterHire?: { enabled: boolean; reason: string | null } | null
+  antigravityHire?: { enabled: boolean; reason: string | null } | null
   map: Map<string, CanvasNode>
   op: OpFn
   slug: string
@@ -918,7 +949,7 @@ interface NodeSquareProps {
   dogs?: number
 }
 
-export function NodeSquare({ node, pos, lod, focused, dragging, isDrop, seats, codexHire, geminiHire, openrouterHire, map, op, slug,
+export function NodeSquare({ node, pos, lod, focused, dragging, isDrop, seats, codexHire, geminiHire, openrouterHire, antigravityHire, map, op, slug,
   toast, pxc, zoom, onSpawn, onSpawnSide, onSpawnTop, onConfig, onInbox, onLineage, onOpenDoc,
   onRecenter, onJump, pub, kioskRemaining, cascadeAlloc, maxTop, pile, compactAt, maxTier,
   onMailLink, onDragStart, onDragMove, onDragEnd, onDragCancel,
@@ -955,6 +986,7 @@ export function NodeSquare({ node, pos, lod, focused, dragging, isDrop, seats, c
   if (node.tier && CODEX_TIERS.includes(node.tier)) cls.push('prov-openai')
   if (node.tier && GEMINI_TIERS.includes(node.tier)) cls.push('prov-google')
   if (node.tier && OPENROUTER_TIERS.includes(node.tier)) cls.push('prov-openrouter')
+  if (node.tier && ANTIGRAVITY_TIERS.includes(node.tier)) cls.push('prov-antigravity')
   if (node.busy) cls.push('busy')
   // api_fallback (user feature 2026-08-19): a turn RUNNING on the org's own
   // API key wears the same red as the canvas border. No `busy` companion
@@ -1185,7 +1217,7 @@ export function NodeSquare({ node, pos, lod, focused, dragging, isDrop, seats, c
       {live && !node.isBearerOf && !node.bearer_state &&
         <SpawnChips onSpawn={onSpawn} free={kioskRemaining ?? Infinity} seats={seats}
           maxTier={maxTier} codexHire={codexHire} geminiHire={geminiHire}
-          openrouterHire={openrouterHire} />}
+          openrouterHire={openrouterHire} antigravityHire={antigravityHire} />}
       {/* FR-03: presented documents pop out the card's side as square icon
           chips — click opens the in-page reader. Not at desk zoom (the desk
           HEADER carries titled doc badges instead — world-scaled side chips
@@ -1211,11 +1243,11 @@ export function NodeSquare({ node, pos, lod, focused, dragging, isDrop, seats, c
           <SpawnChips side="left" onSpawn={(t, m) => onSpawnSide(t, 'left', m)}
             free={kioskRemaining ?? Infinity} seats={seats} maxTier={maxTier}
             codexHire={codexHire} geminiHire={geminiHire}
-            openrouterHire={openrouterHire} />
+            openrouterHire={openrouterHire} antigravityHire={antigravityHire} />
           <SpawnChips side="right" onSpawn={(t, m) => onSpawnSide(t, 'right', m)}
             free={kioskRemaining ?? Infinity} seats={seats} maxTier={maxTier}
             codexHire={codexHire} geminiHire={geminiHire}
-            openrouterHire={openrouterHire} />
+            openrouterHire={openrouterHire} antigravityHire={antigravityHire} />
         </>
       )}
       {/* FR-25: top-edge chips SPLICE a new superior above this node — the
@@ -1226,7 +1258,7 @@ export function NodeSquare({ node, pos, lod, focused, dragging, isDrop, seats, c
         <SpawnChips side="top" onSpawn={(t, m) => onSpawnTop(t, m)}
           free={kioskRemaining ?? Infinity} seats={seats} maxTier={maxTier}
           codexHire={codexHire} geminiHire={geminiHire}
-          openrouterHire={openrouterHire} />
+          openrouterHire={openrouterHire} antigravityHire={antigravityHire} />
       )}
       {/* portal to <body>: the card lives inside the world transform, where
           position:fixed would resolve against the scaled ancestor (same
