@@ -24,6 +24,17 @@ of the chosen model's price and can move under `switch_model`, and the hire
 surface is a model picker rather than chips. Read that doc alongside this one
 when the next provider is also API-only.
 
+Provider #5 (Antigravity, one placeholder `orbit` tier, `D-AG-1…D-AG-5`) is
+back to a CLI — `agy`, Google's replacement for individual Gemini Code
+Assist — but it stretches the playbook in new ways
+([design-antigravity.md](design-antigravity.md)): its built-in toolset
+cannot be narrowed so `scope.tools` is unenforceable (agents get full local
+tools within their folder grants); it publishes no rates so turns book $0
+with a visible note; it has no system-prompt flag so identity is the first
+user message; and its MCP config is global-only so the MVP agent is a
+"worker leaf" with no org powers. Read that doc when the next provider is a
+capable agentic CLI you don't fully control.
+
 Maintained live: every increment that lands for a provider updates the
 matching section here. If you are adding provider #4 and a step below didn't
 match reality, fix the step — this document is only worth what it predicts.

@@ -2905,6 +2905,73 @@ later P2; 429s surface as loud turn errors; **(5)** kiosk admission — the
 same sandbox-story hold-out as codex/gemini. Each is named in code where a
 reader would otherwise assume the capability.
 
+> **The `D-AG-N` series** is the Antigravity provider's own namespace (same
+> convention as `D-OR-N` above). Google deprecated the individual Gemini
+> Code Assist OAuth and pushed users to `agy` — a full agentic CLI, not the
+> gemini ACP lane — so orgtree got a fifth provider. Full recon +
+> increment map: [docs/design-antigravity.md](docs/design-antigravity.md).
+
+### D-AG-1 · an `agy` agent's built-in toolset cannot be narrowed
+Decision (antigravity-provider, 2026-08-30): `agy` is an agentic CLI with
+~50 built-in tools (`run_command`, `write_to_file`, `search_web`,
+`browser_*`, subagents, …) and NO CLI flag to disable or subset them. Every
+other provider enforces the node's `scope.tools.{bash,web,edit,subagents}`
+grants — the claude lane with `--disallowed-tools`, codex/gemini through the
+in-process dispatcher / permission hook. This lane CANNOT: `_agy_leg` runs
+`--dangerously-skip-permissions` and a hired `agy` agent has full local
+tools **within its `--add-dir` folder grants**, gated only by the folder
+bounds and the OS. Stated in the identity prompt and the hire surface so it
+is a chosen limitation, not a surprise. A real per-tool gate waits on `agy`
+gaining a `--disallowed-tools` flag or a permission-request event orgtree
+can answer per call.
+
+### D-AG-2 · an Antigravity turn books $0 — a visible under-count, not a silent one
+Decision (antigravity-provider, 2026-08-30): the `agy` wire reports token
+counts (`input_tokens`, `output_tokens`, `thinking_tokens`,
+`cache_read_tokens`) and **no cost**, and Google has published no
+Antigravity API rates. `providers.agy_cost` returns `0.0` unconditionally
+and the accounts panel / card carry a "cost not tracked on this lane" note —
+a deliberate zero the reader is told about, versus the Gemini rule's
+cardinal sin of a silent zero over real spend. The `orbit` seat is a
+placeholder `2` (mirroring the other mid tiers) since it cannot be
+price-honest. Both revisit the day rates exist — `agy_cost` is written to
+make the swap a one-liner.
+
+### D-AG-3 · identity rides the first user message
+Decision (antigravity-provider, 2026-08-30): `agy` has no `--system-prompt`
+/ instruction flag. On a NEW conversation `AgyTurn` sends `identity` as the
+first `{"event":"user"}` message, then the caller's input as the second —
+`_queue_initial` reserves both result slots atomically so the identity turn
+completing cannot make the turn look finished. On a RESUMED conversation the
+identity is not re-sent (it is already in the transcript `agy` holds).
+`--agent <name>` is not used: there is no way to define one headlessly
+per node.
+
+### D-AG-4 · `agy mcp` config is global-only, so an MVP `agy` agent is a worker leaf
+Decision (antigravity-provider, 2026-08-30): `agy mcp add` writes ONE global
+`~/.gemini/config/mcp_config.json`; there is no per-session / per-invocation
+MCP override. orgtree needs a distinct `ORGTREE_NODE` per concurrent agent,
+which a fixed global config cannot carry, and rewriting it per spawn races
+(agy reads it at process start, seconds after the write). So the MVP
+attaches **no** orgtree MCP server: an `agy` agent is a **worker leaf** — it
+runs real work in its granted folders but cannot `orgtree_message` peers,
+hire, or ask. A proper fix (a per-node `agy` home so each agent gets its own
+`mcp_config.json`, if `agy` gains a home override) is a later increment.
+
+### D-AG-5 · what stays deliberately OUT of the Antigravity MVP
+Decision (antigravity-provider, 2026-08-30): **(1)** org powers / MCP (D-AG-4
+— the worker-leaf limitation); **(2)** the generation split —
+`_compact_split_body` refuses cleanly (`agy` has no fork verb), the
+cheap-compact is the path (same hold-out as gemini/openrouter); **(3)** a
+model picker UI (the design's D-AG-4-analog picker) — the `orbit` band runs
+its default model until the frontend picker lands; **(4)** inline images —
+`agy` image input is unverified, so `_agy_leg` drops `images`; **(5)** kiosk
+admission and headless hire — held out (kiosk sandbox story; headless
+because `agy` is account-OAuth only, no keyed path — `provider_hire_gate`
+refuses both). **(6)** real-time item journaling — the leg writes a
+user/assistant/usage record set at turn end, not per-item like the codex
+lane.
+
 ---
 
 ## Mail & messaging
