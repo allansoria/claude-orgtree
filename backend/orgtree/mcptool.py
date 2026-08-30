@@ -631,6 +631,11 @@ TOOLS: list[dict[str, Any]] = [
                                   "luna", "terra", "sol", "flash", "pro",
                                   "spark", "ember", "flare", "blaze",
                                   "nova"]},
+                "model": {
+                    "type": "string",
+                    "description": "OpenRouter model id (only for OpenRouter "
+                                   "band tiers); the seat band is derived "
+                                   "from its price"},
                 "grant": {"type": "integer", "minimum": 0,
                           "description": "credits it may spend on ITS OWN hires"},
                 "charter": {"type": "string",
@@ -1054,7 +1059,10 @@ TOOLS: list[dict[str, Any]] = [
                                                          "sol", "flash",
                                                          "pro", "spark",
                                                          "ember", "flare",
-                                                         "blaze", "nova"]}},
+                                                         "blaze", "nova"]},
+                                       "model": {
+                                           "type": "string",
+                                           "description": "OpenRouter model id (only for OpenRouter band tiers); the seat band is derived from its price"}},
                         "required": ["node", "tier"]},
     },
     {

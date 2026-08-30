@@ -376,6 +376,67 @@ def main():
     check("gate: no key refuses; key present passes; headless OK (keyed); "
           "kiosk refuses; claude ungated", or_gate)
 
+    print("§8 D-OR-3 slug storage and dynamic-band switches")
+
+    def slug_hire_and_switch():
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-fake"
+        dyn = Org.create("or-slug-test")
+        dyn.hire(USER, None, "opus", 40, "payer")
+        # The caller-supplied band is only an OpenRouter-family marker. The
+        # catalogue price is authoritative and resolves gpt-5 to flare.
+        band = provider_hire_gate(dyn, "spark", "openai/gpt-5")
+        eq(band, "flare", "slug-derived hire band")
+        dyn.hire(USER, "payer", band or "", 0, "router",
+                 or_slug="openai/gpt-5")
+        eq((dyn.node("router")["model"], dyn.node("router").get("or_slug"),
+            dyn.seat_cost("router")),
+           ("flare", "openai/gpt-5", 5), "slug hire storage")
+
+        # A cross-band slug is a real tier change: it pays the new seat and
+        # the same provider gate runs again before the ledger commits.
+        band = provider_hire_gate(
+            dyn, "flare", "anthropic/claude-opus-4.1")
+        dyn.switch_model(USER, "router", band or "",
+                         "anthropic/claude-opus-4.1")
+        eq((dyn.node("router")["model"], dyn.node("router").get("or_slug"),
+            dyn.seat_cost("router")),
+           ("nova", "anthropic/claude-opus-4.1", 20),
+           "cross-band switch")
+
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        raises(lambda: provider_hire_gate(
+                   dyn, "nova", "openai/gpt-4o-mini"),
+               "OPENROUTER_API_KEY", "cross-band switch re-gate")
+        eq((dyn.node("router")["model"], dyn.node("router").get("or_slug")),
+           ("nova", "anthropic/claude-opus-4.1"),
+           "refused switch is atomic")
+    check("slug→band at hire; cross-band switch re-prices and re-gates",
+          slug_hire_and_switch)
+
+    def bad_slugs():
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-fake"
+        bad = Org.create("or-bad-slug-test")
+        raises(lambda: provider_hire_gate(bad, "spark", "no/such-model"),
+               "unknown or does not support tools", "unknown slug")
+        raises(lambda: provider_hire_gate(
+                   bad, "spark", "some/embedding-model"),
+               "unknown or does not support tools", "non-tool slug")
+    check("unknown and non-tool-capable slugs are refused loudly", bad_slugs)
+
+    def kiosk_band_ceiling():
+        ko = Org.create("or-kiosk-band-test")
+        ko.hire(USER, None, "spark", 30, "router",
+                or_slug="openai/gpt-4o-mini")
+        ko.d["kiosk"] = {"max_scope": {"max_tier": "spark"}}
+        raises(lambda: ko.switch_model(
+                   USER, "router", "blaze",
+                   "anthropic/claude-sonnet-4.5"),
+               "kiosk ceiling", "upward band switch")
+        eq((ko.node("router")["model"], ko.node("router").get("or_slug")),
+           ("spark", "openai/gpt-4o-mini"), "ceiling refusal is atomic")
+    check("kiosk max_tier blocks a slug switch crossing upward",
+          kiosk_band_ceiling)
+
     print(f"\n{PASS} checks passed")
 
 

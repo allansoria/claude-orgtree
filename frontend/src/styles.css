@@ -353,6 +353,11 @@ button.badge.retired-fold:hover { border-color: var(--accent); }
 .chip.agents b.t-sol { color: var(--tier-sol); }
 .chip.agents b.t-flash { color: var(--tier-flash); }
 .chip.agents b.t-pro { color: var(--tier-pro); }
+.chip.agents b.t-spark { color: var(--tier-spark); }
+.chip.agents b.t-ember { color: var(--tier-ember); }
+.chip.agents b.t-flare { color: var(--tier-flare); }
+.chip.agents b.t-blaze { color: var(--tier-blaze); }
+.chip.agents b.t-nova { color: var(--tier-nova); }
 /* credit requests (inbox panel): old → new (+Δ), reason, one-click verdict */
 .credreq {
   background: var(--bg); border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line-soft));
@@ -405,11 +410,21 @@ button.badge.retired-fold:hover { border-color: var(--accent); }
 .sq.tier-sol { border-top-color: color-mix(in srgb, var(--tier-sol) 55%, var(--line)); }
 .sq.tier-flash { border-top-color: color-mix(in srgb, var(--tier-flash) 55%, var(--line)); }
 .sq.tier-pro { border-top-color: color-mix(in srgb, var(--tier-pro) 55%, var(--line)); }
+.sq.tier-spark { border-top-color: color-mix(in srgb, var(--tier-spark) 55%, var(--line)); }
+.sq.tier-ember { border-top-color: color-mix(in srgb, var(--tier-ember) 55%, var(--line)); }
+.sq.tier-flare { border-top-color: color-mix(in srgb, var(--tier-flare) 55%, var(--line)); }
+.sq.tier-blaze { border-top-color: color-mix(in srgb, var(--tier-blaze) 55%, var(--line)); }
+.sq.tier-nova { border-top-color: color-mix(in srgb, var(--tier-nova) 55%, var(--line)); }
 .sq.mini.tier-luna { --mini-tier: var(--tier-luna); }
 .sq.mini.tier-terra { --mini-tier: var(--tier-terra); }
 .sq.mini.tier-sol { --mini-tier: var(--tier-sol); }
 .sq.mini.tier-flash { --mini-tier: var(--tier-flash); }
 .sq.mini.tier-pro { --mini-tier: var(--tier-pro); }
+.sq.mini.tier-spark { --mini-tier: var(--tier-spark); }
+.sq.mini.tier-ember { --mini-tier: var(--tier-ember); }
+.sq.mini.tier-flare { --mini-tier: var(--tier-flare); }
+.sq.mini.tier-blaze { --mini-tier: var(--tier-blaze); }
+.sq.mini.tier-nova { --mini-tier: var(--tier-nova); }
 /* At map zoom the old provider signal collapsed to a sub-pixel busy border,
    so provider could only be inferred from the tier token. Give the mini card
    a large-area family wash plus a solid rail: orange for Claude, teal for
@@ -473,6 +488,27 @@ button.badge.retired-fold:hover { border-color: var(--accent); }
 }
 .sq.prov-google.desk.tier-flash { border-top-color: var(--tier-flash); }
 .sq.prov-google.desk.tier-pro { border-top-color: var(--tier-pro); }
+/* OpenRouter follows D-189's family-root contract: one violet provider
+   accent rebinds all inherited desk chrome; tier hues remain independent. */
+.sq.prov-openrouter.busy {
+  border-color: color-mix(in srgb, var(--prov-openrouter) 55%, transparent);
+}
+.sq.prov-openrouter.desk {
+  border-color: var(--prov-openrouter);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, .55),
+    0 0 0 1px color-mix(in srgb, var(--prov-openrouter) 25%, transparent);
+}
+.sq.prov-openrouter {
+  --provider-accent: var(--prov-openrouter);
+  --accent: var(--prov-openrouter);
+  --accent-soft: color-mix(in srgb, var(--prov-openrouter) 16%, transparent);
+  --accent-hover: color-mix(in srgb, var(--prov-openrouter) 82%, white);
+}
+.sq.prov-openrouter.desk.tier-spark { border-top-color: var(--tier-spark); }
+.sq.prov-openrouter.desk.tier-ember { border-top-color: var(--tier-ember); }
+.sq.prov-openrouter.desk.tier-flare { border-top-color: var(--tier-flare); }
+.sq.prov-openrouter.desk.tier-blaze { border-top-color: var(--tier-blaze); }
+.sq.prov-openrouter.desk.tier-nova { border-top-color: var(--tier-nova); }
 /* status never rides color alone (dataviz rule): the dots carry a SHAPE
    channel too — done is a filled circle, working pulses, blocked is a diamond,
    idle is a hollow ring */
@@ -947,6 +983,13 @@ button.cc-name:hover {
      redundant glyph. */
   --tier-flash: #aee2f9;
   --tier-pro: #6b45d6;
+  /* OpenRouter's fire-band family: five distinct chip hues. Provider chrome
+     stays violet below; these continue to identify price bands within it. */
+  --tier-spark: #f9a8d4;
+  --tier-ember: #fb923c;
+  --tier-flare: #f43f5e;
+  --tier-blaze: #facc15;
+  --tier-nova: #c084fc;
   /* the provider ACCENT — the blue counterpart of --accent: desk border,
      desk shadow ring and busy border for codex agents (dormant until codex
      hire lands; the class comes from cards.tsx `prov-openai`) */
@@ -954,6 +997,7 @@ button.cc-name:hover {
   /* the gemini provider accent — mid bluish-violet, MORE BLUE than violet
      (the pro chip is more violet than blue; user spec 2026-08-29) */
   --prov-google: #5f6fdb;
+  --prov-openrouter: #7c3aed;
   --ice: #a8d4ea;           /* frozen (usage limit) — pale ice, deliberately
                                whiter than the saturated credit-bar cyans */
 }
@@ -971,6 +1015,11 @@ button.cc-name:hover {
 .tier.t-sol { color: var(--tier-sol); border-color: color-mix(in srgb, var(--tier-sol) 45%, var(--line)); }
 .tier.t-flash { color: var(--tier-flash); border-color: color-mix(in srgb, var(--tier-flash) 45%, var(--line)); }
 .tier.t-pro { color: var(--tier-pro); border-color: color-mix(in srgb, var(--tier-pro) 45%, var(--line)); }
+.tier.t-spark { color: var(--tier-spark); border-color: color-mix(in srgb, var(--tier-spark) 45%, var(--line)); }
+.tier.t-ember { color: var(--tier-ember); border-color: color-mix(in srgb, var(--tier-ember) 45%, var(--line)); }
+.tier.t-flare { color: var(--tier-flare); border-color: color-mix(in srgb, var(--tier-flare) 45%, var(--line)); }
+.tier.t-blaze { color: var(--tier-blaze); border-color: color-mix(in srgb, var(--tier-blaze) 45%, var(--line)); }
+.tier.t-nova { color: var(--tier-nova); border-color: color-mix(in srgb, var(--tier-nova) 45%, var(--line)); }
 /* lifecycle fills: archived fades (existing); knowledge bearers wash grey.
 
    ⚠ THE WASH IS A LIFECYCLE FILL, SO IT ONLY BELONGS ON A CARD THAT IS NOT
@@ -1810,6 +1859,11 @@ button.cc-name:hover {
 .hsof button.t-sol { color: var(--tier-sol); border-color: color-mix(in srgb, var(--tier-sol) 45%, var(--line)); }
 .hsof button.t-flash { color: var(--tier-flash); border-color: color-mix(in srgb, var(--tier-flash) 45%, var(--line)); }
 .hsof button.t-pro { color: var(--tier-pro); border-color: color-mix(in srgb, var(--tier-pro) 45%, var(--line)); }
+.hsof button.t-spark { color: var(--tier-spark); border-color: color-mix(in srgb, var(--tier-spark) 45%, var(--line)); }
+.hsof button.t-ember { color: var(--tier-ember); border-color: color-mix(in srgb, var(--tier-ember) 45%, var(--line)); }
+.hsof button.t-flare { color: var(--tier-flare); border-color: color-mix(in srgb, var(--tier-flare) 45%, var(--line)); }
+.hsof button.t-blaze { color: var(--tier-blaze); border-color: color-mix(in srgb, var(--tier-blaze) 45%, var(--line)); }
+.hsof button.t-nova { color: var(--tier-nova); border-color: color-mix(in srgb, var(--tier-nova) 45%, var(--line)); }
 .hsof button.codex-preview:disabled { opacity: .45; border-style: dashed; }
 /* (the desk needs no special case — the universal --invz counter-scale keeps
    the chips screen-constant below the card border at any zoom) */
@@ -3396,11 +3450,55 @@ html.mobile .md table { display: block; overflow-x: auto; max-width: 100%; }
 .acct-provider-head.prov-google { border-bottom-color: color-mix(in srgb, var(--prov-google) 45%, var(--line)); }
 .acct-provider-head.prov-google .acct-preview-tag { color: var(--prov-google);
   border-color: color-mix(in srgb, var(--prov-google) 45%, var(--line)); }
+.acct-provider-head.prov-openrouter {
+  border-bottom-color: color-mix(in srgb, var(--prov-openrouter) 45%, var(--line));
+}
 .acct-prov-note { font-size: 12.5px; line-height: 1.5; }
 .acct-prov-note code { font-size: 11px; }
 .acct-prov-tiers { display: flex; flex-wrap: wrap; gap: 6px 14px;
   font-size: 12.5px; }
 .acct-prov-tier { display: inline-flex; align-items: center; gap: 6px; }
+.or-account-bands button.acct-prov-tier {
+  background: none; border: none; color: var(--ink); padding: 2px 0;
+  font: inherit; cursor: pointer;
+}
+.or-account-bands button.acct-prov-tier:hover { color: var(--ink-strong); }
+
+/* D-OR-4 searchable model catalogue/picker. The price/context/reasoning
+   columns remain aligned across ~310 rows and collapse naturally on mobile. */
+.or-picker-overlay { z-index: 65; }
+.settings.or-picker { width: min(920px, 94vw); max-height: 86vh;
+  --accent: var(--prov-openrouter);
+  --accent-soft: color-mix(in srgb, var(--prov-openrouter) 16%, transparent); }
+.or-band-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.or-band { display: inline-flex; align-items: center; gap: 6px;
+  background: var(--input); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--ink); padding: 4px 8px; }
+.or-band.on { border-color: var(--accent); background: var(--accent-soft); }
+.or-search { width: 100%; }
+.or-model-list { min-height: 120px; max-height: 56vh; overflow-y: auto;
+  border: 1px solid var(--line-soft); border-radius: 6px; background: var(--bg); }
+.or-model-row { width: 100%; display: grid;
+  grid-template-columns: minmax(220px, 1fr) 190px 78px 150px 24px;
+  gap: 10px; align-items: center; text-align: left; color: var(--ink);
+  background: none; border: 0; border-bottom: 1px solid var(--line-soft);
+  border-radius: 0; padding: 6px 8px; font-size: 11.5px; }
+button.or-model-row { cursor: pointer; }
+button.or-model-row:hover, .or-model-row.on {
+  background: color-mix(in srgb, var(--prov-openrouter) 12%, var(--panel)); }
+.or-model-main { min-width: 0; display: flex; flex-direction: column; }
+.or-model-main b, .or-model-main .mono { overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.or-model-price, .or-model-context, .or-model-reason { white-space: nowrap; }
+.or-empty { padding: 18px 10px; text-align: center; }
+.or-config-pick { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.or-config-pick .mono { overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+@media (max-width: 700px) {
+  .or-model-row { grid-template-columns: minmax(0, 1fr) auto 24px; }
+  .or-model-price { grid-column: 1; }
+  .or-model-context, .or-model-reason { display: none; }
+}
 /* ---- the header usage modal's per-account sections ---- */
 .usage-acct { display: flex; flex-direction: column; gap: 6px;
   border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }

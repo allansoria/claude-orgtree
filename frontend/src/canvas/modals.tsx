@@ -18,8 +18,9 @@ import { pickFolder } from '../picker'
 import {
   CloseIcon, DeleteIcon, FolderIcon, LayersIcon, SettingsIcon,
 } from '../icons'
-import { ago, CODEX_TIER_SEAT, CODEX_TIERS, GEMINI_TIER_SEAT, GEMINI_TIERS, MODEL_VERSIONS, pileOrder, PROVIDER_LABEL, providerOf, TIER_LETTER, TIER_SEAT, TIERS, USER, useEsc } from './shared'
+import { ago, CODEX_TIER_SEAT, CODEX_TIERS, GEMINI_TIER_SEAT, GEMINI_TIERS, MODEL_VERSIONS, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, pileOrder, PROVIDER_LABEL, providerOf, TIER_LETTER, TIER_SEAT, TIERS, USER, useEsc } from './shared'
 import type { CanvasNode, DraftScope, DraftState, OpFn, Pile } from './shared'
+import { OpenRouterModelPicker } from './accounts'
 
 export interface ConfirmModalProps {
   title: ReactNode
@@ -571,11 +572,12 @@ interface NodeConfigProps {
   toast: ToastFn
   codexProvider?: ProviderInfo | null
   geminiProvider?: ProviderInfo | null
+  openrouterProvider?: ProviderInfo | null
   close: () => void
 }
 
 export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
-  geminiProvider, close }: NodeConfigProps) {
+  geminiProvider, openrouterProvider, close }: NodeConfigProps) {
   useEsc(close)
   const [asking, setAsking] =
     useState<'delete' | 'dissolve' | 'retire' | 'rescind' | 'crossprovider' | null>(null)
@@ -613,6 +615,9 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
   const setTeamCharter = set<string>('teamCharter', teamCharter)
   const model = val('model', node.tier!)
   const setModel = set<string>('model', model)
+  const orSlug = val('orSlug', node.or_slug ?? '')
+  const setOrSlug = set<string>('orSlug', orSlug)
+  const [orPickerOpen, setOrPickerOpen] = useState(false)
   const effort = val('effort', scope.effort ?? '')
   const setEffort = set<string>('effort', effort)
   const pm = val('pm', scope.permission_mode ?? 'acceptEdits')
@@ -654,6 +659,8 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
   // D-196: does this save move the agent to a DIFFERENT PROVIDER? Answered by
   // the shared `providerOf`, never by testing tier membership inline — the
   // second copy of that question is what D-182 was about.
+  const modelChanged = model !== node.tier
+    || (OPENROUTER_TIERS.includes(model) && orSlug !== (node.or_slug ?? ''))
   const crossProvider = model !== node.tier
     && providerOf(model) !== providerOf(node.tier ?? '')
   // ONE save implementation, reached either directly or through the
@@ -661,8 +668,10 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
   // cannot drift from the unconfirmed one — and so CANCEL is simply "never
   // call this", which is what makes cancelling total rather than partial.
   const doSave = () =>
-    (model !== node.tier
-      ? op({ op: 'switch_model', node: node.id, tier: model })
+    (modelChanged
+      ? op({ op: 'switch_model', node: node.id, tier: model,
+             ...(OPENROUTER_TIERS.includes(model) && orSlug
+               ? { model: orSlug } : {}) })
       : Promise.resolve())
       .then(() => saveScope(slug, node.id,
         { add_dirs: dirs, tools, org_visibility: vis,
@@ -717,7 +726,8 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
   // while the frontend constants are only a startup fallback. Provider is an
   // axis over that one flat tier vocabulary, never a second price table.
   const tierSeat = (t: string) => tree.tiers?.[t]
-    ?? TIER_SEAT[t] ?? CODEX_TIER_SEAT[t] ?? GEMINI_TIER_SEAT[t] ?? 0
+    ?? TIER_SEAT[t] ?? CODEX_TIER_SEAT[t] ?? GEMINI_TIER_SEAT[t]
+    ?? OPENROUTER_TIER_SEAT[t] ?? 0
   // Keep the same refusal order as provider_hire_gate: provider presence and
   // login first, then org policy, then the headless authentication rule.
   const codexUnavailable = !codexProvider?.hire_enabled
@@ -735,12 +745,17 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
         && geminiProvider.status.kind !== 'vertex'
         ? 'headless requires a Gemini API-key login'
         : null
+  const openrouterUnavailable = !openrouterProvider?.hire_enabled
+    ? openrouterProvider?.reason ?? 'provider state unavailable'
+    : tree.kiosk ? 'unavailable in kiosk orgs' : null
   const unavailable = (t: string): string | null => {
     // The current tier remains a truthful selected no-op even if policy has
     // since tightened around it; save does not call switch_model for a no-op.
     if (t === node.tier) return null
     if (CODEX_TIERS.includes(t) && codexUnavailable) return codexUnavailable
     if (GEMINI_TIERS.includes(t) && geminiUnavailable) return geminiUnavailable
+    if (OPENROUTER_TIERS.includes(t) && openrouterUnavailable)
+      return openrouterUnavailable
     const cap = tree.kiosk?.max_tier
     if (cap && tierSeat(t) > tierSeat(cap)) return `above kiosk cap (${cap})`
     return null
@@ -943,7 +958,24 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
           <optgroup label="Gemini">
             {GEMINI_TIERS.map(modelOption)}
           </optgroup>
+          <optgroup label="OpenRouter — use picker below">
+            {OPENROUTER_TIERS.map((t) => (
+              <option key={t} value={t} disabled={t !== model}>
+                {t} · seat {tierSeat(t)}
+              </option>
+            ))}
+          </optgroup>
         </select>
+        {!tree.kiosk && <div className="or-config-pick">
+          <button type="button"
+            disabled={!!openrouterUnavailable && !OPENROUTER_TIERS.includes(model)}
+            title={openrouterUnavailable ?? 'search tool-capable OpenRouter models'}
+            onClick={() => setOrPickerOpen(true)}>
+            choose OpenRouter model…</button>
+          {OPENROUTER_TIERS.includes(model) && <span className="mono dim">
+            {orSlug || 'band default'}
+          </span>}
+        </div>}
 
         <div className="field-label">org-structure visibility</div>
         <select value={vis} onChange={(e) => setVis(e.target.value)}>
@@ -1062,6 +1094,10 @@ export function NodeConfig({ node, map, tree, slug, op, toast, codexProvider,
           onConfirm={doSave}
           close={() => setAsking(null)} />
       )}
+      {orPickerOpen && <OpenRouterModelPicker current={orSlug || null}
+        initialBand={OPENROUTER_TIERS.includes(model) ? model : null}
+        onChoose={(m) => { setModel(m.band); setOrSlug(m.id) }}
+        close={() => setOrPickerOpen(false)} />}
       {asking === 'retire' && (
         <ConfirmModal title={`retire ${node.id}?`}
           body={`It stops working and frees ${(node.seat ?? 0) + (node.grant ?? 0)} credit(s) back to its superior. Its context is KEPT — rehire brings it back exactly as it was.`}

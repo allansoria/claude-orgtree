@@ -13,7 +13,7 @@ import {
   FullscreenIcon, PublicIcon, RemoveIcon, ViewListIcon,
 } from '../icons'
 import {
-  ago, attentionPip, CODEX_TIER_LETTER, CODEX_TIER_SEAT, CODEX_TIERS, DOG_H, DOG_W, DRAFT, ease, edgeJumpPlacement, type EJForm, EXTERN, fallbackActive, flatten, GEMINI_TIER_LETTER, GEMINI_TIER_SEAT, GEMINI_TIERS, INBOX, INBOX_H, layout, NODE_H, NODE_W, orgPxc, segD,
+  ago, attentionPip, CODEX_TIER_LETTER, CODEX_TIER_SEAT, CODEX_TIERS, DOG_H, DOG_W, DRAFT, ease, edgeJumpPlacement, type EJForm, EXTERN, fallbackActive, flatten, GEMINI_TIER_LETTER, GEMINI_TIER_SEAT, GEMINI_TIERS, INBOX, INBOX_H, layout, NODE_H, NODE_W, OPENROUTER_TIER_LETTER, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, orgPxc, segD,
   segPoint, sizeOf, smooth, SPRING_C, SPRING_K, TIER_LETTER, TIERS, useCrowdPiles, USER, USER_H,
   USER_W, withDraftTree, Z_DESK, Z_MAX, Z_MINI,
 } from './shared'
@@ -26,6 +26,7 @@ import { DocReader } from './docs'
 import { NodeInboxModal, OrgInboxModal } from './mail'
 import { NodeConfig, PilePicker, UserConfig, WatchdogPanel } from './modals'
 import { DraftNode, NodeSquare, UserNode } from './cards'
+import { OpenRouterModelPicker } from './accounts'
 import { isCompact, isMobile, MaybePortal, sheetGate } from '../mobile'
 
 export interface OrgCanvasProps {
@@ -82,7 +83,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
   // The seen-stamp bookkeeping stays: the inbox count badge still uses it.
   const [, setInboxSeen] = useState(
     () => localStorage.getItem('orgtree-inbox-seen-' + slug) ?? '')
-  const seats = tree.tiers ?? { haiku: 1, sonnet: 2, opus: 5, fable: 10, luna: 1, terra: 2, sol: 5, flash: 1, pro: 2 }
+  const seats = tree.tiers ?? { haiku: 1, sonnet: 2, opus: 5, fable: 10, luna: 1, terra: 2, sol: 5, flash: 1, pro: 2, spark: 1, ember: 2, flare: 5, blaze: 10, nova: 20 }
   // FR-15 M8: hire surfaces render from the provider payload — whether the
   // codex family is hireable HERE and NOW (CLI installed + signed in) or
   // still a disabled preview, with the payload's own reason as the tooltip.
@@ -91,12 +92,16 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
   const [codexProvider, setCodexProvider] = useState<ProviderInfo | null>(null)
   const [geminiProvider, setGeminiProvider] =
     useState<ProviderInfo | null>(null)
+  const [openrouterProvider, setOpenrouterProvider] =
+    useState<ProviderInfo | null>(null)
   useEffect(() => {
     getProviders().then((p) => {
       const cx = p.providers.find((v) => v.id === 'openai')
       if (cx) setCodexProvider(cx)
       const gm = p.providers.find((v) => v.id === 'google')
       if (gm) setGeminiProvider(gm)
+      const or = p.providers.find((v) => v.id === 'openrouter')
+      if (or) setOpenrouterProvider(or)
     }).catch(() => {})
   }, [slug])
   const codexHire = codexProvider && {
@@ -106,6 +111,10 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
   const geminiHire = geminiProvider && {
     enabled: !!geminiProvider.hire_enabled,
     reason: geminiProvider.reason,
+  }
+  const openrouterHire = openrouterProvider && {
+    enabled: !!openrouterProvider.hire_enabled,
+    reason: openrouterProvider.reason,
   }
   // canonical retired-stack slot (user note 2026-08-06): display-order every
   // parent's children so archived siblings sit CONTIGUOUSLY at the first
@@ -1405,8 +1414,9 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
     return [...keep.values()]
   }, [tree.audiences, map, hidden])
 
-  const spawn = (parentId: string, tier: string) => {
-    setDraft({ parent: parentId === USER ? null : parentId, tier })
+  const spawn = (parentId: string, tier: string, model?: string) => {
+    setDraft({ parent: parentId === USER ? null : parentId, tier,
+               or_slug: model })
     // roughly OVERVIEW scale start to finish (user ruling): the form is
     // authored on a 200px virtual surface (scale .6 into the card), so
     // z ≈ 1.7 already renders authored px ≈ screen px — no screen-fill dive.
@@ -1417,9 +1427,10 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
   }
   // F-03: hire a COWORKER — same superior, placed to the chosen side of the
   // anchor. Top-level agents side-hire more top-levels (parent is the user).
-  const spawnBeside = (n: CanvasNode, tier: string, side: 'left' | 'right') => {
+  const spawnBeside = (n: CanvasNode, tier: string, side: 'left' | 'right',
+    model?: string) => {
     setDraft({ parent: !n.parent || n.parent === USER ? null : n.parent, tier,
-               beside: { anchor: n.id, side } })
+               or_slug: model, beside: { anchor: n.id, side } })
     setTimeout(() => centerOn(
       DRAFT, Math.min(2.05, Math.max(1.7, viewRef.current.z))), 60)
   }
@@ -1428,15 +1439,16 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
   // and the server splices atomically (hire + ordinal pin + move, one save).
   // The draft meanwhile WRAPS the anchor in the preview tree (withDraftTree),
   // so the form already sits in the final shape and confirm causes no reflow.
-  const spawnAbove = (n: CanvasNode, tier: string) => {
+  const spawnAbove = (n: CanvasNode, tier: string, model?: string) => {
     setDraft({ parent: !n.parent || n.parent === USER ? null : n.parent, tier,
-               above: { anchor: n.id } })
+               or_slug: model, above: { anchor: n.id } })
     setTimeout(() => centerOn(
       DRAFT, Math.min(2.05, Math.max(1.7, viewRef.current.z))), 60)
   }
   const confirmDraft = (name: string, grant: number, charter: string,
     scope: DraftScope | null) => {
     op({ op: 'hire', parent: draft!.parent, tier: draft!.tier, grant, name,
+         ...(draft!.or_slug ? { model: draft!.or_slug } : {}),
          charter: charter?.trim() || undefined,
          // FR-25: the anchor rides the hire op — the SERVER splices the new
          // node in as its superior atomically (one save, one broadcast), so
@@ -1696,6 +1708,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
               : Math.round(USER_H * 16 / 9)
             return <UserNode key={USER} pos={p} isDrop={dropId === USER} seats={seats}
               codexHire={codexHire} geminiHire={geminiHire}
+              openrouterHire={openrouterHire}
               stats={orgStats}
               kiosk={tree.kiosk} pub={!!tree.public} kioskRemaining={kioskRemaining}
               kioskSegs={tree.roots.filter((n) => n.state === 'live')
@@ -1725,7 +1738,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
                  (user spec 2026-08-19): the gen badge and gear in each panel
                  open the same canvas-level lineage/config surfaces */
               onNodeLineage={setLineageId} onNodeConfig={setConfigId}
-              onSpawn={(t) => spawn(USER, t)} />
+              onSpawn={(t, m) => spawn(USER, t, m)} />
           }
           if (n.id === DRAFT) {
             return <DraftNode key={DRAFT} pos={p} draft={draft!} map={map} seats={seats}
@@ -1741,11 +1754,12 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
               dragging={nodeDrag.current?.id === n.id && nodeDrag.current!.moved}
               isDrop={dropId === n.id}
               seats={seats} codexHire={codexHire} geminiHire={geminiHire}
+              openrouterHire={openrouterHire}
               map={map} op={op} slug={slug} toast={toast}
               pxc={pxPerCredit} zoom={view.z}
-              onSpawn={(t) => spawn(n.id, t)}
-              onSpawnSide={(t, side) => spawnBeside(n, t, side)}
-              onSpawnTop={(t) => spawnAbove(n, t)}
+              onSpawn={(t, m) => spawn(n.id, t, m)}
+              onSpawnSide={(t, side, m) => spawnBeside(n, t, side, m)}
+              onSpawnTop={(t, m) => spawnAbove(n, t, m)}
               onConfig={() => setConfigId(n.id)}
               onInbox={() => setInboxId(n.id)} onLineage={() => setLineageId(n.id)}
               onOpenDoc={setDocView}
@@ -1989,7 +2003,9 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
                     + (ghost ? ' ghost' : '')
                     + (n.tier && CODEX_TIERS.includes(n.tier) ? ' prov-openai'
                        : n.tier && GEMINI_TIERS.includes(n.tier)
-                         ? ' prov-google' : '')}
+                         ? ' prov-google'
+                         : n.tier && OPENROUTER_TIERS.includes(n.tier)
+                           ? ' prov-openrouter' : '')}
                   style={{ paddingLeft: 8 + depth * 14 }}
                   title={ghost
                     ? 'shown for context — this row does not match the '
@@ -2044,7 +2060,7 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
       {configId && map.get(configId) && (
         <MaybePortal><NodeConfig node={map.get(configId)!} map={map} tree={tree} slug={slug}
           op={op} toast={toast} codexProvider={codexProvider}
-          geminiProvider={geminiProvider}
+          geminiProvider={geminiProvider} openrouterProvider={openrouterProvider}
           close={() => setConfigId(null)} /></MaybePortal>
       )}
       {lineageId && map.get(lineageId) && (
@@ -2142,14 +2158,16 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
       {hireOpen && sheetId && map.get(sheetId) && (
         <MaybePortal>
           <HireSheet anchor={map.get(sheetId)!} seats={seats} codexHire={codexHire}
-            geminiHire={geminiHire}
+            geminiHire={geminiHire} openrouterHire={openrouterHire}
+            showOpenrouter={!tree.kiosk}
             defaultGrant={!map.get(sheetId)!.parent ? (tree.default_top_grant ?? 50) : 0}
             onClose={() => setHireOpen(false)}
-            onHire={(tier, name, grant, placement) => {
+            onHire={(tier, name, grant, placement, model) => {
               const a = map.get(sheetId)!
               const parentOf = !a.parent || a.parent === USER ? null : a.parent
               const parent = placement === 'below' ? a.id : parentOf
-              op({ op: 'hire', parent, tier, grant, name })
+              op({ op: 'hire', parent, tier, grant, name,
+                   ...(model ? { model } : {}) })
                 .then((r) => {
                   const born = r?.node
                   if (typeof born === 'string' && born) {
@@ -2182,19 +2200,24 @@ export function OrgCanvas({ tree, op, slug, toast, mailEvt, onInbox }: OrgCanvas
  *  is a full-screen form — and it carries PLACEMENT, so the F-03 side-hire
  *  and FR-25 splice semantics survive: below (report), left/right (coworker
  *  ordering), above (new superior — the anchor moves under the hire). */
-function HireSheet({ anchor, seats, codexHire, geminiHire, defaultGrant,
+function HireSheet({ anchor, seats, codexHire, geminiHire, openrouterHire,
+  showOpenrouter, defaultGrant,
   onHire,
   onClose }: {
   anchor: CanvasNode
   seats: Record<string, number>
   codexHire?: { enabled: boolean; reason: string | null } | null
   geminiHire?: { enabled: boolean; reason: string | null } | null
+  openrouterHire?: { enabled: boolean; reason: string | null } | null
+  showOpenrouter: boolean
   defaultGrant: number
   onHire: (tier: string, name: string, grant: number,
-    placement: 'below' | 'left' | 'right' | 'above') => void
+    placement: 'below' | 'left' | 'right' | 'above', model?: string) => void
   onClose: () => void
 }) {
   const [tier, setTier] = useState('sonnet')
+  const [orSlug, setOrSlug] = useState<string | undefined>()
+  const [orBand, setOrBand] = useState<string | null>(null)
   const [name, setName] = useState('')
   const [grant, setGrant] = useState(defaultGrant)
   const [placement, setPlacement] =
@@ -2218,6 +2241,24 @@ function HireSheet({ anchor, seats, codexHire, geminiHire, defaultGrant,
             </button>
           ))}
         </div>
+        {showOpenrouter && <>
+          <div className="field-label">
+            {openrouterHire?.enabled ? 'OpenRouter' : 'OpenRouter — unavailable'}</div>
+          <div className="hs-tiers">
+            {OPENROUTER_TIERS.map((t) => (
+              <button key={t}
+                className={'hs-tier t-' + t + (tier === t ? ' on' : '')}
+                disabled={!openrouterHire?.enabled}
+                title={openrouterHire?.enabled
+                  ? `choose a ${t} model`
+                  : (openrouterHire?.reason ?? 'hiring is not enabled yet')}
+                onClick={() => setOrBand(t)}>
+                <span className={'tier t-' + t}>{OPENROUTER_TIER_LETTER[t]}</span>
+                {t} · seat {seats[t] ?? OPENROUTER_TIER_SEAT[t]}
+              </button>
+            ))}
+          </div>
+        </>}
         <div className="field-label">
           {codexHire?.enabled ? 'Codex' : 'Codex — preview'}</div>
         <div className="hs-tiers">
@@ -2270,10 +2311,14 @@ function HireSheet({ anchor, seats, codexHire, geminiHire, defaultGrant,
           onChange={(e) => setGrant(Math.max(0, Math.round(Number(e.target.value) || 0)))} />
         <div className="row">
           <button className="primary" disabled={!ok}
-            onClick={() => onHire(tier, name.trim(), grant, placement)}>hire</button>
+            onClick={() => onHire(tier, name.trim(), grant, placement,
+              OPENROUTER_TIERS.includes(tier) ? orSlug : undefined)}>hire</button>
           <button onClick={onClose}>cancel</button>
         </div>
       </div>
+      {orBand && <OpenRouterModelPicker initialBand={orBand}
+        onChoose={(m) => { setTier(m.band); setOrSlug(m.id) }}
+        close={() => setOrBand(null)} />}
     </div>
   )
 }

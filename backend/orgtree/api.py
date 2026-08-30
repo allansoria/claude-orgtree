@@ -4070,15 +4070,16 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                                               a.get("body") or "",
                                               a.get("replaces"))
             elif body.tool == "orgtree_hire":
-                provider_hire_gate(org, a.get("tier"))
+                tier = provider_hire_gate(org, a.get("tier"), a.get("model"))
                 hdirs, dwarns = supervisor.sandbox_dirs_to_host(
                     org, a.get("add_dirs"))
                 result = org.hire(body.node, a.get("parent") or body.node,
-                                  a.get("tier"), _arg_int(a, "grant", 0),  # type: ignore[arg-type]  # ledger 422s a missing tier
+                                  tier, _arg_int(a, "grant", 0),  # type: ignore[arg-type]  # ledger 422s a missing tier
                                   a.get("name") or "", add_dirs=hdirs,
                                   tools=a.get("tools"),
                                   org_visibility=a.get("org_visibility"),
-                                  charter=a.get("charter"))
+                                  charter=a.get("charter"),
+                                  or_slug=a.get("model"))
                 if dwarns:
                     result.setdefault("warnings", []).extend(dwarns)
                 if result.get("node"):
@@ -4208,9 +4209,9 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
             elif body.tool == "orgtree_reallocate":
                 result = org.reallocate(body.node, a.get("node"), _arg_int(a, "delta", 0))  # type: ignore[arg-type]  # node() 422s on None
             elif body.tool == "orgtree_switch_model":
-                provider_hire_gate(org, a.get("tier"))
+                tier = provider_hire_gate(org, a.get("tier"), a.get("model"))
                 result = org.switch_model(body.node, a.get("node", ""),
-                                          a.get("tier", ""))
+                                          tier or "", a.get("model"))
             elif body.tool == "orgtree_status":
                 status = a.get("status", "working")
                 summary = a.get("summary", "")
@@ -5275,6 +5276,7 @@ class Op(Body):
     node: str | None = None       # target node (all but hire)
     parent: str | None = None     # hire target parent (None = top level)
     tier: str | None = None       # hire
+    model: str | None = None      # OpenRouter model id (hire / switch_model)
     grant: int | None = None      # hire / rehire / reallocate delta via `delta`
     name: str | None = None       # hire
     charter: str | None = None    # hire — short standing role card
@@ -5299,7 +5301,8 @@ class Op(Body):
     raise_ceiling: bool = False
 
 
-def provider_hire_gate(org: Org, tier: str | None) -> None:
+def provider_hire_gate(org: Org, tier: str | None,
+                       model: str | None = None) -> str | None:
     """FR-15 M4, the vision made checkable: a tier is hireable exactly while
     its provider's CLI is CONNECTED on this machine. Raises LedgerError (the
     ops/agent layers both turn that into a clean 422) NAMING the provider and
@@ -5328,7 +5331,21 @@ def provider_hire_gate(org: Org, tier: str | None) -> None:
         (⚠ D-OR-2), so this rule is satisfied there without a special case.
     """
     if not tier:
-        return
+        if model:
+            raise LedgerError(
+                "an OpenRouter model id also needs an OpenRouter band tier")
+        return tier
+    if model is not None:
+        if tier not in providers.OPENROUTER_TIERS:
+            raise LedgerError(
+                "the model field is only for OpenRouter band tiers "
+                f"({', '.join(providers.OPENROUTER_TIER_NAMES)})")
+        resolved = providers.band_for_slug(str(model))
+        if resolved is None:
+            raise LedgerError(
+                f"OpenRouter model {model!r} is unknown or does not support "
+                "tools; choose a tool-capable model from the OpenRouter picker")
+        tier = resolved
     if tier in providers.GEMINI_TIERS:
         gst = providers.gemini_status()
         if not gst.get("installed"):
@@ -5352,7 +5369,7 @@ def provider_hire_gate(org: Org, tier: str | None) -> None:
                 "a headless org may only hire tiers from KEYED providers "
                 "(user ruling 2026-08-28) — Gemini here is signed in with a "
                 "Google account login, not an API key")
-        return
+        return tier
     if tier in providers.OPENROUTER_TIERS:
         # ⚠ D-OR-2: OpenRouter is not a CLI — connect-state is just "is a key
         # configured" (env, or a per-org key). No install ladder, and no
@@ -5369,9 +5386,9 @@ def provider_hire_gate(org: Org, tier: str | None) -> None:
                 "kiosk orgs cannot hire OpenRouter tiers yet — held out "
                 "until the sandbox story is settled (the same holdout as "
                 "codex and gemini, user ruling 2026-08-28)")
-        return
+        return tier
     if tier not in providers.CODEX_TIERS:
-        return
+        return tier
     st = providers.codex_status()
     if not st.get("installed"):
         raise LedgerError(
@@ -5391,6 +5408,7 @@ def provider_hire_gate(org: Org, tier: str | None) -> None:
             "a headless org may only hire tiers from KEYED providers (user "
             "ruling 2026-08-28) — Codex here is signed in with a "
             "subscription login, not an API key")
+    return tier
 
 
 @app.post("/api/orgs/{slug}/ops")
@@ -5448,18 +5466,18 @@ def _org_op_locked(slug: str, body: Op, allow_raise: bool = False) -> dict[str, 
         if body.op == "hire":
             if body.tier is None or body.name is None:
                 raise LedgerError("hire needs tier and name")
-            provider_hire_gate(org, body.tier)
+            tier = provider_hire_gate(org, body.tier, body.model)
             if body.above is not None \
                     and org.node(body.above)["parent"] != body.parent:
                 raise LedgerError(
                     f"insert-superior: {body.above} does not report to "
                     f"{body.parent or 'the top level'}")
-            result = org.hire(body.actor, body.parent, body.tier,
+            result = org.hire(body.actor, body.parent, tier,  # type: ignore[arg-type]  # gate returns the resolved band; ledger 422s a missing tier
                               body.grant or 0, body.name, body.add_dirs,
                               tools=body.tools, org_visibility=body.org_visibility,
                               charter=body.charter,
                               external_handles=body.external_handles,
-                              raise_ceiling=rc)
+                              raise_ceiling=rc, or_slug=body.model)  # type: ignore[arg-type]
             if body.effort:
                 # applied WITH the hire, atomically (same save): the draft
                 # gear's effort used to ride a separate /scope call that the
@@ -5519,8 +5537,8 @@ def _org_op_locked(slug: str, body: Op, allow_raise: bool = False) -> dict[str, 
         elif body.op == "switch_model":
             if body.tier is None:
                 raise LedgerError("switch_model needs tier")
-            provider_hire_gate(org, body.tier)
-            result = org.switch_model(body.actor, body.node, body.tier)  # type: ignore[arg-type]
+            tier = provider_hire_gate(org, body.tier, body.model)
+            result = org.switch_model(body.actor, body.node, tier, body.model)  # type: ignore[arg-type]  # node()/ledger 422 on a bad node or tier
         elif body.op == "promote":
             result = org.promote(body.actor, body.node, body.new_parent)  # type: ignore[arg-type]
         elif body.op == "demote":

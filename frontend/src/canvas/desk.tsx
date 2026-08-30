@@ -24,7 +24,7 @@ import {
   HearingIcon, LayersIcon, LockIcon, MailIcon, PlayIcon, PsychologyIcon,
   SettingsIcon, SparkIcon, StopIcon, WarnIcon,
 } from '../icons'
-import { ago, ALL_TIERS, CODEX_TIER_SEAT, CODEX_TIERS, CopyIcon, EXTERN, freezeKind, FREEZE_LABEL, GEMINI_TIER_SEAT, GEMINI_TIERS, md, TIER_LETTER, TIER_SEAT, USER, useEsc, usePolled } from './shared'
+import { ago, ALL_TIERS, CODEX_TIER_SEAT, CODEX_TIERS, CopyIcon, EXTERN, freezeKind, FREEZE_LABEL, GEMINI_TIER_SEAT, GEMINI_TIERS, md, OPENROUTER_TIER_SEAT, OPENROUTER_TIERS, TIER_LETTER, TIER_SEAT, USER, useEsc, usePolled } from './shared'
 import {
   addPending, CHAT_WINDOW, dropPending, loadOlder as storeLoadOlder, markBusy,
   MAX_WINDOW, refreshConvo, useConvo,
@@ -1298,7 +1298,8 @@ export function LineagePanel({ node, op, slug, close }: LineagePanelProps) {
   // the claude-only table — so a codex or gemini bearer rendered "as sol ·
   // seat undefined" and "retire · frees undefined" in its own lineage panel.
   const SEAT = (t: string) =>
-    TIER_SEAT[t] ?? CODEX_TIER_SEAT[t] ?? GEMINI_TIER_SEAT[t] ?? 0
+    TIER_SEAT[t] ?? CODEX_TIER_SEAT[t] ?? GEMINI_TIER_SEAT[t]
+    ?? OPENROUTER_TIER_SEAT[t] ?? 0
   // D-197: which tiers a generation may be rehired at. A bearer is rehired to
   // be CONSULTED, and a consult resumes the transcript it holds — but a
   // transcript cannot cross providers, so the offer is every tier of the
@@ -1313,7 +1314,8 @@ export function LineagePanel({ node, op, slug, close }: LineagePanelProps) {
   // explains nothing; a disabled row with a reason does. Same semantics as
   // the model-switch dropdown in modals.tsx.
   const famOf = (t: string) => CODEX_TIERS.includes(t) ? 'codex'
-    : GEMINI_TIERS.includes(t) ? 'gemini' : 'claude'
+    : GEMINI_TIERS.includes(t) ? 'gemini'
+      : OPENROUTER_TIERS.includes(t) ? 'openrouter' : 'claude'
   const rehireWhy = (t: string, bearerTier: string): string | null =>
     famOf(t) === famOf(bearerTier) ? null
       : `its transcript is a ${famOf(bearerTier)} session — ${famOf(t)} `

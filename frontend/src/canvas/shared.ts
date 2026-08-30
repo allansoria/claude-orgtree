@@ -26,6 +26,7 @@ export const TIER_LETTER: Record<string, string> = {
   // flash shares F with fable by the same accepted collision as sol/sonnet's
   // S — the chip class carries the family
   flash: 'F', pro: 'P',
+  spark: 'K', ember: 'E', flare: 'R', blaze: 'B', nova: 'N',
 }
 export const TIERS = ['haiku', 'sonnet', 'opus', 'fable']
 /** seat cost per tier — mirrors ledger.TIERS. One table, four tiers; the
@@ -55,9 +56,20 @@ export const CODEX_TIER_SEAT: Record<string, number> = { luna: 1, terra: 2, sol:
 export const GEMINI_TIERS = ['flash', 'pro']
 export const GEMINI_TIER_LETTER: Record<string, string> = { flash: 'F', pro: 'P' }
 export const GEMINI_TIER_SEAT: Record<string, number> = { flash: 1, pro: 2 }
+/** OpenRouter's static price bands (D-OR-3/D-OR-4). The selected model slug
+ *  determines one of these five seats; it is not itself a ledger tier. */
+export const OPENROUTER_TIERS = ['spark', 'ember', 'flare', 'blaze', 'nova']
+export const OPENROUTER_TIER_LETTER: Record<string, string> = {
+  spark: 'K', ember: 'E', flare: 'R', blaze: 'B', nova: 'N',
+}
+export const OPENROUTER_TIER_SEAT: Record<string, number> = {
+  spark: 1, ember: 2, flare: 5, blaze: 10, nova: 20,
+}
 /** Provider-neutral surfaces (for example the live-agent summary) use this;
  * provider-specific controls keep using their family list. */
-export const ALL_TIERS = [...TIERS, ...CODEX_TIERS, ...GEMINI_TIERS]
+export const ALL_TIERS = [
+  ...TIERS, ...CODEX_TIERS, ...GEMINI_TIERS, ...OPENROUTER_TIERS,
+]
 
 /** Which PROVIDER a tier runs on — the UI mirror of backend
  *  `providers.provider_of` (D-196). Derived from the family lists ABOVE
@@ -71,15 +83,18 @@ export const ALL_TIERS = [...TIERS, ...CODEX_TIERS, ...GEMINI_TIERS]
  *  the answer decides whether a change CROSSES providers, and wrongly
  *  claiming a crossing would offer to destroy a conversation that was never
  *  at risk. */
-export const providerOf = (tier: string): 'openai' | 'google' | 'claude' =>
+export const providerOf = (
+  tier: string,
+): 'openai' | 'google' | 'openrouter' | 'claude' =>
   (CODEX_TIERS.includes(tier) ? 'openai'
-    : GEMINI_TIERS.includes(tier) ? 'google' : 'claude')
+    : GEMINI_TIERS.includes(tier) ? 'google'
+      : OPENROUTER_TIERS.includes(tier) ? 'openrouter' : 'claude')
 
 /** How a provider is named to the user in prose. The dialog says "Codex",
  *  not "openai" — the user picks tiers by the product name they see on the
  *  chips and in the accounts panel. */
 export const PROVIDER_LABEL: Record<string, string> = {
-  openai: 'Codex', google: 'Gemini', claude: 'Claude' }
+  openai: 'Codex', google: 'Gemini', openrouter: 'OpenRouter', claude: 'Claude' }
 
 // ---------------------------------------------------------------- view types
 // The canvas overlays the payload's TreeNode with synthetic cards — the eye
@@ -93,6 +108,8 @@ export interface CanvasNode {
   tier: string | null
   children: CanvasNode[]
   title?: string
+  /** D-OR-3: selected OpenRouter model id on persisted nodes. */
+  or_slug?: string | null
   /** set by flatten(): the parent card's id (null on the eye root) */
   parent?: string | null
   /** lineage pseudo-cards: the successor node this bearer floats beside */
@@ -222,6 +239,8 @@ export interface View { x: number; y: number; z: number }
 export interface DraftState {
   parent: string | null
   tier: string
+  /** D-OR-3: selected OpenRouter model id; tier is its derived price band. */
+  or_slug?: string
   /** F-03 side hire: the draft is a SIBLING placed to `side` of `anchor` —
    *  the hire lands under the same superior, and after birth a reorder pins
    *  the chosen ordering (left = before, right = after). */

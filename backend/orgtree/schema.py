@@ -198,6 +198,10 @@ class NodeDoc(TypedDict):
     is runtime bookkeeping the supervisor adds as turns happen."""
     session_id: str
     model: str                      # tier key into OrgDoc["tiers"]
+    # D-OR-3: for an OpenRouter price-band tier, the chosen model id. `model`
+    # stays the band (seat/chip/rank); this drives the /chat/completions call
+    # and the context window. Absent ⇒ the band's default model.
+    or_slug: NotRequired[str]
     parent: str | None              # None = top level (§7.4: the user is root)
     grant: int
     state: NodeState

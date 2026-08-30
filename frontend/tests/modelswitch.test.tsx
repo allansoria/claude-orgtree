@@ -32,6 +32,7 @@ function tree(extra: Partial<TreePayload> = {}): TreePayload {
     slug: 'org', dirs: [], tiers: {
       haiku: 1, sonnet: 2, opus: 5, fable: 10,
       luna: 1, terra: 2, sol: 5, flash: 1, pro: 2,
+      spark: 1, ember: 2, flare: 5, blaze: 10, nova: 20,
     }, max_top_grant: 100, default_effort: '', effort_default: 'high',
     cascade_hire: true, sandboxed: false, ...extra,
   } as TreePayload
@@ -49,7 +50,7 @@ type Mounted = { el: HTMLElement; ops: OpRequest[] }
 
 function configTest(name: string, body: (mount: (o?: {
   node?: CanvasNode; tree?: TreePayload; provider?: ProviderInfo | null
-  gemini?: ProviderInfo | null
+  gemini?: ProviderInfo | null; openrouter?: ProviderInfo | null
 }) => Promise<Mounted>) => Promise<void> | void): void {
   test(name, async (t: TestContext) => {
     useFakeClock(); installFetch(new FakeServer())
@@ -71,6 +72,10 @@ function configTest(name: string, body: (mount: (o?: {
                          status: { installed: true, connected: true,
                                    kind: 'api-key' } })
             : o.gemini}
+          openrouterProvider={o.openrouter === undefined
+            ? provider({ id: 'openrouter', label: 'OpenRouter', cli: null,
+                         status: { connected: true, kind: 'api-key' } })
+            : o.openrouter}
           close={noop} />,
         (el) => el,
       )
@@ -87,7 +92,8 @@ const option = (el: HTMLElement, tier: string) =>
 
 test('the header summary counts every provider family', async (t: TestContext) => {
   useFakeClock()
-  const tiers = ['opus', 'luna', 'terra', 'sol', 'flash', 'pro']
+  const tiers = ['opus', 'luna', 'terra', 'sol', 'flash', 'pro',
+    'spark', 'ember', 'flare', 'blaze', 'nova']
   const roots = tiers.map((tier, i) => ({
     ...node(tier), id: tier, busy: i === tiers.length - 1,
   })) as unknown as TreeNode[]
@@ -96,13 +102,15 @@ test('the header summary counts every provider family', async (t: TestContext) =
     (el) => el,
   )
   t.after(async () => { await view.unmount(); realClock() })
-  assert.match(view.el.textContent ?? '', /6 live · 1 working/)
+  assert.match(view.el.textContent ?? '', /11 live · 1 working/)
   assert.deepEqual(
     [...view.el.querySelectorAll<HTMLBRElement>('.agents b')]
       .map((b) => [b.className, b.textContent]),
     [
       ['t-opus', 'O1'], ['t-luna', 'L1'], ['t-terra', 'T1'], ['t-sol', 'S1'],
       ['t-flash', 'F1'], ['t-pro', 'P1'],
+      ['t-spark', 'K1'], ['t-ember', 'E1'], ['t-flare', 'R1'],
+      ['t-blaze', 'B1'], ['t-nova', 'N1'],
     ],
   )
 })
@@ -111,15 +119,18 @@ configTest('the switch lists every provider family with its ledger seats',
   async (mount) => {
     const { el } = await mount()
     const groups = [...el.querySelectorAll('select.model-switch optgroup')]
-    // grew to three at D-189 (gemini)
+    // OpenRouter's bands are inventory options; actual selection is the picker.
     assert.deepEqual(groups.map((g) => g.getAttribute('label')),
-      ['Claude', 'Codex', 'Gemini'])
+      ['Claude', 'Codex', 'Gemini', 'OpenRouter — use picker below'])
     assert.deepEqual(options(el).map((o) => [o.value, o.textContent?.trim()]), [
       ['haiku', 'haiku · seat 1'], ['sonnet', 'sonnet · seat 2'],
       ['opus', 'opus · seat 5'], ['fable', 'fable · seat 10'],
       ['luna', 'luna · seat 1'], ['terra', 'terra · seat 2'],
       ['sol', 'sol · seat 5'],
       ['flash', 'flash · seat 1'], ['pro', 'pro · seat 2'],
+      ['spark', 'spark · seat 1'], ['ember', 'ember · seat 2'],
+      ['flare', 'flare · seat 5'], ['blaze', 'blaze · seat 10'],
+      ['nova', 'nova · seat 20'],
     ])
   })
 
@@ -170,7 +181,7 @@ configTest('kiosk policy and seat cap disable options instead of hiding them',
     const { el } = await mount({ tree: tree({
       kiosk: { max_tier: 'sonnet' } as TreePayload['kiosk'],
     }) })
-    assert.equal(options(el).length, 9)   // 4 claude + 3 codex + 2 gemini
+    assert.equal(options(el).length, 14)
     for (const tier of ['luna', 'terra', 'sol', 'flash', 'pro']) {
       assert.equal(option(el, tier).disabled, true)
       assert.match(option(el, tier).textContent ?? '', /unavailable in kiosk orgs/)
