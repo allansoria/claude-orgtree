@@ -65,9 +65,10 @@ def main() -> None:
                      "input wire/order"))
     argv = plain_turn.client.proc.args
     assert isinstance(argv, list)
-    check("spawn carries print/stream formats, model, effort, permissions, dirs",
+    check("spawn carries stream formats (NO --print - it eats the next flag "
+          "as its prompt), model, effort, permissions, dirs",
           lambda: eq(argv[len(FAKE):], [
-              "--print", "--output-format", "stream-json",
+              "--output-format", "stream-json",
               "--input-format", "stream-json", "--model",
               "gemini-3.7-flash-high", "--effort", "high",
               "--mode", "accept-edits", "--dangerously-skip-permissions",
@@ -89,10 +90,12 @@ def main() -> None:
     print("§2 tool events remain intact")
     tool_events: list[dict[str, Any]] = []
     _, tool_result, _ = run("tool", on_event=tool_events.append)
-    tool_steps = [event for event in tool_events
-                  if event.get("step_type") == "tool"]
+    # payloads are nested under the event-named key on the real wire
+    tool_steps = [event["step_update"] for event in tool_events
+                  if event.get("event") == "step_update"
+                  and event["step_update"].get("step_type") == "tool"]
     check("tool ACTIVE→DONE and parameters survive the reader",
-          lambda: eq(([event["state"] for event in tool_steps],
+          lambda: eq(([body["state"] for body in tool_steps],
                       tool_steps[0]["tool_info"]["parameters"]),
                      (["ACTIVE", "DONE"], {"path": "tree.txt"}), "tool"))
     check("tool turn assistant text is folded",

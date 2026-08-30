@@ -29,6 +29,19 @@ def send(value: dict[str, Any]) -> None:
         sys.stdout.flush()
 
 
+def step(**body: Any) -> None:
+    """A step_update event — payload NESTED under `step_update`, as the real
+    wire does (measured 2026-08-30)."""
+    body.setdefault("conversation_id", CONVERSATION)
+    send({"event": "step_update", "step_update": body})
+
+
+def result(**body: Any) -> None:
+    """A result event — payload NESTED under `result`."""
+    body.setdefault("conversation_id", CONVERSATION)
+    send({"event": "result", "result": body})
+
+
 def usage(turn: int) -> dict[str, int]:
     return {
         "input_tokens": 10 * turn,
@@ -51,11 +64,9 @@ def reader() -> None:
                 and isinstance(raw.get("message"), dict)
                 and raw["message"].get("role") == "user"
                 and isinstance(raw["message"].get("content"), str)):
-            send({"event": "result", "conversation_id": CONVERSATION,
-                  "status": "ERROR", "response": "",
-                  "error": "message must be an object with role+content",
-                  "duration_seconds": 0.0, "num_turns": 0,
-                  "usage": usage(0)})
+            result(status="ERROR", response="",
+                   error="message must be an object with role+content",
+                   duration_seconds=0.0, num_turns=0, usage=usage(0))
             continue
         msg = {str(key): value for key, value in raw.items()}
         seen.append(msg)
@@ -101,14 +112,11 @@ while True:
     assert isinstance(message, dict)
     content = str(message["content"])
 
-    send({"event": "step_update", "conversation_id": CONVERSATION,
-          "step_index": turn * 10, "state": "DONE",
-          "step_type": "user_input"})
+    step(step_index=turn * 10, state="DONE", step_type="user_input")
 
     if SCENARIO == "interrupt":
-        send({"event": "step_update", "conversation_id": CONVERSATION,
-              "step_index": turn * 10 + 1, "state": "ACTIVE",
-              "step_type": "agent_response", "text_delta": "long "})
+        step(step_index=turn * 10 + 1, state="ACTIVE",
+             step_type="agent_response", text_delta="long ")
         while True:
             time.sleep(1)
 
@@ -116,25 +124,18 @@ while True:
         time.sleep(0.35)  # let the runner enqueue steer while this turn runs
 
     if SCENARIO == "error":
-        send({"event": "result", "conversation_id": CONVERSATION,
-              "status": "ERROR", "response": "",
-              "error": "planted agy failure", "duration_seconds": 0.01,
-              "num_turns": turn, "usage": usage(turn)})
+        result(status="ERROR", response="", error="planted agy failure",
+               duration_seconds=0.01, num_turns=turn, usage=usage(turn))
         continue
 
     if SCENARIO == "tool":
-        send({"event": "step_update", "conversation_id": CONVERSATION,
-              "step_index": turn * 10 + 1, "state": "ACTIVE",
-              "step_type": "agent_response", "text_delta": "checking "})
+        step(step_index=turn * 10 + 1, state="ACTIVE",
+             step_type="agent_response", text_delta="checking ")
         tool = {"name": "view_file", "parameters": {"path": "tree.txt"}}
-        send({"event": "step_update", "conversation_id": CONVERSATION,
-              "step_index": turn * 10 + 2, "state": "ACTIVE",
-              "step_type": "tool", "tool_name": "view_file",
-              "tool_info": tool})
-        send({"event": "step_update", "conversation_id": CONVERSATION,
-              "step_index": turn * 10 + 2, "state": "DONE",
-              "step_type": "tool", "tool_name": "view_file",
-              "tool_info": tool, "duration_seconds": 0.01})
+        step(step_index=turn * 10 + 2, state="ACTIVE", step_type="tool",
+             tool_name="view_file", tool_info=tool)
+        step(step_index=turn * 10 + 2, state="DONE", step_type="tool",
+             tool_name="view_file", tool_info=tool, duration_seconds=0.01)
         text = "tool done"
     elif SCENARIO == "multi":
         text = (f"first:{content}" if not history
@@ -142,13 +143,9 @@ while True:
     else:
         text = f"agy says: {content}"
 
-    send({"event": "step_update", "conversation_id": CONVERSATION,
-          "step_index": turn * 10 + 3, "state": "DONE",
-          "step_type": "agent_response", "text_delta": text,
-          "usage": usage(turn)})
+    step(step_index=turn * 10 + 3, state="DONE",
+         step_type="agent_response", text_delta=text, usage=usage(turn))
     history.append(content)
-    send({"event": "result", "conversation_id": CONVERSATION,
-          "status": "SUCCESS", "response": text,
-          "duration_seconds": 0.02, "num_turns": turn,
-          "usage": usage(turn)})
+    result(status="SUCCESS", response=text, duration_seconds=0.02,
+           num_turns=turn, usage=usage(turn))
 

@@ -63,8 +63,11 @@ class AgyClient:
             env.update(env_extra)
 
         argv = list(argv_head)
+        # ⚠ NO `--print`: it takes an OPTIONAL inline prompt value, so
+        # `--print --output-format …` makes agy read `--output-format` as the
+        # prompt (measured 2026-08-30). `--input-format stream-json` already
+        # selects print mode; prompts arrive as NDJSON on stdin.
         argv += [
-            "--print",
             "--output-format", "stream-json",
             "--input-format", "stream-json",
             "--model", model,
@@ -241,19 +244,26 @@ class AgyTurn:
         }
 
     def _observe(self, msg: dict[str, Any]) -> None:
+        # ⚠ the wire NESTS each event's payload under a key named for the
+        # event: {"event":"step_update","step_update":{…}} and
+        # {"event":"result","result":{…}}. Only `init` carries
+        # conversation_id at the top level.
         event = str(msg.get("event") or "")
-        if event == "step_update" and msg.get("step_type") == "agent_response":
-            delta = msg.get("text_delta")
-            if isinstance(delta, str):
-                self.agent_text.append(delta)
+        if event == "step_update":
+            body = _event_of(msg.get("step_update")) or {}
+            if body.get("step_type") == "agent_response":
+                delta = body.get("text_delta")
+                if isinstance(delta, str):
+                    self.agent_text.append(delta)
         elif event == "result":
-            usage = self._normalize_usage(msg.get("usage"))
-            raw_turns = msg.get("num_turns")
-            raw_error = msg.get("error")
-            raw_status = str(msg.get("status") or "")
+            body = _event_of(msg.get("result")) or {}
+            usage = self._normalize_usage(body.get("usage"))
+            raw_turns = body.get("num_turns")
+            raw_error = body.get("error")
+            raw_status = str(body.get("status") or "")
             with self._state_lock:
                 self._results += 1
-                self.response = msg.get("response")
+                self.response = body.get("response")
                 self.error = str(raw_error) if raw_error is not None else None
                 if isinstance(raw_turns, int) and not isinstance(raw_turns, bool):
                     self.num_turns = raw_turns
