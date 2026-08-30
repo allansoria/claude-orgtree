@@ -825,6 +825,38 @@ def openrouter_tiers() -> list[TierInfo]:
     ]
 
 
+def openrouter_cost(token_usage: dict[str, Any] | None,
+                    cost: float | None) -> float:
+    """Dollars for one OpenRouter turn. `cost` is the runner's figure —
+    OpenRouter's own per-request `cost` summed across the turn's rounds
+    (design §4/§9); trust it when present. Only when it is None (the rare
+    response with `usage` but no `cost`) fall back to `tokens ×
+    OPENROUTER_PRICE_FALLBACK` — deliberately an OVER-estimate, because a
+    silent $0 is the Gemini rule's cardinal sin and there is no per-model
+    price table (design §8). `token_usage` is the runner's normalized
+    {input, cached, output, prompt}."""
+    if cost is not None:
+        return round(max(0.0, float(cost)), 6)
+    if not token_usage:
+        return 0.0
+    p_in, p_cache, p_out = OPENROUTER_PRICE_FALLBACK
+    inp = max(0, int(token_usage.get("input") or 0))
+    cached = max(0, int(token_usage.get("cached") or 0))
+    out = max(0, int(token_usage.get("output") or 0))
+    return round((inp * p_in + cached * p_cache + out * p_out) / 1e6, 6)
+
+
+def openrouter_occupancy(token_usage: dict[str, Any] | None) -> int:
+    """Context occupancy after the turn: the LAST request's prompt size. The
+    runner already keeps `prompt` as the last round's value (input+cache
+    combined would double-count and the summed-across-rounds figure is the
+    ~123% bug in another coat — same rule as codex_occupancy). 0 means "no
+    measurement" to `_after_turn`, never an empty context."""
+    if not token_usage:
+        return 0
+    return max(0, int(token_usage.get("prompt") or 0))
+
+
 def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
     """The /api/providers document. `claude_status` is composed by the API
     layer from state it already owns (accounts registry, cli_version) — this
