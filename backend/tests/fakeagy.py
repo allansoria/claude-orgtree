@@ -11,6 +11,10 @@ import time
 from typing import Any
 
 
+if "--version" in sys.argv:          # keep providers._agy_version() fast
+    print("agy-cli 9.9.9 (fake)")
+    raise SystemExit(0)
+
 SCENARIO = os.environ.get("FAKEAGY_SCENARIO", "plain")
 MESSAGES: queue.Queue[dict[str, Any] | None] = queue.Queue()
 OUT_LOCK = threading.Lock()

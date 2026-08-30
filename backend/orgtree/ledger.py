@@ -58,7 +58,12 @@ TIERS: Final[dict[str, int]] = {"fable": 10, "opus": 5, "sonnet": 2, "haiku": 1,
                                 "sol": 5, "terra": 2, "luna": 1,
                                 "flash": 1, "pro": 2,
                                 "spark": 1, "ember": 2, "flare": 5,
-                                "blaze": 10, "nova": 20}
+                                "blaze": 10, "nova": 20,
+                                # Antigravity (`agy`) — one placeholder band.
+                                # Google publishes no rates (⚠ D-AG-2), so the
+                                # seat cannot be price-honest; 2 mirrors the
+                                # other mid tiers. Revisit when rates exist.
+                                "orbit": 2}
 
 # №34 runaway insurance, and NOTHING else (user ruling 2026-08-04): "no need to
 # have any practical limit other than to prevent infinite recursion from a bug
@@ -98,6 +103,8 @@ MODELS: Final[dict[str, str]] = {
     "flare": "openai/gpt-5",
     "blaze": "anthropic/claude-sonnet-4.5",
     "nova": "anthropic/claude-opus-4.1",
+    # Antigravity — the default `agy` model when a node carries no agy_slug.
+    "orbit": "gemini-3.7-flash-medium",
 }
 
 # A TIER is a price band — four of them, four chips. A model VERSION is a

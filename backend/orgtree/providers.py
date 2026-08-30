@@ -889,11 +889,15 @@ _ANTIGRAVITY_LETTER: Final[dict[str, str]] = {"orbit": "A"}
 #: terra/pro/ember (mid). Inc 4 moves this row into ledger.TIERS and revisits
 #: the number once Google publishes rates (⚠ D-AG-2).
 ANTIGRAVITY_TIER_NAMES: Final = ("orbit",)
-ANTIGRAVITY_TIERS: Final[dict[str, int]] = {"orbit": 2}
-
-#: tier → the `--model` id used when a node carries no explicit pick. Ids
-#: exactly as `agy models` reports them (effort is baked into the id).
-ANTIGRAVITY_MODELS: Final[dict[str, str]] = {"orbit": "gemini-3.7-flash-medium"}
+#: seat and default model DERIVED from ledger.TIERS / ledger.MODELS (the
+#: `orbit` row landed there at hire enablement), the way CODEX_/GEMINI_/
+#: OPENROUTER_ do — one copy of a seat price. The default is the `--model`
+#: id used when a node carries no explicit `agy_slug`; ids as `agy models`
+#: reports them (effort baked into the id).
+ANTIGRAVITY_TIERS: Final[dict[str, int]] = {
+    n: _LEDGER_TIERS[n] for n in ANTIGRAVITY_TIER_NAMES}
+ANTIGRAVITY_MODELS: Final[dict[str, str]] = {
+    n: _LEDGER_MODELS[n] for n in ANTIGRAVITY_TIER_NAMES}
 
 #: tier → a conservative context-window FLOOR (recon did not capture per-model
 #: windows; the served model's real window can be written to
@@ -1049,6 +1053,39 @@ def antigravity_tiers() -> list[TierInfo]:
     ]
 
 
+#: orgtree's effort vocabulary → what `agy --effort` accepts (low|medium|high).
+_AGY_EFFORT: Final[dict[str, str]] = {
+    "low": "low", "medium": "medium", "high": "high",
+    "xhigh": "high", "max": "high"}
+
+
+def agy_effort(effort: str | None) -> str | None:
+    """Map an orgtree effort setting onto `agy --effort`. Unknown / empty →
+    omit the flag (let agy use its own default)."""
+    return _AGY_EFFORT.get(str(effort or "").lower()) if effort else None
+
+
+def agy_cost(token_usage: dict[str, Any] | None) -> float:
+    """Dollars for one Antigravity turn. ⚠ D-AG-2: the `agy` wire reports
+    token counts and NO cost, and Google has published no Antigravity rates,
+    so a turn books **$0** — a deliberate, visible under-count until rates
+    exist, not a silent one (the accounts panel / card carry a "cost not
+    tracked on this lane" note). `token_usage` is accepted for signature
+    symmetry with the other lanes and to make the future swap a one-liner."""
+    del token_usage
+    return 0.0
+
+
+def agy_occupancy(token_usage: dict[str, Any] | None) -> int:
+    """Context occupancy after the turn: the LAST result's prompt size.
+    `agyrun` normalizes `input_tokens` (which includes the cached reads) to
+    `input`; 0 means "no measurement" to `_after_turn`, never empty."""
+    if not token_usage:
+        return 0
+    return max(0, int(token_usage.get("input") or 0)
+              + int(token_usage.get("cached") or 0))
+
+
 def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
     """The /api/providers document. `claude_status` is composed by the API
     layer from state it already owns (accounts registry, cli_version) — this
@@ -1130,11 +1167,13 @@ def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
             "cli": "Antigravity CLI",
             "tiers": antigravity_tiers(),
             "status": antigravity,
-            # PREVIEW: hard-False until the runner + dispatch seam land. It
-            # then becomes bool(connected), the same predicate the api hire
-            # gate will enforce. `agy` authenticates from ~/.gemini's OAuth
-            # store (D-AG-3), so "connected" == "oauth_creds.json present".
-            "hire_enabled": False,
+            # a CONNECTED provider is hireable — the same predicate the api
+            # hire gate enforces. `agy` authenticates from ~/.gemini's OAuth
+            # store, so "connected" == "oauth_creds.json present". ⚠ D-AG-1:
+            # a hired agy agent gets FULL local tools within its folder grants
+            # (scope.tools is not enforceable on this lane); D-AG-4: it has no
+            # orgtree MCP yet, so it is a worker leaf (no message/hire/ask).
+            "hire_enabled": bool(antigravity.get("connected")),
             "reason": (
                 None if antigravity.get("connected")
                 else "not signed in — the Antigravity CLI reuses the Gemini "

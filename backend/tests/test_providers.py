@@ -456,21 +456,22 @@ def main():
           kiosk_band_ceiling)
 
     print("§9 the antigravity axis (design-antigravity.md, provider #5) - "
-          "DATA only, hire disabled until the runner + seam land")
+          "LEDGER-hireable since hire enablement")
     check("provider_of / provider_label route an antigravity tier to the axis",
           lambda: eq((providers.provider_of("orbit"),
                       providers.provider_label("orbit")),
                      ("antigravity", "Antigravity"), "axis"))
-    check("antigravity_tiers(): the placeholder 'orbit' tier, seat 2, letter "
-          "A (clear of F/O/S/H/L/T/P/K/E/R/B/N)",
-          lambda: eq([(t["tier"], t["seat"], t["provider"], t["letter"])
-                      for t in providers.antigravity_tiers()],
-                     [("orbit", 2, "antigravity", "A")], "tiers"))
-    check("preview era: 'orbit' is NOT in ledger.TIERS (nothing budget-bearing "
-          "knows it), so a hire is refused as unknown",
-          lambda: (eq("orbit" in TIERS, False, "not budget-bearing"),
-                   raises(lambda: org.hire(USER, top, "orbit", 0, "x-agy"),
-                          "unknown tier", "orbit refused"))[0])
+    check("antigravity_tiers(): the 'orbit' band DERIVES seat 2 + model from "
+          "ledger; letter A (clear of F/O/S/H/L/T/P/K/E/R/B/N)",
+          lambda: eq([(t["tier"], t["seat"], t["provider"], t["model"],
+                       t["letter"]) for t in providers.antigravity_tiers()],
+                     [("orbit", TIERS["orbit"], "antigravity",
+                       MODELS["orbit"], "A")], "tiers"))
+    check("'orbit' IS in ledger.TIERS at seat 2; a bare ledger hire works",
+          lambda: (eq(TIERS.get("orbit"), 2, "band row"),
+                   eq((org.hire(USER, top, "orbit", 0, "x-agy") and
+                       org.d["nodes"]["x-agy"]["model"],
+                       org.seat_cost("x-agy")), ("orbit", 2), "orbit hire"))[1])
     cat = providers.agy_models(force=True)
     check("agy_models parses id<TAB>name, skips the header, pulls effort from "
           "the id suffix",
@@ -481,20 +482,20 @@ def main():
                       ("claude-sonnet-4-6", None),
                       ("gpt-oss-120b-medium", "medium")], "catalogue"))
 
-    print("§10 the antigravity payload entry - preview shape")
+    print("§10 the antigravity payload entry")
     providers._agy_status_cache = None  # noqa: SLF001
     pay5 = providers.providers_payload({"installed": True, "connected": True})
     agy = next(p for p in pay5["providers"] if p["id"] == "antigravity")
-    check("cli 'Antigravity CLI', hire_enabled hard-False in the preview, "
-          "reason names the install command (agy binary pinned at nothing)",
+    check("cli 'Antigravity CLI'; signed-out ⇒ not hireable, reason names the "
+          "install command (agy binary pinned at nothing)",
           lambda: eq((agy["cli"], agy["hire_enabled"],
                       agy["status"]["installed"],
                       "install.ps1" in (agy["reason"] or "")),
                      ("Antigravity CLI", False, False, True), "entry"))
 
     def agy_signed_in():
-        # drop an oauth_creds.json into the pinned home -> connected, but
-        # hire_enabled STAYS False (preview) and the reason clears
+        # drop an oauth_creds.json into the pinned home -> connected ->
+        # hire_enabled FOLLOWS connection, reason clears
         with open(os.path.join(os.environ["ORGTREE_AGY_HOME"],
                                "oauth_creds.json"), "w", encoding="utf-8") as f:
             f.write("{}")
@@ -507,9 +508,9 @@ def main():
         a2 = next(p for p in p6["providers"] if p["id"] == "antigravity")
         eq((a2["status"]["connected"], a2["status"]["email"],
             a2["status"]["kind"], a2["hire_enabled"], a2["reason"]),
-           (True, "probe@example.test", "oauth", False, None),
-           "signed-in preview entry")
-    check("oauth_creds.json present -> connected + identity, hire still locked",
+           (True, "probe@example.test", "oauth", True, None),
+           "signed-in entry")
+    check("oauth_creds.json present ⇒ connected + identity ⇒ hireable",
           agy_signed_in)
 
     print(f"\n{PASS} checks passed")

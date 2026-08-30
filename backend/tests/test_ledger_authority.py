@@ -1550,19 +1550,17 @@ def section_edges():
 
     # model VERSIONS are a subcategory of a tier, never a tier (user ruling
     # 2026-08-04): a fixed set of tiers, one chip each; the version lives in
-    # the gear. Fourteen since design-openrouter.md §9: the four Claude
-    # bands, the codex family (luna/terra/sol — user seat ruling 2026-08-28),
-    # the gemini family (flash/pro — user greenlight 2026-08-29), and the
-    # five OpenRouter PRICE BANDS (spark/ember/flare/blaze/nova — user
-    # approval 2026-08-29). ⚠ D-OR-3: an OpenRouter node's band is a function
-    # of its chosen model and can move under switch_model, but the band TABLE
-    # itself is static, exactly like the others.
+    # the gear. Fifteen now: four Claude bands, codex (luna/terra/sol),
+    # gemini (flash/pro), the five OpenRouter PRICE BANDS
+    # (spark/ember/flare/blaze/nova), and Antigravity's one `orbit` band
+    # (design-antigravity.md — a placeholder seat, no published rates yet,
+    # ⚠ D-AG-2).
     mv = deep_org()
-    check("the tier table is exactly the fourteen price bands",
+    check("the tier table is exactly the fifteen price bands",
           lambda: eq(sorted(mv.d["tiers"]),
                      ["blaze", "ember", "fable", "flare", "flash", "haiku",
-                      "luna", "nova", "opus", "pro", "sol", "sonnet",
-                      "spark", "terra"]))
+                      "luna", "nova", "opus", "orbit", "pro", "sol",
+                      "sonnet", "spark", "terra"]))
     check("model_for defaults to the tier's own model",
           lambda: eq(mv.model_for("top"), MODELS["opus"]))
     mv.set_scope(USER, "top", model_version="4.8")
