@@ -73,6 +73,16 @@ TIERS: Final[dict[str, int]] = {"fable": 10, "opus": 5, "sonnet": 2, "haiku": 1,
 MAX_DEPTH: Final = 1024
 MAX_CHILDREN: Final = 1024
 
+WORKER_CHARTER: Final[str] = (
+    "Loop: `orgtree_queue_take`. Do the work on the item. "
+    "`orgtree_queue_done` with your result — it hands you the next item. "
+    "When it returns empty, stop and go idle. Work ONE item at a time; do not "
+    "carry a finished item's detail into the next; if your context passes "
+    "60k, compact. If a tool call returns \"unknown tool\" or you cannot read "
+    "a file, `orgtree_queue_fail` the item with that reason and continue — "
+    "never loop on it."
+)
+
 # §5 — full model ids only; aliases drift (spike: 'sonnet' resolved to sonnet-4-5).
 MODELS: Final[dict[str, str]] = {
     "fable": "claude-fable-5",
@@ -2608,6 +2618,10 @@ class Org:
             "cost_usd": float(cost_usd),
             "turns": int(turns),
         })
+        per_worker = cast(
+            "dict[str, dict[str, Any]]", q.setdefault("per_worker", {}))
+        worker_stats = per_worker.setdefault(worker, {"done": 0})
+        worker_stats["done"] = int(worker_stats["done"]) + 1
         del claimed[worker]
         del claimed_items[worker]
         ts = _time.time() if now_ts is None else float(now_ts)
@@ -2660,6 +2674,48 @@ class Org:
                    "attempts": attempts,
                    "dead_letter": bool(out.get("dead_letter"))}, [])
         return out
+
+    def queue_spawn_plan(self, qid: str, *,
+                         repo_root: str | None = None) -> list[dict[str, Any]]:
+        """Build hire-shaped worker specs without hiring or running workers."""
+        q = self._queue(qid)
+        config = cast("dict[str, Any]", q["config"])
+        template = cast("dict[str, Any]", config["worker_template"])
+        tier = template.get("tier")
+        if not tier:
+            raise LedgerError(
+                f"queue {qid!r} worker_template needs a tier to spawn")
+        specs: list[dict[str, Any]] = []
+        names: list[str] = []
+        for i in range(1, int(config["workers"]) + 1):
+            name = f"{qid}-w{i}"
+            names.append(name)
+            specs.append({
+                "name": name,
+                "tier": tier,
+                "grant": template.get("grant") or 0,
+                "add_dirs": template.get("add_dirs") or [],
+                "tools": template.get("tools") or {},
+                "org_visibility": template.get("org_visibility") or "team",
+                "effort": template.get("effort"),
+                "charter": WORKER_CHARTER + "\n\n"
+                           + str(template.get("charter") or ""),
+                "model": template.get("model"),
+            })
+        q["spawn"] = {"repo_root": repo_root, "planned": names, "at": now()}
+        self._log("queue_spawn_plan", USER,
+                  {"qid": qid, "repo_root": repo_root, "planned": names}, [])
+        return specs
+
+    def queue_should_compact(self, worker: str, qid: str) -> bool:
+        """Whether this worker hit an items-per-session completion boundary."""
+        q = self._queue(qid)
+        per_worker = cast("dict[str, dict[str, Any]]",
+                          q.get("per_worker") or {})
+        done = int((per_worker.get(worker) or {}).get("done") or 0)
+        items_per_session = int(
+            cast("dict[str, Any]", q["config"])["items_per_session"])
+        return done > 0 and done % items_per_session == 0
 
     # ------------------------------------------------------------------ hire
     def hire(self, actor: str, parent: str | None, tier: str, grant: int, name: str,
