@@ -3427,7 +3427,7 @@ class AgentCall(Body):
 _ARG_STRS = ("node", "to", "from", "target", "grantee", "parent", "new_parent",
              "name", "tier", "kind", "body", "action", "status", "summary",
              "reason", "charter", "team_charter", "org_visibility", "effort",
-             "path",
+             "path", "qid", "item_id",
              # D-160: the one-call hire's own text arguments. `permission_mode`
              # joins them at the same time — it has always been text-only, and
              # retool simply never had it normalised, so a container landed in
@@ -4283,6 +4283,25 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                 tier = provider_hire_gate(org, a.get("tier"), a.get("model"))
                 result = org.switch_model(body.node, a.get("node", ""),
                                           tier or "", a.get("model"))
+            elif body.tool == "orgtree_queue_take":
+                result = org.queue_take(body.node, str(a.get("qid") or ""))
+            elif body.tool == "orgtree_queue_done":
+                raw_cost = a.get("cost_usd", 0.0)
+                try:
+                    cost_usd = float(raw_cost)
+                except (TypeError, ValueError, OverflowError):
+                    raise LedgerError(
+                        f"cost_usd must be a number (got {raw_cost!r})")
+                result = org.queue_done(
+                    body.node, str(a.get("qid") or ""),
+                    str(a.get("item_id") or ""), a.get("result"),
+                    cost_usd=cost_usd,
+                    turns=_arg_int(a, "turns", 0))
+            elif body.tool == "orgtree_queue_fail":
+                result = org.queue_fail(
+                    body.node, str(a.get("qid") or ""),
+                    str(a.get("item_id") or ""),
+                    str(a.get("reason") or ""))
             elif body.tool == "orgtree_status":
                 status = a.get("status", "working")
                 summary = a.get("summary", "")

@@ -944,6 +944,51 @@ TOOLS: list[dict[str, Any]] = [
                         "required": ["node", "delta"]},
     },
     {
+        "name": "orgtree_queue_take",
+        "description": (
+            "Claim the next eligible item from a work queue. You may hold "
+            "only one claim in a queue; finish it with orgtree_queue_done or "
+            "orgtree_queue_fail before taking again. Returns {item} or "
+            "{empty: true}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"qid": {"type": "string"}},
+            "required": ["qid"],
+        },
+    },
+    {
+        "name": "orgtree_queue_done",
+        "description": (
+            "Record the result for your claimed queue item and atomically "
+            "claim the next eligible item. Returns {item} or {empty: true}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qid": {"type": "string"},
+                "item_id": {"type": "string"},
+                "result": {},
+                "cost_usd": {"type": "number"},
+                "turns": {"type": "integer"},
+            },
+            "required": ["qid", "item_id", "result"],
+        },
+    },
+    {
+        "name": "orgtree_queue_fail",
+        "description": (
+            "Fail your claimed queue item with a reason. It is requeued up "
+            "to retry_max, then moved to the dead-letter list."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qid": {"type": "string"},
+                "item_id": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["qid", "item_id", "reason"],
+        },
+    },
+    {
         "name": "orgtree_status",
         "description": ("Report your working status. REQUIRED when you finish or get "
                         "stuck: 'done' and 'blocked' notify your superior with your "

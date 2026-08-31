@@ -400,8 +400,9 @@ def _():
     # +orgtree_present (FR-03); +orgtree_withdraw_ask; +orgtree_self_update;
     # +orgtree_cheap_compact (FR-24); +orgtree_request_scope (FR-13);
     # +orgtree_watchdog (FR-18); +orgtree_send_notice (2026-08-19);
-    # +orgtree_prime_restart (FR-27, 2026-08-27)
-    assert len(tools) == 27, [x["name"] for x in tools]
+    # +orgtree_prime_restart (FR-27, 2026-08-27);
+    # +orgtree_queue_take / _done / _fail (work-queue Inc 2, 2026-08-31)
+    assert len(tools) == 30, [x["name"] for x in tools]
     for c in tools:
         assert c["name"].startswith("orgtree_"), c
         assert len(c["description"]) > 20, c
@@ -555,7 +556,7 @@ _DISPATCH = sorted(set(__import__("re").findall(r'"(orgtree_\w+)"', _AGENT_CALL)
 ALIASES = {"orgtree_self_update": "orgtree_self_restart"}
 
 
-@t("the catalogue and the /api/agent dispatch name exactly the same 27 verbs")
+@t("the catalogue and the /api/agent dispatch name exactly the same 30 verbs")
 def _():
     assert sorted(CARDS) == sorted(set(_DISPATCH) - set(ALIASES)), \
         f"drift: cards {sorted(set(CARDS) - set(_DISPATCH))}, " \
@@ -566,8 +567,9 @@ def _():
     # +orgtree_cheap_compact (FR-24, 2026-08-11);
     # +orgtree_request_scope (FR-13) + orgtree_watchdog (FR-18, 2026-08-12);
     # +orgtree_send_notice (mail that never wakes, 2026-08-19);
-    # +orgtree_prime_restart (FR-27, the deferred restart, 2026-08-27)
-    assert len(CARDS) == 27, len(CARDS)
+    # +orgtree_prime_restart (FR-27, the deferred restart, 2026-08-27);
+    # +orgtree_queue_take / _done / _fail (work-queue Inc 2, 2026-08-31)
+    assert len(CARDS) == 30, len(CARDS)
 
 
 @t("☠ the deprecated self_update alias is dispatchable but NOT advertised")
@@ -717,11 +719,16 @@ def _():
     # to ASK — a whole round trip that returns the agent's account of events
     # instead of the events. Reading is instant, downward-only and costs the
     # report nothing, so the trigger belongs where the moment happens.
-    # The four that REMAIN absent are deliberate: rename/move/list_orgs/
+    # The ones that REMAIN absent are deliberate: rename/move/list_orgs/
     # switch_model have no moment that arrives unbidden — an agent reaches for
     # them having already decided to reorganize, and finds them in their cards.
+    # queue_take/_done/_fail (work-queue Inc 2, 2026-08-31) are the same: only
+    # a queue WORKER calls them, and its charter names the loop explicitly, so
+    # the standing prompt says nothing about them.
     assert absent == ["orgtree_list_orgs", "orgtree_move",
-                      "orgtree_rename", "orgtree_switch_model"], \
+                      "orgtree_queue_done", "orgtree_queue_fail",
+                      "orgtree_queue_take", "orgtree_rename",
+                      "orgtree_switch_model"], \
         f"the recital gap changed — update or retire this pin: {absent}"
     # …and the read-down pair is gated on HAVING reports: an agent with none
     # would be told to go read a subtree it does not have

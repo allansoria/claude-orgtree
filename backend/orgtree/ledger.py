@@ -2478,6 +2478,189 @@ class Org:
             }, [])
         return self.queue_status(qid)
 
+    @staticmethod
+    def _queue_iso(ts: float) -> str:
+        """Render a queue test-seam timestamp in the ledger's ISO format."""
+        d = datetime.fromtimestamp(ts, timezone.utc)
+        return d.strftime("%Y-%m-%dT%H:%M:%S.") + \
+            f"{d.microsecond // 1000:03d}Z"
+
+    def _queue_take_next(self, worker: str, qid: str,
+                         now_ts: float) -> dict[str, Any]:
+        """Reclaim expired leases, then claim the next eligible item.
+
+        The public claim table stays in the locked-contract shape (item id +
+        lease metadata). The full item lives in a private sibling map while
+        claimed so expiry and done/fail can recover its payload and writes.
+        Callers hold store.DOC_LOCK; this helper deliberately takes no lock.
+        """
+        q = self._queue(qid)
+        if q.get("closed") or q.get("phase") != "draining":
+            raise LedgerError(f"queue {qid!r} is not draining")
+        pending = cast("list[dict[str, Any]]", q["pending"])
+        claimed = cast("dict[str, dict[str, Any]]", q["claimed"])
+        claimed_items = cast(
+            "dict[str, dict[str, Any]]", q.setdefault("_claimed_items", {}))
+        failed = cast("list[dict[str, Any]]", q["failed"])
+        config = cast("dict[str, Any]", q["config"])
+        retry_max = int(config["retry_max"])
+
+        # Reclaim before checking whether this worker already owns a claim: an
+        # expired claim is no longer held, including when its owner returns.
+        reclaimed: list[dict[str, Any]] = []
+        for owner, claim in list(claimed.items()):
+            if float(claim["lease_until"]) >= now_ts:
+                continue
+            item = claimed_items.get(owner)
+            if item is None:
+                raise LedgerError(
+                    f"queue {qid!r} claim for {owner!r} has no stored item")
+            del claimed[owner]
+            del claimed_items[owner]
+            attempts = int(item["attempts"]) + 1
+            item["attempts"] = attempts
+            if attempts > retry_max:
+                failed.append({"id": item["id"], "payload": item["payload"],
+                               "reason": "lease expired",
+                               "attempts": attempts})
+            else:
+                reclaimed.append(item)
+        if reclaimed:
+            pending[0:0] = reclaimed
+
+        if worker in claimed:
+            raise LedgerError(
+                f"worker {worker!r} already holds a claim in queue {qid!r}; "
+                "it must done or fail it first")
+
+        pick: int | None = None
+        if pending:
+            if bool(config.get("ordered")):
+                # Ordered queues are globally serial even when adjacent items
+                # have disjoint (or empty) write sets.
+                if not claimed:
+                    pick = 0
+            else:
+                live_writes: set[str] = set()
+                for owner in claimed:
+                    item = claimed_items.get(owner)
+                    if item is None:
+                        raise LedgerError(
+                            f"queue {qid!r} claim for {owner!r} has no stored item")
+                    live_writes.update(cast("list[str]", item["writes"]))
+                for i, item in enumerate(pending):
+                    if not live_writes.intersection(
+                            cast("list[str]", item["writes"])):
+                        pick = i
+                        break
+        if pick is None:
+            return {"empty": True}
+
+        item = pending.pop(pick)
+        claimed[worker] = {
+            "item_id": item["id"],
+            "at": self._queue_iso(now_ts),
+            "lease_until": now_ts + int(config["lease_seconds"]),
+        }
+        claimed_items[worker] = item
+        return {"item": item}
+
+    def queue_take(self, worker: str, qid: str,
+                   now_ts: float | None = None) -> dict[str, Any]:
+        """Atomically claim the next item eligible for ``worker``."""
+        ts = _time.time() if now_ts is None else float(now_ts)
+        result = self._queue_take_next(worker, qid, ts)
+        self._log("queue_take", worker,
+                  {"qid": qid,
+                   "item_id": cast("dict[str, Any]", result.get("item")
+                                   or {}).get("id"),
+                   "empty": bool(result.get("empty"))}, [])
+        return result
+
+    def queue_done(self, worker: str, qid: str, item_id: str, result: Any,
+                   cost_usd: float = 0.0, turns: int = 0,
+                   now_ts: float | None = None) -> dict[str, Any]:
+        """Finish the worker's claim, record its result, and claim the next."""
+        q = self._queue(qid)
+        if q.get("closed") or q.get("phase") != "draining":
+            raise LedgerError(f"queue {qid!r} is not draining")
+        claimed = cast("dict[str, dict[str, Any]]", q["claimed"])
+        claim = claimed.get(worker)
+        if claim is None:
+            raise LedgerError(
+                f"worker {worker!r} has no claim in queue {qid!r}")
+        if claim.get("item_id") != item_id:
+            raise LedgerError(
+                f"worker {worker!r} claimed {claim.get('item_id')!r}, not "
+                f"{item_id!r}")
+        claimed_items = cast(
+            "dict[str, dict[str, Any]]", q.setdefault("_claimed_items", {}))
+        item = claimed_items.get(worker)
+        if item is None:
+            raise LedgerError(
+                f"queue {qid!r} claim for {worker!r} has no stored item")
+
+        cast("list[dict[str, Any]]", q["done"]).append({
+            "id": item_id,
+            "payload": item["payload"],
+            "result": result,
+            "by": worker,
+            "cost_usd": float(cost_usd),
+            "turns": int(turns),
+        })
+        del claimed[worker]
+        del claimed_items[worker]
+        ts = _time.time() if now_ts is None else float(now_ts)
+        next_result = self._queue_take_next(worker, qid, ts)
+        self._log("queue_done", worker,
+                  {"qid": qid, "item_id": item_id,
+                   "next_item_id": cast(
+                       "dict[str, Any]", next_result.get("item") or {}).get("id")},
+                  [])
+        return next_result
+
+    def queue_fail(self, worker: str, qid: str, item_id: str, reason: str,
+                   now_ts: float | None = None) -> dict[str, Any]:
+        """Fail the worker's claim, requeueing or dead-lettering the item."""
+        q = self._queue(qid)
+        if q.get("closed") or q.get("phase") != "draining":
+            raise LedgerError(f"queue {qid!r} is not draining")
+        claimed = cast("dict[str, dict[str, Any]]", q["claimed"])
+        claim = claimed.get(worker)
+        if claim is None:
+            raise LedgerError(
+                f"worker {worker!r} has no claim in queue {qid!r}")
+        if claim.get("item_id") != item_id:
+            raise LedgerError(
+                f"worker {worker!r} claimed {claim.get('item_id')!r}, not "
+                f"{item_id!r}")
+        claimed_items = cast(
+            "dict[str, dict[str, Any]]", q.setdefault("_claimed_items", {}))
+        item = claimed_items.get(worker)
+        if item is None:
+            raise LedgerError(
+                f"queue {qid!r} claim for {worker!r} has no stored item")
+
+        attempts = int(item["attempts"]) + 1
+        item["attempts"] = attempts
+        del claimed[worker]
+        del claimed_items[worker]
+        retry_max = int(cast("dict[str, Any]", q["config"])["retry_max"])
+        if attempts <= retry_max:
+            cast("list[dict[str, Any]]", q["pending"]).append(item)
+            out = {"requeued": True, "attempts": attempts}
+        else:
+            cast("list[dict[str, Any]]", q["failed"]).append({
+                "id": item_id, "payload": item["payload"],
+                "reason": reason, "attempts": attempts,
+            })
+            out = {"dead_letter": True}
+        self._log("queue_fail", worker,
+                  {"qid": qid, "item_id": item_id, "reason": reason,
+                   "attempts": attempts,
+                   "dead_letter": bool(out.get("dead_letter"))}, [])
+        return out
+
     # ------------------------------------------------------------------ hire
     def hire(self, actor: str, parent: str | None, tier: str, grant: int, name: str,
              add_dirs: list[Any] | None = None, tools: Mapping[str, Any] | None = None,
