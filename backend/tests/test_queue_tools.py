@@ -158,7 +158,8 @@ def main():
           lambda: eq((dead, fail.d["queues"]["q"]["failed"]),
                      ({"dead_letter": True, "queue_drained": True}, [{
                          "id": "bad", "payload": {"n": "bad"},
-                         "reason": "still broken", "attempts": 2}])))
+                         "reason": "still broken", "attempts": 2,
+                         "cost_usd": 0.0, "turns": 0}])))
     check("dead-letter drops the claim and does not auto-take",
           lambda: eq((fail.d["queues"]["q"]["claimed"],
                       fail.d["queues"]["q"]["pending"]), ({}, [])))

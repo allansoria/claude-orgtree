@@ -75,12 +75,16 @@ MAX_DEPTH: Final = 1024
 MAX_CHILDREN: Final = 1024
 
 WORKER_CHARTER: Final[str] = (
-    "Loop: `orgtree_queue_take`. Do the work on the item. "
-    "`orgtree_queue_done` with your result — it hands you the next item. "
-    "When it returns empty, stop and go idle. Work ONE item at a time; do not "
-    "carry a finished item's detail into the next; if your context passes "
-    "60k, compact. If a tool call returns \"unknown tool\" or you cannot read "
-    "a file, `orgtree_queue_fail` the item with that reason and continue — "
+    "Loop: `orgtree_queue_take`. Do the work on the item. If you edit files "
+    "and are working in a git worktree, `git add -A && git commit` your "
+    "changes on your branch BEFORE finishing the item — the reducer merges "
+    "committed branches, not a dirty tree. Then `orgtree_queue_done` with "
+    "your result (pass `turns` = how many turns this item took, and "
+    "`cost_usd` if you know it) — it hands you the next item. When it "
+    "returns empty, stop and go idle. Work ONE item at a time; do not carry "
+    "a finished item's detail into the next; if your context passes 60k, "
+    "compact. If a tool call returns \"unknown tool\" or you cannot read a "
+    "file, `orgtree_queue_fail` the item with that reason and continue — "
     "never loop on it."
 )
 
@@ -2655,13 +2659,21 @@ class Org:
             raise LedgerError(
                 f"queue {qid!r} claim for {worker!r} has no stored item")
 
+        # roll the breaker's per-turn telemetry (queue_tick_item accrues it on
+        # the claim) into the recorded cost, plus whatever the worker passed —
+        # so the results carry a real number even when the worker reports 0.
+        # The turn that CALLS queue_done is booked by _after_turn afterwards,
+        # so a 1-turn item still lands near 0; multi-turn items — the ones the
+        # budget cares about — carry their accrued spend.
+        acc_cost = float(claim.get("cost_usd") or 0.0)
+        acc_turns = int(claim.get("turns") or 0)
         cast("list[dict[str, Any]]", q["done"]).append({
             "id": item_id,
             "payload": item["payload"],
             "result": result,
             "by": worker,
-            "cost_usd": float(cost_usd),
-            "turns": int(turns),
+            "cost_usd": round(acc_cost + float(cost_usd), 6),
+            "turns": acc_turns + int(turns),
         })
         per_worker = cast(
             "dict[str, dict[str, Any]]", q.setdefault("per_worker", {}))
@@ -2704,6 +2716,8 @@ class Org:
 
         attempts = int(item["attempts"]) + 1
         item["attempts"] = attempts
+        acc_cost = round(float(claim.get("cost_usd") or 0.0), 6)
+        acc_turns = int(claim.get("turns") or 0)
         del claimed[worker]
         del claimed_items[worker]
         retry_max = int(cast("dict[str, Any]", q["config"])["retry_max"])
@@ -2714,6 +2728,7 @@ class Org:
             cast("list[dict[str, Any]]", q["failed"]).append({
                 "id": item_id, "payload": item["payload"],
                 "reason": reason, "attempts": attempts,
+                "cost_usd": acc_cost, "turns": acc_turns,
             })
             out = {"dead_letter": True}
         self._log("queue_fail", worker,
