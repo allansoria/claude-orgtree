@@ -2796,53 +2796,6 @@ async def queue_spawn(slug: str, qid: str, body: QueueSpawn,
     return store.load_org(slug).queue_status(qid)
 
 
-def _queue_fire_reducer(org: Org, qid: str, drive: list[str]) -> None:
-    """Inc 4 completion trigger — the queue just drained (queue_done /
-    queue_fail set `queue_drained`). Hire the reducer with every worker
-    result as one input mail and wake it via `drive`; with no reducer
-    configured, drop a user notice instead. Runs inside agent_call's
-    DOC_LOCK, before its `store.save_org`."""
-    try:
-        spec = org.queue_reducer_plan(qid)
-    except LedgerError:
-        return
-    payload = org.queue_results(qid)
-    n_done, n_dead = len(payload["done"]), len(payload["failed"])
-    if spec is None:
-        org.to_user_inbox({
-            "from": ledger_mod.SYSTEM, "kind": "notice", "at": ledger_mod.now(),
-            "body": (f"Work queue '{qid}' drained — {n_done} done, {n_dead} "
-                     f"dead-lettered. No reducer configured; the results are "
-                     f"on the queue (GET …/queues/{qid}).")})
-        return
-    try:
-        tier = provider_hire_gate(org, spec["tier"], spec.get("model"))
-        res = org.hire(USER, None, tier, int(spec["grant"] or 0), spec["name"],
-                       spec["add_dirs"], tools=spec["tools"],
-                       org_visibility=spec["org_visibility"],
-                       charter=spec["charter"], or_slug=spec.get("model"))
-        node = str(res["node"])
-        if spec.get("effort"):
-            org.set_scope(USER, node, effort=spec["effort"])
-    except LedgerError:
-        return
-    lines = [f"Queue '{qid}' is fully drained — {n_done} result(s):"]
-    for d in payload["done"]:
-        body = json.dumps(d.get("result"), indent=2, default=str)
-        lines.append(f"\n— item {d['id']} (by {d.get('by')}, "
-                     f"${float(d.get('cost_usd') or 0):.4f}, "
-                     f"{int(d.get('turns') or 0)} turns):\n{body[:4000]}")
-    if payload["failed"]:
-        lines.append("\nDead-letter (" + str(n_dead) + "): " + ", ".join(
-            f"{f['id']} ({f.get('reason')})" for f in payload["failed"]))
-    wts = (payload.get("spawn") or {}).get("worktrees") or []
-    if wts:
-        lines.append("\nWorker branches to merge into the base: "
-                     + ", ".join(w["branch"] for w in wts))
-    org.post_mail(USER, node, "\n".join(lines))
-    drive.append(node)
-
-
 class AskAnswer(Body):
     # single card: the picked labels. FR-04 batch card: ONE item per tab,
     # positionally — a string, or a list for a multi tab's picks
@@ -4435,14 +4388,18 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                     cost_usd=cost_usd,
                     turns=_arg_int(a, "turns", 0))
                 if result.get("queue_drained"):
-                    _queue_fire_reducer(org, str(a.get("qid") or ""), drive)
+                    _fr = org.queue_fire_reducer(str(a.get("qid") or ""))
+                    if _fr.get("reducer"):
+                        drive.append(str(_fr["reducer"]))
             elif body.tool == "orgtree_queue_fail":
                 result = org.queue_fail(
                     body.node, str(a.get("qid") or ""),
                     str(a.get("item_id") or ""),
                     str(a.get("reason") or ""))
                 if result.get("queue_drained"):
-                    _queue_fire_reducer(org, str(a.get("qid") or ""), drive)
+                    _fr = org.queue_fire_reducer(str(a.get("qid") or ""))
+                    if _fr.get("reducer"):
+                        drive.append(str(_fr["reducer"]))
             elif body.tool == "orgtree_status":
                 status = a.get("status", "working")
                 summary = a.get("summary", "")

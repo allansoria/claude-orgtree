@@ -23,6 +23,7 @@ revoke is explicit; re-parenting intersects the moved subtree's dirs with the ne
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import time as _time
@@ -2458,6 +2459,23 @@ class Org:
         claimed = cast("dict[str, Any]", q["claimed"])
         done = cast("list[dict[str, Any]]", q["done"])
         failed = cast("list[dict[str, Any]]", q["failed"])
+        done_summaries = [
+            {"id": d["id"], "by": d.get("by"),
+             "cost_usd": float(d.get("cost_usd") or 0.0),
+             "turns": int(d.get("turns") or 0)}
+            for d in done]
+        failed_summaries = [
+            {"id": f["id"], "reason": f.get("reason"),
+             "attempts": int(f.get("attempts") or 0)}
+            for f in failed]
+        by_worker: dict[str, float] = {}
+        for d in done:
+            worker = str(d.get("by") or "")
+            if worker:
+                by_worker[worker] = by_worker.get(worker, 0.0) + float(
+                    d.get("cost_usd") or 0.0)
+        by_worker = {worker: round(cost, 6)
+                     for worker, cost in by_worker.items()}
         return {
             "qid": qid,
             "phase": q["phase"],
@@ -2470,13 +2488,23 @@ class Org:
             },
             "pending": [it["id"] for it in pending],
             "claimed": claimed,
-            "done": [{"id": d["id"], "by": d.get("by"),
-                      "cost_usd": float(d.get("cost_usd") or 0.0),
-                      "turns": int(d.get("turns") or 0)} for d in done],
-            "failed": [{"id": f["id"], "reason": f.get("reason"),
-                        "attempts": int(f.get("attempts") or 0)} for f in failed],
+            "done": done_summaries,
+            "failed": failed_summaries,
+            "items": (
+                [{"id": it["id"]} for it in pending]
+                + [{"id": claim.get("item_id"), "worker": worker,
+                    "turns": int(claim.get("turns") or 0),
+                    "cost_usd": float(claim.get("cost_usd") or 0.0),
+                    "lease_until": claim.get("lease_until")}
+                   for worker, claim in claimed.items()]
+                + done_summaries + failed_summaries
+            ),
             "cost": {"total_usd": round(
-                sum(float(d.get("cost_usd") or 0.0) for d in done), 6)},
+                sum(float(d.get("cost_usd") or 0.0) for d in done), 6),
+                "by_worker": by_worker,
+                "claimed_usd": round(sum(
+                    float(claim.get("cost_usd") or 0.0)
+                    for claim in claimed.values()), 6)},
             "overlaps": q.get("overlaps", []),
             "spawn": q.get("spawn"),
             "reduce": q.get("reduce"),
@@ -2824,6 +2852,116 @@ class Org:
                        for f in cast("list[dict[str, Any]]", q["failed"])],
             "spawn": q.get("spawn"),
         }
+
+    def queue_tick_item(self, worker: str, qid: str, *, cost_usd: float,
+                        turn_sig: str) -> dict[str, Any]:
+        """Book one turn against a live item claim and decide its breaker.
+
+        The supervisor owns the hot-path consequence: when ``trip`` is true
+        it calls ``queue_fail`` with this reason, then lets the same worker
+        take another item. This locked ledger seam only accumulates telemetry,
+        makes the deterministic decision, and logs a trip.
+        """
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return {"trip": False, "reason": "", "turns": 0,
+                    "cost_usd": 0.0}
+        claimed = cast("dict[str, dict[str, Any]]", q.get("claimed") or {})
+        claim = claimed.get(worker)
+        if claim is None:
+            return {"trip": False, "reason": "", "turns": 0,
+                    "cost_usd": 0.0}
+
+        turns = int(claim.get("turns") or 0) + 1
+        item_cost = float(claim.get("cost_usd") or 0.0) + float(cost_usd)
+        claim["turns"] = turns
+        claim["cost_usd"] = item_cost
+        sigs = cast("list[str]", claim.setdefault("sigs", []))
+        sigs.append(turn_sig)
+        del sigs[:-5]
+
+        config = cast("dict[str, Any]", q["config"])
+        budget = float(config["per_item_budget_usd"])
+        turn_cap = int(config["per_item_turn_cap"])
+        reason = ""
+        if item_cost > budget:
+            reason = (f"over per-item budget: ${item_cost:.2f} > "
+                      f"${budget:.2f}")
+        elif turns > turn_cap:
+            reason = f"over per-item turn cap: {turns} > {turn_cap}"
+        elif (len(sigs) >= 3 and bool(sigs[-1])
+              and sigs[-3] == sigs[-2] == sigs[-1]):
+            reason = f"identical-turn loop 3x: {turn_sig[:80]}"
+
+        if reason:
+            self._log("queue_item_tripped", worker,
+                      {"qid": qid, "item_id": claim.get("item_id"),
+                       "reason": reason, "turns": turns,
+                       "cost_usd": item_cost}, [])
+        return {"trip": bool(reason), "reason": reason, "turns": turns,
+                "cost_usd": item_cost}
+
+    def queue_fire_reducer(self, qid: str) -> dict[str, Any]:
+        """The drain consequence (Inc 4/5): hire the queue's reducer with
+        every worker result as one input mail and return
+        ``{"reducer": <node id>}`` for the caller to drive. No reducer
+        configured -> a user notice and ``{"notice": True}``.
+        ``{"skipped": <why>}`` when there is nothing to do (already hired) or
+        the hire itself refused.
+
+        Called from api.agent_call's queue_done/_fail dispatch AND from the
+        supervisor's per-item breaker when it dead-letters the last item, so
+        it lives here rather than in either. No provider gate: the reducer is
+        system-initiated on a queue the user already configured with a
+        reducer tier — a signed-out provider surfaces at the hire or the
+        first turn, same as any other reducer failure."""
+        try:
+            spec = self.queue_reducer_plan(qid)
+        except LedgerError as e:
+            return {"skipped": str(e)}
+        payload = self.queue_results(qid)
+        n_done = len(cast("list[Any]", payload["done"]))
+        n_dead = len(cast("list[Any]", payload["failed"]))
+        if spec is None:
+            self.to_user_inbox({
+                "from": SYSTEM, "kind": "notice", "at": now(),
+                "body": (f"Work queue '{qid}' drained — {n_done} done, "
+                         f"{n_dead} dead-lettered. No reducer configured; the "
+                         f"results are on the queue.")})
+            return {"notice": True}
+        if spec["name"] in self.nodes:
+            return {"skipped": "reducer already hired"}
+        try:
+            res = self.hire(USER, None, str(spec["tier"]),
+                            int(spec["grant"] or 0), str(spec["name"]),
+                            cast("list[Any]", spec["add_dirs"]),
+                            tools=cast("Mapping[str, Any]", spec["tools"]),
+                            org_visibility=cast("str", spec["org_visibility"]),
+                            charter=cast("str", spec["charter"]),
+                            or_slug=cast("str | None", spec.get("model")))
+            node = str(res["node"])
+            if spec.get("effort"):
+                self.set_scope(USER, node, effort=cast("str", spec["effort"]))
+        except LedgerError as e:
+            return {"skipped": f"reducer hire refused: {e}"}
+        lines = [f"Queue '{qid}' is fully drained — {n_done} result(s):"]
+        for d in cast("list[dict[str, Any]]", payload["done"]):
+            body = json.dumps(d.get("result"), indent=2, default=str)
+            lines.append(f"\n— item {d['id']} (by {d.get('by')}, "
+                         f"${float(d.get('cost_usd') or 0):.4f}, "
+                         f"{int(d.get('turns') or 0)} turns):\n{body[:4000]}")
+        failed = cast("list[dict[str, Any]]", payload["failed"])
+        if failed:
+            lines.append("\nDead-letter (" + str(n_dead) + "): " + ", ".join(
+                f"{f['id']} ({f.get('reason')})" for f in failed))
+        wts = cast("list[dict[str, Any]]",
+                   (payload.get("spawn") or {}).get("worktrees") or [])
+        if wts:
+            lines.append("\nWorker branches to merge into the base: "
+                         + ", ".join(str(w["branch"]) for w in wts))
+        self.post_mail(USER, node, "\n".join(lines))
+        return {"reducer": node}
 
     # ------------------------------------------------------------------ hire
     def hire(self, actor: str, parent: str | None, tier: str, grant: int, name: str,
@@ -7223,6 +7361,12 @@ class Org:
                          + sum(1 for r in self.d.get("scope_requests", [])
                                if r["status"] == "pending"),
             "tiers": self.d["tiers"],
+            # Queue ids only: the read-only work-queue panel uses this cheap
+            # discovery list, then polls each computed queue_status endpoint.
+            # Full queue payloads (including opaque item payload/result data)
+            # stay out of the always-on tree heartbeat.
+            "queues": list(cast("dict[str, Any]",
+                                self.d.get("queues") or {}).keys()),
             "audiences": self.d["audiences"],
             "roots": [build(c) for c in self.org_children(None)],
             "audit": self.audit(),

@@ -13,6 +13,7 @@ import {
 import { bumpLive } from './livebus'
 import { ConfirmModal, MailFolders, MailList, OrgCanvas, OrgRecord, RetiredFold, useEsc } from './Canvas'
 import { DiskBrowser, DiskFullAlert } from './DiskBrowser'
+import { QueuePanel } from './QueuePanel'
 import {
   AutorenewIcon, BlockIcon, CheckIcon, ChevronRightIcon, CloseIcon, CopyIcon, EyeIcon, LanIcon,
   DataUsageIcon, DeleteIcon, ExpandMoreIcon, GitHubIcon, HearingIcon, HomeIcon, LockIcon,
@@ -691,6 +692,9 @@ export default function App() {
                   target="_blank" rel="noreferrer" title="orgtree on GitHub">
                   <GitHubIcon fontSize="inherit" /></a>
               </header>
+              <QueuePanel slug={slug} qids={tree.queues ?? []}
+                workerModels={Object.fromEntries(
+                  [...flatNodes(tree)].map(([id, node]) => [id, node.tier]))} />
               <OrgCanvas tree={tree} op={op} slug={slug} toast={toast}
                 mailEvt={mailEvt}
                 onInbox={(jump: unknown) => {

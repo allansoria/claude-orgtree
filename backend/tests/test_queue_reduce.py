@@ -178,6 +178,77 @@ def main():
         except LedgerError:
             pass
 
+    print("§6 Org.queue_fire_reducer — the shared drain consequence")
+    a = Org.create("fire-none")
+    a.queue_create(USER, "q", mk("x"))
+    drain(a, "q")
+    check("no reducer -> {'notice': True} + a user-inbox notice",
+          lambda: eq((a.queue_fire_reducer("q"),
+                      any("drained" in str(m.get("body", ""))
+                          for m in a.d.get("user_inbox", [])
+                          + a.d.get("user_mail_log", []))),
+                     ({"notice": True}, True)))
+
+    b = Org.create("fire-hire")
+    b.queue_create(USER, "q", mk("x", "y"),
+                   {"reducer": {"tier": "haiku", "charter": "reduce"}})
+    drain(b, "q")
+    fr = b.queue_fire_reducer("q")
+    check("reducer hired, returned for the caller to drive",
+          lambda: eq((fr, "q-reduce" in b.nodes), ({"reducer": "q-reduce"},
+                                                   True)))
+    check("its input mail carries the results",
+          lambda: eq("drained" in b.d["mail"]["q-reduce"][0]["body"], True))
+    check("a second call is a no-op (reducer already hired)",
+          lambda: eq(b.queue_fire_reducer("q"),
+                     {"skipped": "reducer already hired"}))
+
+    print("§7 supervisor._queue_breaker_tick — trip -> fail + redrive")
+    try:
+        from fastapi.testclient import TestClient
+        from orgtree import api, supervisor
+    except Exception as exc:                               # noqa: BLE001
+        print(f"  note: web stack not importable ({exc}); skipping §7")
+    else:
+        sent: list[tuple[str, str]] = []
+        supervisor.send_message = (                        # type: ignore[assignment]
+            lambda slug, nid, text, **kw: sent.append((nid, text)) or {})
+        slug = "breaker-http"
+        try:
+            store.delete_org(slug)
+        except LedgerError:
+            pass
+        o = store.create_org(slug)
+        with store.DOC_LOCK:
+            o.queue_create(USER, "b", mk("runaway", "next"),
+                           {"workers": 1, "workspace": "shared",
+                            "retry_max": 0, "per_item_budget_usd": 0.50,
+                            "worker_template": {"tier": "haiku"}})
+            store.save_org(o)
+        TestClient(api.app).post(f"/api/orgs/{slug}/queues/b/spawn", json={})
+        w = store.load_org(slug).d["queues"]["b"]["spawn"]["workers"][0]
+        with store.DOC_LOCK:
+            o = store.load_org(slug)
+            o.queue_take(w, "b", now_ts=1.0)
+            store.save_org(o)
+        supervisor._queue_breaker_tick(slug, w, {"total_cost_usd": 0.99,
+                                                 "result": "loop output"})
+        back = store.load_org(slug)
+        check("the over-budget item is dead-lettered, worker keeps its seat",
+              lambda: eq(([f["id"] for f in back.d["queues"]["b"]["failed"]],
+                          w in back.nodes),
+                         (["runaway"], True)))
+        check("the worker is re-driven to take the next item",
+              lambda: eq(any(n == w and "circuit breaker" in t
+                             for n, t in sent), True))
+        check("a non-worker node is a silent no-op",
+              lambda: (supervisor._queue_breaker_tick(
+                  slug, "nobody", {"total_cost_usd": 9.0}), None)[1])
+        try:
+            store.delete_org(slug)
+        except LedgerError:
+            pass
+
     print(f"\n{PASS} checks passed")
 
 

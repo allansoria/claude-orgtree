@@ -8045,6 +8045,72 @@ def _log_turn_error(slug: str, nid: str, text: str) -> None:
         pass
 
 
+def _turn_sig(res: dict[str, Any]) -> str:
+    """A cheap fingerprint of a turn's OUTPUT for the work-queue loop
+    detector (Inc 5): the final assistant text, clipped. Three turns running
+    that produce the identical fingerprint are a stuck item. Falls back to ''
+    (loop detection off, budget/turn caps still apply) when the leg reports
+    no final text."""
+    for k in ("result", "response", "text"):
+        v = res.get(k)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())[:240]
+    return ""
+
+
+def _queue_breaker_tick(slug: str, nid: str, res: dict[str, Any]) -> None:
+    """Inc 5 per-item circuit breaker — runs after EVERY worker turn (all
+    provider legs land in `_after_turn`). Books the turn against the node's
+    live queue claim; if it crossed the per-item budget / turn cap /
+    identical-turn-loop guard, dead-letters the ITEM (never the worker) and
+    re-drives the worker onto the next one. A queue drained by that fail
+    fires its reducer. No-op — one cheap `queue_of_worker` scan — for every
+    node that is not a live queue worker.
+
+    Own lock/load/save (DOC_LOCK is reentrant): it touches only
+    `queues[qid]`, which nothing else in `_after_turn` does, and the drive
+    sends happen after the save like everywhere else."""
+    redrive: tuple[str, str] | None = None
+    wake_reducer: str | None = None
+    try:
+        with store.DOC_LOCK:
+            org = store.load_org(slug)
+            if nid not in org.nodes:
+                return
+            qid = org.queue_of_worker(nid)
+            if not qid:
+                return
+            claim = cast("dict[str, Any]",
+                         (org.d["queues"][qid].get("claimed") or {})).get(nid)
+            if not claim:
+                return
+            item_id = str(claim.get("item_id") or "")
+            d = org.queue_tick_item(
+                nid, qid, cost_usd=float(res.get("total_cost_usd") or 0.0),
+                turn_sig=_turn_sig(res))
+            if not d["trip"]:
+                store.save_org(org)          # persist the telemetry bump
+                return
+            fail = org.queue_fail(nid, qid, item_id, str(d["reason"]))
+            redrive = (nid, f"(orgtree) Queue item '{item_id}' was auto-failed "
+                            f"by the circuit breaker ({d['reason']}). Call "
+                            f"orgtree_queue_take for '{qid}' to pick up the "
+                            f"next item.")
+            if fail.get("queue_drained"):
+                fr = org.queue_fire_reducer(qid)
+                if fr.get("reducer"):
+                    wake_reducer = str(fr["reducer"])
+            store.save_org(org)
+    except Exception:                                           # noqa: BLE001
+        return
+    if redrive:
+        send_message(slug, redrive[0], redrive[1])
+    if wake_reducer:
+        send_message(slug, wake_reducer,
+                     "(orgtree) The work queue drained — the results are in "
+                     "your mail above. Reduce and report.")
+
+
 def _after_turn(slug: str, nid: str, org: Org, res: dict[str, Any],
                 st: dict[str, Any], occ: int = 0,
                 on_key: bool = False) -> None:
@@ -8058,6 +8124,8 @@ def _after_turn(slug: str, nid: str, org: Org, res: dict[str, Any],
     needlessly compact-split the node."""
     if nid not in org.nodes:
         return
+    # Inc 5 work-queue per-item breaker — own lock/save, no-op for non-workers.
+    _queue_breaker_tick(slug, nid, res)
     cost = float(res.get("total_cost_usd") or 0.0)
     # the pinned per-tier window wins; the CLI's modelUsage.contextWindow is
     # only a fallback for unknown tiers (it under-reported 1M models as 200k).

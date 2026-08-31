@@ -549,6 +549,8 @@ export interface TreePayload {
   effort_default?: string
   credit_requests: CreditRequest[]
   tiers: Record<string, number>
+  /** Work-queue discovery only; QueuePanel polls each computed status. */
+  queues?: string[]
   audiences: AudienceGrant[]
   roots: TreeNode[]
   audit: AuditReport
