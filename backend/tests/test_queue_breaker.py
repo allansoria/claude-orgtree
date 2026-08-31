@@ -202,6 +202,20 @@ def main():
                      (True, 0.037, 2, False)))
     check("a second call books nothing (idempotent)",
           lambda: eq(fin.queue_book_final_turn("w", "q", cost_usd=99.0), False))
+
+    # two items finished in one turn: last gets the cost, both marks cleared
+    batch = Org.create("batch")
+    batch.queue_create(USER, "q", mk("p", "r"), {"retry_max": 0})
+    batch.queue_take("w", "q", now_ts=1.0)
+    batch.queue_done("w", "q", "p", None, now_ts=2.0)   # -> claims r
+    batch.queue_done("w", "q", "r", None, now_ts=3.0)   # -> empty
+    booked2 = batch.queue_book_final_turn("w", "q", cost_usd=0.09)
+    dq = batch.d["queues"]["q"]["done"]
+    check("a one-turn batch books the turn to the LAST item, clears every "
+          "mark",
+          lambda: eq((booked2, dq[0]["cost_usd"], dq[1]["cost_usd"],
+                      any("_final_pending" in d for d in dq)),
+                     (True, 0.0, 0.09, False)))
     check("queue_results strips the internal _final_pending marker",
           lambda: eq(any("_final_pending" in d
                          for d in fin.queue_results("q")["done"]), False))

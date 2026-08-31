@@ -2937,23 +2937,34 @@ class Org:
         """Attribute the turn that just ended — the one during which `worker`
         called queue_done / queue_fail — to the item it finished. queue_done
         runs mid-turn, before _after_turn knows the turn's cost, so it stamps
-        the recorded entry `_final_pending`; this books that cost + 1 turn and
-        clears the mark. Returns True when it booked (the supervisor then
-        SKIPS the claim tick for this turn — the turn belonged to the
-        finished item, not to whatever the worker claimed next)."""
+        the recorded entry `_final_pending`; this books that cost + 1 turn to
+        the MOST RECENT such entry and clears every `_final_pending` for this
+        worker. Returns True when it booked (the supervisor then SKIPS the
+        claim tick — the turn belonged to a finished item, not to whatever
+        the worker claimed next).
+
+        ⚠ When a worker finishes SEVERAL items in one turn, only the last
+        gets that turn's cost; the earlier ones keep whatever queue_done
+        recorded (their claim-accrued spend, often ~0). The per-worker and
+        queue totals stay exact; only the per-item split is lossy, and only
+        for a worker batching items — which is itself a sign of little work
+        per item."""
         try:
             q = self._queue(qid)
         except LedgerError:
             return False
-        for lst in ("done", "failed"):
-            for entry in reversed(cast("list[dict[str, Any]]", q.get(lst) or [])):
-                if entry.get("_final_pending") == worker:
-                    entry["cost_usd"] = round(
-                        float(entry.get("cost_usd") or 0.0) + float(cost_usd), 6)
-                    entry["turns"] = int(entry.get("turns") or 0) + 1
-                    entry.pop("_final_pending", None)
-                    return True
-        return False
+        entries = [e for lst in ("done", "failed")
+                   for e in cast("list[dict[str, Any]]", q.get(lst) or [])
+                   if e.get("_final_pending") == worker]
+        if not entries:
+            return False
+        last = entries[-1]
+        last["cost_usd"] = round(
+            float(last.get("cost_usd") or 0.0) + float(cost_usd), 6)
+        last["turns"] = int(last.get("turns") or 0) + 1
+        for e in entries:
+            e.pop("_final_pending", None)
+        return True
 
     def queue_fire_reducer(self, qid: str) -> dict[str, Any]:
         """The drain consequence (Inc 4/5): hire the queue's reducer with
