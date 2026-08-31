@@ -492,6 +492,10 @@ class Org:
             cur = cast("dict[str, Any]", _doc.setdefault(key, {}))
             for k, v in table.items():
                 cur.setdefault(k, v)
+        # work-queue state (Inc 1): existing orgs reach the feature with an
+        # empty map, exactly like a fresh one. ADD ONLY — never rebuild a
+        # populated queue set on load.
+        _doc.setdefault("queues", {})
         # ☞ a price CHANGE (not an addition) needs its own migration under
         # the add-only rule: sonnet 3 → 2 (user ruling 2026-08-12, $2/M input
         # locked in). Only the OLD SHIPPED DEFAULT migrates — any other value
@@ -642,6 +646,7 @@ class Org:
             "fable_api_fallback": False,          # user feature 2026-08-23 (needs
                                                   # api_fallback + api_key too)
             "nodes": {},
+            "queues": {},            # work-queue execution (Inc 1); {qid: {...}}
             "audiences": [],          # §7.3 — [{grantee, grantor, granted_at, reason}]
             # (a "chain_notices" key was seeded here and READ BY NOTHING. §7.4
             #  chain notices are ledger.user_deep_reach() writing into the
@@ -2245,6 +2250,233 @@ class Org:
             "op": op, "actor": actor, "at": now(), "detail": detail,
             "warnings": warnings,
         })
+
+    # =========================================================== work queues
+    # A work queue (design-work-queue.md) is a pre-filled bag of disjoint items
+    # that N workers drain with orgtree_queue_take/done/fail (Inc 2) and one
+    # reducer closes (Inc 4). Inc 1 is state + lifecycle only: create, read
+    # status, close. No workers spawn, no reducer fires here.
+    #
+    # State lives at self.d["queues"][qid]; every mutation runs under
+    # store.DOC_LOCK at the caller, like every other op. An item is the LOCKED
+    # CONTRACT shape {id, payload, writes:[path], attempts}.
+    QUEUE_DEFAULTS: Final[dict[str, Any]] = {
+        "workers": 1,
+        "retry_max": 2,
+        "per_item_budget_usd": 0.50,
+        "per_item_turn_cap": 12,
+        "lease_seconds": 600,
+        "workspace": "per-worker",   # "shared" | "per-worker"
+        "items_per_session": 4,
+        "ordered": False,
+    }
+    _QID_RE: Final = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+    def _queue(self, qid: str) -> dict[str, Any]:
+        q = cast("dict[str, Any]", self.d.get("queues") or {}).get(qid)
+        if q is None:
+            raise LedgerError(f"no such queue: {qid!r}")
+        return cast("dict[str, Any]", q)
+
+    @staticmethod
+    def _norm_queue_items(items: Any) -> list[dict[str, Any]]:
+        """Validate + copy the item list into the LOCKED CONTRACT shape.
+        Rejects a missing payload, a non-string in `writes`, a bad `attempts`,
+        or a duplicate id. Order and ids are preserved as given (the partition
+        utility already assigned `f"{i:04d}"`)."""
+        if not isinstance(items, list) or not items:
+            raise LedgerError("a queue needs a non-empty list of items")
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for i, raw in enumerate(cast("list[Any]", items)):
+            if not isinstance(raw, dict):
+                raise LedgerError(f"queue item {i} is not an object")
+            it = cast("dict[str, Any]", raw)
+            if "payload" not in it:
+                raise LedgerError(f"queue item {i} has no 'payload'")
+            iid = str(it.get("id") or f"{i:04d}")
+            if iid in seen:
+                raise LedgerError(f"duplicate queue item id {iid!r}")
+            seen.add(iid)
+            writes = it.get("writes") or []
+            if (not isinstance(writes, list)
+                    or not all(isinstance(p, str) for p in cast("list[Any]", writes))):
+                raise LedgerError(
+                    f"queue item {iid} 'writes' must be a list of path strings")
+            attempts = it.get("attempts", 0)
+            if not isinstance(attempts, int) or isinstance(attempts, bool) \
+                    or attempts < 0:
+                raise LedgerError(
+                    f"queue item {iid} 'attempts' must be a non-negative int")
+            out.append({"id": iid, "payload": it["payload"],
+                        "writes": list(cast("list[str]", writes)),
+                        "attempts": attempts})
+        return out
+
+    @classmethod
+    def _norm_queue_config(cls, config: Any) -> dict[str, Any]:
+        """Fill defaults, type-check every knob, keep worker_template / reducer
+        opaque (Inc 3/4 read them) but shape-checked."""
+        if config is not None and not isinstance(config, dict):
+            raise LedgerError("queue config must be an object")
+        src = cast("dict[str, Any]", config or {})
+        cfg = dict(cls.QUEUE_DEFAULTS)
+        for k in ("workers", "retry_max", "per_item_turn_cap",
+                  "lease_seconds", "items_per_session"):
+            if k in src:
+                v = src[k]
+                if not isinstance(v, int) or isinstance(v, bool):
+                    raise LedgerError(f"config.{k} must be an integer")
+                cfg[k] = v
+        if "per_item_budget_usd" in src:
+            v = src["per_item_budget_usd"]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
+                raise LedgerError(
+                    "config.per_item_budget_usd must be a positive number")
+            cfg["per_item_budget_usd"] = float(v)
+        if "workspace" in src:
+            if src["workspace"] not in ("shared", "per-worker"):
+                raise LedgerError(
+                    "config.workspace must be 'shared' or 'per-worker'")
+            cfg["workspace"] = src["workspace"]
+        if "ordered" in src:
+            cfg["ordered"] = bool(src["ordered"])
+        if int(cfg["workers"]) < 1:
+            raise LedgerError("config.workers must be >= 1")
+        if int(cfg["retry_max"]) < 0:
+            raise LedgerError("config.retry_max must be >= 0")
+        for k in ("per_item_turn_cap", "lease_seconds", "items_per_session"):
+            if int(cfg[k]) < 1:
+                raise LedgerError(f"config.{k} must be >= 1")
+        wt = src.get("worker_template")
+        if wt is not None and not isinstance(wt, dict):
+            raise LedgerError("config.worker_template must be an object")
+        cfg["worker_template"] = wt or {}
+        rd = src.get("reducer")
+        if rd is not None and not isinstance(rd, dict):
+            raise LedgerError("config.reducer must be an object or null")
+        cfg["reducer"] = rd
+        return cfg
+
+    @staticmethod
+    def _queue_overlaps(items: list[dict[str, Any]]) -> list[list[Any]]:
+        """Every path shared by two items, as [id_a, id_b, [shared...]] — the
+        same report shape partition.partition() produces. A read-only item
+        (writes == []) never collides."""
+        overlaps: list[list[Any]] = []
+        for a in range(len(items)):
+            wa = set(cast("list[str]", items[a]["writes"]))
+            if not wa:
+                continue
+            for b in range(a + 1, len(items)):
+                shared = wa & set(cast("list[str]", items[b]["writes"]))
+                if shared:
+                    overlaps.append([items[a]["id"], items[b]["id"],
+                                     sorted(shared)])
+        return overlaps
+
+    def queue_create(self, actor: str, qid: str, items: Any,
+                     config: Any = None) -> dict[str, Any]:
+        """Register a pre-filled work queue. `items` is the disjoint list from
+        partition.partition()["items"] (or an equivalent); each is
+        {id, payload, writes, attempts}. Inc 1: state only — nothing spawns.
+
+        Refuses an overlapping write-set on a SHARED workspace with no
+        serialisation escape (that is the mtg two-writers-one-file bug): the
+        fix is workspace:'per-worker', ordered:true, or a tighter partition.
+        On a per-worker workspace an overlap is recorded (`overlaps`) and
+        left for the reducer's serial merge."""
+        if actor != USER:
+            raise LedgerError("only the user can create a work queue")
+        qid = str(qid or "").strip()
+        if not self._QID_RE.match(qid):
+            raise LedgerError(
+                "queue id must be 1-64 chars of [a-z0-9-] and not start with '-'")
+        queues = cast("dict[str, Any]",
+                      cast("dict[str, Any]", self.d).setdefault("queues", {}))
+        if qid in queues:
+            raise LedgerError(f"queue {qid!r} already exists")
+        norm_items = self._norm_queue_items(items)
+        cfg = self._norm_queue_config(config)
+        overlaps = self._queue_overlaps(norm_items)
+        if overlaps and cfg["workspace"] == "shared" and not cfg["ordered"]:
+            a, b, paths = overlaps[0]
+            raise LedgerError(
+                f"items {a} and {b} both write {paths} and workspace is "
+                f"'shared' — two workers could corrupt that file "
+                f"({len(overlaps)} overlapping pair(s)). Use "
+                f"workspace:'per-worker', set ordered:true, or partition so "
+                f"each path has one owner.")
+        queues[qid] = {
+            "phase": "draining",
+            "pending": norm_items,
+            "claimed": {},
+            "done": [],
+            "failed": [],
+            "closed": False,
+            "config": cfg,
+            "created": now(),
+            "created_by": actor,
+            "closed_at": None,
+            "overlaps": overlaps,
+        }
+        self._log("queue_create", actor,
+                  {"qid": qid, "items": len(norm_items),
+                   "workers": cfg["workers"], "workspace": cfg["workspace"],
+                   "overlaps": len(overlaps)}, [])
+        return self.queue_status(qid)
+
+    def queue_status(self, qid: str) -> dict[str, Any]:
+        """A computed snapshot — no turn, no mutation. Full items stay in the
+        doc; this returns pending ids, the live claim table, and per-item
+        summaries for done / dead-letter, plus the running cost total."""
+        q = self._queue(qid)
+        pending = cast("list[dict[str, Any]]", q["pending"])
+        claimed = cast("dict[str, Any]", q["claimed"])
+        done = cast("list[dict[str, Any]]", q["done"])
+        failed = cast("list[dict[str, Any]]", q["failed"])
+        return {
+            "qid": qid,
+            "phase": q["phase"],
+            "closed": bool(q.get("closed")),
+            "config": q["config"],
+            "counts": {
+                "pending": len(pending), "claimed": len(claimed),
+                "done": len(done), "failed": len(failed),
+                "total": len(pending) + len(claimed) + len(done) + len(failed),
+            },
+            "pending": [it["id"] for it in pending],
+            "claimed": claimed,
+            "done": [{"id": d["id"], "by": d.get("by"),
+                      "cost_usd": float(d.get("cost_usd") or 0.0),
+                      "turns": int(d.get("turns") or 0)} for d in done],
+            "failed": [{"id": f["id"], "reason": f.get("reason"),
+                        "attempts": int(f.get("attempts") or 0)} for f in failed],
+            "cost": {"total_usd": round(
+                sum(float(d.get("cost_usd") or 0.0) for d in done), 6)},
+            "overlaps": q.get("overlaps", []),
+            "created": q.get("created"),
+            "closed_at": q.get("closed_at"),
+        }
+
+    def queue_close(self, actor: str, qid: str) -> dict[str, Any]:
+        """Stop a queue: phase -> done, no further take/done/fail. Manual
+        override; the Inc 4 completion trigger will also land here on a
+        natural drain. Idempotent — closing a closed queue just returns
+        status."""
+        if actor != USER:
+            raise LedgerError("only the user can close a work queue")
+        q = self._queue(qid)
+        if not q.get("closed"):
+            q["closed"] = True
+            q["phase"] = "done"
+            q["closed_at"] = now()
+            self._log("queue_close", actor, {
+                "qid": qid,
+                "pending_dropped": len(cast("list[Any]", q["pending"])),
+                "claimed_dropped": len(cast("dict[str, Any]", q["claimed"])),
+            }, [])
+        return self.queue_status(qid)
 
     # ------------------------------------------------------------------ hire
     def hire(self, actor: str, parent: str | None, tier: str, grant: int, name: str,

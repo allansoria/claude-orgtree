@@ -2647,6 +2647,65 @@ async def document_dismiss(slug: str, did: str) -> dict[str, Any]:
     return {"ok": True, "node": r["node"]}
 
 
+# ---- work queues (design-work-queue.md Inc 1) — state + lifecycle only.
+# Loopback/user path (never the kiosk): a queue spawns workers and spends.
+class QueueCreate(Body):
+    qid: str
+    items: list[dict[str, Any]]
+    config: dict[str, Any] | None = None
+
+
+@app.post("/api/orgs/{slug}/queues")
+async def queue_create(slug: str, body: QueueCreate,
+                       request: Request) -> dict[str, Any]:
+    """Register a pre-filled work queue (partition.partition()['items'] as
+    `items`). Inc 1: state only — nothing spawns. Refuses an overlapping
+    write-set on a 'shared' workspace."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+        except LedgerError as e:
+            raise HTTPException(404, str(e))
+        try:
+            r = org.queue_create(USER, body.qid, body.items, body.config)
+        except LedgerError as e:
+            raise HTTPException(422, str(e))
+        store.save_org(org)
+    await hub.changed(slug)
+    return r
+
+
+@app.get("/api/orgs/{slug}/queues/{qid}")
+def queue_status(slug: str, qid: str, request: Request) -> dict[str, Any]:
+    """Computed snapshot of one queue — no turn, no mutation."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    try:
+        org = store.load_org(slug)
+        return org.queue_status(qid)
+    except LedgerError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/orgs/{slug}/queues/{qid}/close")
+async def queue_close(slug: str, qid: str, request: Request) -> dict[str, Any]:
+    """Stop a queue: phase -> done, no further take/done/fail. Idempotent."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+            r = org.queue_close(USER, qid)
+        except LedgerError as e:
+            raise HTTPException(404 if "no such queue" in str(e) else 422,
+                                str(e))
+        store.save_org(org)
+    await hub.changed(slug)
+    return r
+
+
 class AskAnswer(Body):
     # single card: the picked labels. FR-04 batch card: ONE item per tab,
     # positionally — a string, or a list for a multi tab's picks
