@@ -83,6 +83,19 @@ WORKER_CHARTER: Final[str] = (
     "never loop on it."
 )
 
+REDUCER_CHARTER: Final[str] = (
+    "You are the REDUCER for work queue '{qid}'. Every worker result is in "
+    "your mailbox below as one batch. Do this once, then stop:\n"
+    "1. Synthesise the results into the shared output(s) your task names — "
+    "YOU write those files; the workers only returned data.\n"
+    "2. If the workers used per-worker git worktrees, merge each branch "
+    "`wq/{qid}/w*` into the base branch one at a time, resolving conflicts; "
+    "report any branch that will not merge cleanly.\n"
+    "3. Send the user ONE report: every result accounted for, what you "
+    "wrote, which branches merged, and what is in the dead-letter list.\n"
+    "Do not call `orgtree_queue_take` — you are not a worker."
+)
+
 # §5 — full model ids only; aliases drift (spike: 'sonnet' resolved to sonnet-4-5).
 MODELS: Final[dict[str, str]] = {
     "fable": "claude-fable-5",
@@ -2466,8 +2479,10 @@ class Org:
                 sum(float(d.get("cost_usd") or 0.0) for d in done), 6)},
             "overlaps": q.get("overlaps", []),
             "spawn": q.get("spawn"),
+            "reduce": q.get("reduce"),
             "per_worker": q.get("per_worker", {}),
             "created": q.get("created"),
+            "drained_at": q.get("drained_at"),
             "closed_at": q.get("closed_at"),
         }
 
@@ -2633,6 +2648,8 @@ class Org:
                    "next_item_id": cast(
                        "dict[str, Any]", next_result.get("item") or {}).get("id")},
                   [])
+        if self._queue_check_drained(q, qid):
+            next_result["queue_drained"] = True
         return next_result
 
     def queue_fail(self, worker: str, qid: str, item_id: str, reason: str,
@@ -2675,7 +2692,29 @@ class Org:
                   {"qid": qid, "item_id": item_id, "reason": reason,
                    "attempts": attempts,
                    "dead_letter": bool(out.get("dead_letter"))}, [])
+        if self._queue_check_drained(q, qid):
+            out["queue_drained"] = True
         return out
+
+    def _queue_check_drained(self, q: dict[str, Any], qid: str) -> bool:
+        """Tail of queue_done / queue_fail: if the queue just emptied — no
+        pending, no live claim, still draining, not closed — advance its
+        phase (``reducing`` when a reducer is configured, else ``done``),
+        stamp ``drained_at``, and log it. Returns True the ONE time it makes
+        that transition so the caller fires the reducer exactly once."""
+        if (q.get("closed") or q.get("phase") != "draining"
+                or cast("list[Any]", q["pending"])
+                or cast("dict[str, Any]", q["claimed"])):
+            return False
+        has_reducer = bool(
+            cast("dict[str, Any]", q["config"]).get("reducer"))
+        q["phase"] = "reducing" if has_reducer else "done"
+        q["drained_at"] = now()
+        self._log("queue_drained", USER,
+                  {"qid": qid, "done": len(cast("list[Any]", q["done"])),
+                   "failed": len(cast("list[Any]", q["failed"])),
+                   "reducer": has_reducer}, [])
+        return True
 
     def queue_spawn_plan(self, qid: str, *,
                          repo_root: str | None = None) -> list[dict[str, Any]]:
@@ -2744,6 +2783,47 @@ class Org:
             if nid in ((q.get("spawn") or {}).get("workers") or []):
                 return qid
         return None
+
+    def queue_reducer_plan(self, qid: str) -> dict[str, Any] | None:
+        """One hire-shaped spec for the queue's reducer, or None when no
+        reducer is configured. Records ``queues[qid]['reduce']``. The
+        completion trigger (api._queue_fire_reducer) calls this once, when
+        the queue drains."""
+        q = self._queue(qid)
+        template = cast("dict[str, Any]",
+                        cast("dict[str, Any]", q["config"]).get("reducer") or {})
+        if not template:
+            return None
+        tier = template.get("tier")
+        if not tier:
+            raise LedgerError(f"queue {qid!r} reducer needs a tier")
+        name = f"{qid}-reduce"
+        q["reduce"] = {"planned": name, "at": now()}
+        self._log("queue_reducer_plan", USER, {"qid": qid}, [])
+        return {
+            "name": name,
+            "tier": tier,
+            "grant": template.get("grant") or 0,
+            "add_dirs": template.get("add_dirs") or [],
+            "tools": template.get("tools") or {},
+            "org_visibility": template.get("org_visibility") or "team",
+            "effort": template.get("effort"),
+            "charter": REDUCER_CHARTER.format(qid=qid) + "\n\n"
+                       + str(template.get("charter") or ""),
+            "model": template.get("model"),
+        }
+
+    def queue_results(self, qid: str) -> dict[str, Any]:
+        """Full done results + dead-letter list + the spawn record — the
+        reducer's input (queue_status only carries summaries)."""
+        q = self._queue(qid)
+        return {
+            "qid": qid,
+            "done": [dict(d) for d in cast("list[dict[str, Any]]", q["done"])],
+            "failed": [dict(f)
+                       for f in cast("list[dict[str, Any]]", q["failed"])],
+            "spawn": q.get("spawn"),
+        }
 
     # ------------------------------------------------------------------ hire
     def hire(self, actor: str, parent: str | None, tier: str, grant: int, name: str,

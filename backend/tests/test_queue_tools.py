@@ -138,10 +138,11 @@ def main():
               "result": {"answer": 42}, "by": "worker",
               "cost_usd": 1.25, "turns": 3}))
     empty = done.queue_done("worker", "q", "two", "finished", now_ts=22.0)
-    check("done returns empty when the queue is drained",
-          lambda: eq(empty, {"empty": True}))
-    check("natural drain leaves phase draining for Inc 4",
-          lambda: eq(done.d["queues"]["q"]["phase"], "draining"))
+    check("done returns empty + the one-shot queue_drained flag on the "
+          "last item",
+          lambda: eq(empty, {"empty": True, "queue_drained": True}))
+    check("natural drain with no reducer configured moves phase to done",
+          lambda: eq(done.d["queues"]["q"]["phase"], "done"))
 
     print("§5 fail — retry then dead-letter")
     fail = Org.create("fail")
@@ -153,9 +154,9 @@ def main():
                      ({"requeued": True, "attempts": 1}, 1)))
     fail.queue_take("worker", "q", 31.0)
     dead = fail.queue_fail("worker", "q", "bad", "still broken")
-    check("the next failure dead-letters the item",
+    check("the next failure dead-letters the item (and drains the queue)",
           lambda: eq((dead, fail.d["queues"]["q"]["failed"]),
-                     ({"dead_letter": True}, [{
+                     ({"dead_letter": True, "queue_drained": True}, [{
                          "id": "bad", "payload": {"n": "bad"},
                          "reason": "still broken", "attempts": 2}])))
     check("dead-letter drops the claim and does not auto-take",
