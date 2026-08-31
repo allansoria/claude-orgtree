@@ -334,6 +334,34 @@ sandbox/kiosk admission (holdout, §0) · provider routing preferences
 rate-limit-driven freezes (telemetry is normalized and carried in the turn
 result for a later P2).
 
+### ⚠ D-OR-8 — no file/shell tools on the OpenRouter lane (KNOWN GAP, fix deferred)
+
+`_openrouter_leg` attaches ONLY `mcptool.TOOLS` (the `orgtree_*` power tools,
+answered via the `/api/agent` loopback). It attaches NO `bash` / `read` /
+`edit` / `glob` / `grep`. In the Claude and Codex lanes those are native
+tools of the spawned CLI; the OpenRouter lane has no CLI, so an OpenRouter
+node can message/hire/report but **cannot touch the filesystem** — any such
+node hired into a reviewer/fixer/legwork seat fails ("unknown orgtree tool"
+as the model guesses at a file reader that isn't there). Observed live
+2026-08-30 across deepseek-v4-flash, glm-5.3-flash, qwen3-coder-next — a lane
+gap, not a model verdict.
+
+- **Interim (no code):** treat OpenRouter as a **coordination-tier** provider
+  — its nodes may only hold roles that use `orgtree_*` tools (coordinator,
+  router, planner), never a filesystem role. Enforce in the hire UI / docs.
+- **Proper fix — OPTION A, user-approved for a future task (2026-08-30):**
+  implement `bash` / `read_file` / `write_file` / `edit_file` / `glob` /
+  `grep` as client-answered tool cards in `_openrouter_leg` alongside
+  `mcptool.TOOLS`. Each handler runs in the node's `cwd`, enforces its
+  `add_dirs` (path + ro/rw) as the sandbox boundary, and is gated by the
+  node's `tools` dict (`bash:false` ⇒ tool not offered; `edit:false` ⇒ no
+  write tools). ~200–400 LOC + a hermetic suite. This is the logical
+  completion of D-OR-1 ("orgtree is the agent harness for this lane"): if
+  orgtree runs the loop, orgtree supplies the whole tool surface, not just
+  the power tools. Option B (bridge a filesystem/shell MCP server via a
+  stdio-MCP client in `openrouterrun.py`) is the reuse-a-protocol
+  alternative if hand-rolling the layer is unattractive.
+
 ## 9. Recon — DONE 2026-08-29
 
 Live probes against the account key; artifacts banked in the implementing
