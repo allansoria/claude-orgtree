@@ -3829,6 +3829,11 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
         except LedgerError as e:
             raise HTTPException(422, str(e))
     drive: list[str] = []      # nodes whose turn should run after we release the lock
+    reducer_kicks: list[str] = []   # queue reducers just hired on a drain — an
+                                    # explicit self-contained kick, not the
+                                    # mail_ping drive tail (a freshly-hired node
+                                    # the same transaction created does not wake
+                                    # reliably off a pointer — first live run)
     org_send: tuple[str, str] | None = None   # (dst-slug, body) outbound to another org's inbox
     net_send = False                          # @net: — staged to the spool; kick after the lock
     notice_to: str | None = None              # send_notice recipient — nudged wake=False after the lock
@@ -4390,7 +4395,7 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                 if result.get("queue_drained"):
                     _fr = org.queue_fire_reducer(str(a.get("qid") or ""))
                     if _fr.get("reducer"):
-                        drive.append(str(_fr["reducer"]))
+                        reducer_kicks.append(str(_fr["reducer"]))
             elif body.tool == "orgtree_queue_fail":
                 result = org.queue_fail(
                     body.node, str(a.get("qid") or ""),
@@ -4399,7 +4404,7 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                 if result.get("queue_drained"):
                     _fr = org.queue_fire_reducer(str(a.get("qid") or ""))
                     if _fr.get("reducer"):
-                        drive.append(str(_fr["reducer"]))
+                        reducer_kicks.append(str(_fr["reducer"]))
             elif body.tool == "orgtree_status":
                 status = a.get("status", "working")
                 summary = a.get("summary", "")
@@ -4528,6 +4533,13 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
             body.org, target,
             "(orgtree) You have new mail above — handle it as appropriate, and use "
             "orgtree_status when your own task state changes.", mail_ping=True)
+    for target in reducer_kicks:
+        supervisor.send_message(
+            body.org, target,
+            "(orgtree) The work queue you reduce has drained — every worker "
+            "result is in the mail above. Do your reduction now: write the "
+            "shared output(s), merge the worker branches one at a time, then "
+            "report to the user. Do this once and stop.")
     if notice_to is not None:
         # wake=False: steer a running recipient so the notice arrives
         # mid-task like any mail would, but an idle one stays idle — the

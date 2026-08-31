@@ -167,8 +167,10 @@ def main():
               lambda: eq("rev-reduce" in back.nodes, True))
         check("phase is 'reducing'",
               lambda: eq(back.queue_status("rev")["phase"], "reducing"))
-        check("the reducer was woken (drive kick)",
-              lambda: eq("rev-reduce" in [n for n, _ in kicked], True))
+        check("the reducer got an explicit self-contained kick "
+              "(not the generic mail-pointer)",
+              lambda: eq(any(n == "rev-reduce" and "reduction" in t
+                             for n, t in kicked), True))
         mail = back.d.get("mail", {}).get("rev-reduce", [])
         check("the reducer's input mail carries both worker results",
               lambda: eq(bool(mail) and all(
