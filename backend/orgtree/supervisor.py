@@ -8080,18 +8080,25 @@ def _queue_breaker_tick(slug: str, nid: str, res: dict[str, Any]) -> None:
             qid = org.queue_of_worker(nid)
             if not qid:
                 return
+            turn_cost = float(res.get("total_cost_usd") or 0.0)
+            # This turn is the one during which the worker called queue_done /
+            # queue_fail for an item it just finished — book its cost to THAT
+            # item, not to whatever it claimed next, and stop.
+            if org.queue_book_final_turn(nid, qid, cost_usd=turn_cost):
+                store.save_org(org)
+                return
             claim = cast("dict[str, Any]",
                          (org.d["queues"][qid].get("claimed") or {})).get(nid)
             if not claim:
                 return
             item_id = str(claim.get("item_id") or "")
             d = org.queue_tick_item(
-                nid, qid, cost_usd=float(res.get("total_cost_usd") or 0.0),
-                turn_sig=_turn_sig(res))
+                nid, qid, cost_usd=turn_cost, turn_sig=_turn_sig(res))
             if not d["trip"]:
                 store.save_org(org)          # persist the telemetry bump
                 return
-            fail = org.queue_fail(nid, qid, item_id, str(d["reason"]))
+            fail = org.queue_fail(nid, qid, item_id, str(d["reason"]),
+                                  _breaker=True)
             redrive = (nid, f"(orgtree) Queue item '{item_id}' was auto-failed "
                             f"by the circuit breaker ({d['reason']}). Call "
                             f"orgtree_queue_take for '{qid}' to pick up the "

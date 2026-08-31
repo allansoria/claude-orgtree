@@ -185,6 +185,38 @@ def main():
               "claimed_usd": 0.6,
           }))
 
+    print("§7 queue_book_final_turn — the finishing turn lands on its item")
+    fin = Org.create("fin")
+    fin.queue_create(USER, "q", mk("x", "y"), {"retry_max": 0})
+    fin.queue_take("w", "q", now_ts=1.0)
+    fin.queue_done("w", "q", "x", {"r": 1}, cost_usd=0.0, turns=1, now_ts=2.0)
+    check("the done entry is marked _final_pending for this worker",
+          lambda: eq(fin.d["queues"]["q"]["done"][0].get("_final_pending"), "w"))
+    booked = fin.queue_book_final_turn("w", "q", cost_usd=0.037)
+    check("book_final_turn adds the turn cost + 1 turn to that entry, clears "
+          "the mark",
+          lambda: eq((booked,
+                      fin.d["queues"]["q"]["done"][0]["cost_usd"],
+                      fin.d["queues"]["q"]["done"][0]["turns"],
+                      "_final_pending" in fin.d["queues"]["q"]["done"][0]),
+                     (True, 0.037, 2, False)))
+    check("a second call books nothing (idempotent)",
+          lambda: eq(fin.queue_book_final_turn("w", "q", cost_usd=99.0), False))
+    check("queue_results strips the internal _final_pending marker",
+          lambda: eq(any("_final_pending" in d
+                         for d in fin.queue_results("q")["done"]), False))
+
+    brk = Org.create("brk")
+    brk.queue_create(USER, "q", mk("z"), {"retry_max": 0})
+    brk.queue_take("w", "q", now_ts=1.0)
+    brk.queue_fail("w", "q", "z", "tripped", _breaker=True)
+    check("a breaker-path dead-letter is NOT _final_pending (its turn is "
+          "already on the claim)",
+          lambda: eq("_final_pending" in brk.d["queues"]["q"]["failed"][0],
+                     False))
+    check("...so book_final_turn finds nothing to book for it",
+          lambda: eq(brk.queue_book_final_turn("w", "q", cost_usd=1.0), False))
+
     print(f"\n{PASS} checks passed")
 
 

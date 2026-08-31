@@ -133,10 +133,15 @@ def main():
     check("done returns the next item in the same call",
           lambda: eq(nxt["item"]["id"], "two"))
     check("done stores payload/result/worker/cost/turns",
-          lambda: eq(done.d["queues"]["q"]["done"][0], {
+          lambda: eq({k: v for k, v in done.d["queues"]["q"]["done"][0].items()
+                      if not k.startswith("_")}, {
               "id": "one", "payload": {"n": "one"},
               "result": {"answer": 42}, "by": "worker",
               "cost_usd": 1.25, "turns": 3}))
+    check("the done entry carries _final_pending for the supervisor to book "
+          "the finishing turn's cost",
+          lambda: eq(done.d["queues"]["q"]["done"][0].get("_final_pending"),
+                     "worker"))
     empty = done.queue_done("worker", "q", "two", "finished", now_ts=22.0)
     check("done returns empty + the one-shot queue_drained flag on the "
           "last item",
@@ -155,11 +160,17 @@ def main():
     fail.queue_take("worker", "q", 31.0)
     dead = fail.queue_fail("worker", "q", "bad", "still broken")
     check("the next failure dead-letters the item (and drains the queue)",
-          lambda: eq((dead, fail.d["queues"]["q"]["failed"]),
+          lambda: eq((dead, [{k: v for k, v in f.items()
+                              if not k.startswith("_")}
+                             for f in fail.d["queues"]["q"]["failed"]]),
                      ({"dead_letter": True, "queue_drained": True}, [{
                          "id": "bad", "payload": {"n": "bad"},
                          "reason": "still broken", "attempts": 2,
                          "cost_usd": 0.0, "turns": 0}])))
+    check("a worker-path dead-letter is _final_pending too (its turn is "
+          "booked by the supervisor)",
+          lambda: eq(fail.d["queues"]["q"]["failed"][0].get("_final_pending"),
+                     "worker"))
     check("dead-letter drops the claim and does not auto-take",
           lambda: eq((fail.d["queues"]["q"]["claimed"],
                       fail.d["queues"]["q"]["pending"]), ({}, [])))

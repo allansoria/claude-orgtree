@@ -2659,12 +2659,11 @@ class Org:
             raise LedgerError(
                 f"queue {qid!r} claim for {worker!r} has no stored item")
 
-        # roll the breaker's per-turn telemetry (queue_tick_item accrues it on
-        # the claim) into the recorded cost, plus whatever the worker passed —
-        # so the results carry a real number even when the worker reports 0.
-        # The turn that CALLS queue_done is booked by _after_turn afterwards,
-        # so a 1-turn item still lands near 0; multi-turn items — the ones the
-        # budget cares about — carry their accrued spend.
+        # cost so far: turns 1..n-1 accrued on the claim by queue_tick_item,
+        # plus whatever the worker passed. The FINAL turn — the one running
+        # right now, that called queue_done — is not booked until _after_turn
+        # fires; `_final_pending` marks this entry so the supervisor's next
+        # breaker tick adds that turn's cost here (queue_book_final_turn).
         acc_cost = float(claim.get("cost_usd") or 0.0)
         acc_turns = int(claim.get("turns") or 0)
         cast("list[dict[str, Any]]", q["done"]).append({
@@ -2674,6 +2673,7 @@ class Org:
             "by": worker,
             "cost_usd": round(acc_cost + float(cost_usd), 6),
             "turns": acc_turns + int(turns),
+            "_final_pending": worker,
         })
         per_worker = cast(
             "dict[str, dict[str, Any]]", q.setdefault("per_worker", {}))
@@ -2693,8 +2693,14 @@ class Org:
         return next_result
 
     def queue_fail(self, worker: str, qid: str, item_id: str, reason: str,
-                   now_ts: float | None = None) -> dict[str, Any]:
-        """Fail the worker's claim, requeueing or dead-lettering the item."""
+                   now_ts: float | None = None,
+                   _breaker: bool = False) -> dict[str, Any]:
+        """Fail the worker's claim, requeueing or dead-lettering the item.
+
+        `_breaker` = the supervisor's circuit breaker is the caller (not the
+        worker mid-turn): the tripping turn's cost is already on the claim
+        and rolled in below, so the dead-letter entry is NOT marked
+        `_final_pending` — there is no further worker turn to book to it."""
         q = self._queue(qid)
         if q.get("closed") or q.get("phase") != "draining":
             raise LedgerError(f"queue {qid!r} is not draining")
@@ -2725,11 +2731,14 @@ class Org:
             cast("list[dict[str, Any]]", q["pending"]).append(item)
             out = {"requeued": True, "attempts": attempts}
         else:
-            cast("list[dict[str, Any]]", q["failed"]).append({
+            entry: dict[str, Any] = {
                 "id": item_id, "payload": item["payload"],
                 "reason": reason, "attempts": attempts,
                 "cost_usd": acc_cost, "turns": acc_turns,
-            })
+            }
+            if not _breaker:
+                entry["_final_pending"] = worker
+            cast("list[dict[str, Any]]", q["failed"]).append(entry)
             out = {"dead_letter": True}
         self._log("queue_fail", worker,
                   {"qid": qid, "item_id": item_id, "reason": reason,
@@ -2860,10 +2869,15 @@ class Org:
         """Full done results + dead-letter list + the spawn record — the
         reducer's input (queue_status only carries summaries)."""
         q = self._queue(qid)
+
+        def _clean(e: dict[str, Any]) -> dict[str, Any]:
+            c = dict(e)
+            c.pop("_final_pending", None)   # internal cost-booking marker
+            return c
         return {
             "qid": qid,
-            "done": [dict(d) for d in cast("list[dict[str, Any]]", q["done"])],
-            "failed": [dict(f)
+            "done": [_clean(d) for d in cast("list[dict[str, Any]]", q["done"])],
+            "failed": [_clean(f)
                        for f in cast("list[dict[str, Any]]", q["failed"])],
             "spawn": q.get("spawn"),
         }
@@ -2916,6 +2930,29 @@ class Org:
                        "cost_usd": item_cost}, [])
         return {"trip": bool(reason), "reason": reason, "turns": turns,
                 "cost_usd": item_cost}
+
+    def queue_book_final_turn(self, worker: str, qid: str, *,
+                              cost_usd: float) -> bool:
+        """Attribute the turn that just ended — the one during which `worker`
+        called queue_done / queue_fail — to the item it finished. queue_done
+        runs mid-turn, before _after_turn knows the turn's cost, so it stamps
+        the recorded entry `_final_pending`; this books that cost + 1 turn and
+        clears the mark. Returns True when it booked (the supervisor then
+        SKIPS the claim tick for this turn — the turn belonged to the
+        finished item, not to whatever the worker claimed next)."""
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return False
+        for lst in ("done", "failed"):
+            for entry in reversed(cast("list[dict[str, Any]]", q.get(lst) or [])):
+                if entry.get("_final_pending") == worker:
+                    entry["cost_usd"] = round(
+                        float(entry.get("cost_usd") or 0.0) + float(cost_usd), 6)
+                    entry["turns"] = int(entry.get("turns") or 0) + 1
+                    entry.pop("_final_pending", None)
+                    return True
+        return False
 
     def queue_fire_reducer(self, qid: str) -> dict[str, Any]:
         """The drain consequence (Inc 4/5): hire the queue's reducer with
