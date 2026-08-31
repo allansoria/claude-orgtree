@@ -131,6 +131,61 @@ Each is independently shippable and tier-green before the next.
 - 0.2 A standalone partition helper pattern: raw work list → canonical,
   deduped, disjoint items with `writes` sets. Not orgtree-specific.
 
+#### 0.1 LOCKED CONTRACT
+
+**Queue item** (the unit of `pending` / `done` / `failed`):
+```
+{ "id": str,                 # stable, unique within the queue
+  "payload": <json>,         # opaque to the queue; the worker's whole task
+  "writes": [str],           # repo-relative paths this item may modify ([] = read-only)
+  "attempts": int }          # 0 on create; incremented on requeue
+```
+
+**`done` result**: `{ "id": str, "result": <json>, "by": str,
+"cost_usd": float, "turns": int }` — `result` is opaque to the queue; the
+reducer interprets it.
+
+**Worker tool signatures** (Inc 2, forward-declared so 0.2 and 1 agree):
+- `orgtree_queue_take(qid: str) -> {"item": <item>} | {"empty": true}`
+- `orgtree_queue_done(qid: str, item_id: str, result: <json>) -> {"item": <item>} | {"empty": true}`
+- `orgtree_queue_fail(qid: str, item_id: str, reason: str) -> {"requeued": bool, "attempts": int} | {"dead_letter": true}`
+
+#### 0.2 partition utility — SPEC (Codex)
+
+`backend/orgtree/partition.py`, standalone (no orgtree imports), plus
+`backend/tests/test_partition.py` (plain-assert, runs as a script — house
+style).
+
+```
+def partition(
+    raw: list[dict],            # raw work units: each {"key": <hashable>, "payload": <json>, "writes": list[str]}
+    *,
+    dedup_on: str = "key",      # collapse raw units with an equal value here
+    group_by: str | None = None # optional: merge units sharing this payload field into ONE item
+) -> dict:
+    """Return {"items": [<queue item>], "dropped": [{"key", "reason"}], "stats": {...}}."""
+```
+
+Rules:
+1. **Dedup**: raw units with an equal `dedup_on` value collapse to one; the
+   first wins, the rest go to `dropped` with reason `"duplicate"`.
+2. **Group** (when `group_by` given): units whose `payload[group_by]` match
+   merge into a single item whose `payload` is `{group_by: <value>,
+   "members": [<payload>...]}` and whose `writes` is the **union** of members'
+   writes. This is the "item = every card in file X" partition.
+3. **Disjointness check**: after grouping, if any two items share a path in
+   `writes`, that is a partition failure — return them in
+   `stats["overlaps"] = [[id_a, id_b, [shared_paths]]]` (do not raise; the
+   caller decides whether to accept serialized-by-write-set execution).
+4. **Item ids**: `f"{i:04d}"` in output order; output order = first-seen order
+   of the surviving key/group.
+5. `stats`: `{"raw": n, "items": n, "dropped": n, "overlaps": [...]}`.
+6. Pure and deterministic. No I/O, no globals, no clock.
+
+Tests must cover: plain dedup, group-by union of writes, an overlap that is
+reported not raised, empty input, all-duplicate input, and determinism (same
+input twice → identical output).
+
 ### Inc 1 — queue state + management ops (hermetic, no workers)
 - `org.d["queues"]` schema + add-only load-hook migration (existing orgs get
   `queues: {}`), same pattern as the ledger tier tables.
