@@ -98,6 +98,7 @@ REDUCER_CHARTER: Final[str] = (
     "report any branch that will not merge cleanly.\n"
     "3. Send the user ONE report: every result accounted for, what you "
     "wrote, which branches merged, and what is in the dead-letter list.\n"
+    "4. Call `orgtree_status` with status `done` — that closes the queue.\n"
     "Do not call `orgtree_queue_take` — you are not a worker."
 )
 
@@ -3013,7 +3014,30 @@ class Org:
             lines.append("\nWorker branches to merge into the base: "
                          + ", ".join(str(w["branch"]) for w in wts))
         self.post_mail(USER, node, "\n".join(lines))
+        # queue_reducer_plan already created ["reduce"]; pin the real node id
+        # so queue_reducer_reported can recognise this seat.
+        cast("dict[str, Any]", self._queue(qid)["reduce"])["node"] = node
         return {"reducer": node}
+
+    def queue_reducer_reported(self, nid: str, status: str) -> str | None:
+        """Called from the orgtree_status dispatch: if `nid` is the reducer
+        of a queue still in `reducing` and it just reported a terminal status
+        (`done` / `idle`), close the queue — phase `done`, `closed`,
+        `closed_at`. Returns the qid it closed, or None. This is what stops a
+        queue sitting at `reducing` forever after the reducer finishes."""
+        if status not in ("done", "idle"):
+            return None
+        for qid, q in cast("dict[str, dict[str, Any]]",
+                           self.d.get("queues") or {}).items():
+            rd = q.get("reduce") or {}
+            if rd.get("node") == nid and q.get("phase") == "reducing" \
+                    and not q.get("closed"):
+                q["phase"] = "done"
+                q["closed"] = True
+                q["closed_at"] = now()
+                self._log("queue_reduced", nid, {"qid": qid}, [])
+                return qid
+        return None
 
     # ------------------------------------------------------------------ hire
     def hire(self, actor: str, parent: str | None, tier: str, grant: int, name: str,

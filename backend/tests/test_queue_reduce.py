@@ -101,6 +101,27 @@ def main():
           lambda: eq([d["result"] for d in res["done"]],
                      [{"ok": "x"}, {"ok": "y"}, {"ok": "z"}]))
 
+    print("§2b queue_reducer_reported — the reducer's 'done' closes the queue")
+    o2b = Org.create("red2")
+    o2b.queue_create(USER, "q", mk("a", "b"),
+                     {"reducer": {"tier": "haiku", "charter": "r"}})
+    drain(o2b, "q")
+    fr = o2b.queue_fire_reducer("q")
+    rnode = fr["reducer"]
+    check("q.reduce.node is stamped by queue_fire_reducer",
+          lambda: eq(o2b.d["queues"]["q"]["reduce"]["node"], rnode))
+    check("a 'working' report from the reducer does not close it",
+          lambda: eq((o2b.queue_reducer_reported(rnode, "working"),
+                      o2b.d["queues"]["q"]["phase"]), (None, "reducing")))
+    check("a report from a non-reducer node is ignored",
+          lambda: eq(o2b.queue_reducer_reported("somebody", "done"), None))
+    check("the reducer reporting 'done' closes the queue -> phase done",
+          lambda: eq((o2b.queue_reducer_reported(rnode, "done"),
+                      o2b.d["queues"]["q"]["phase"],
+                      o2b.d["queues"]["q"]["closed"]), ("q", "done", True)))
+    check("a second report is a no-op (already closed)",
+          lambda: eq(o2b.queue_reducer_reported(rnode, "done"), None))
+
     print("§3 a configured reducer must name a tier")
     o3 = Org.create("red-notier")
     o3.queue_create(USER, "q", mk("a"), {"reducer": {"charter": "x"}})
@@ -175,6 +196,17 @@ def main():
         check("the reducer's input mail carries both worker results",
               lambda: eq(bool(mail) and all(
                   s in mail[0]["body"] for s in ("did", '"a"', '"b"')), True))
+        check("q.reduce.node records the hired reducer id",
+              lambda: eq(back.d["queues"]["rev"]["reduce"].get("node"),
+                         "rev-reduce"))
+        rs = c.post("/api/agent", json={
+            "org": slug, "node": "rev-reduce", "tool": "orgtree_status",
+            "args": {"status": "done", "summary": "merged + reported"}})
+        check("the reducer reporting done closes the queue over the wire",
+              lambda: eq(rs.json().get("queue_closed"), "rev"))
+        check("phase is now 'done' and closed",
+              lambda: eq(store.load_org(slug).queue_status("rev")["phase"],
+                         "done"))
         try:
             store.delete_org(slug)
         except LedgerError:

@@ -4422,6 +4422,9 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                     "status": stored, "summary": summary,
                     "at": supervisor.now_iso()}
                 result = {"recorded": status}
+                _closed_q = org.queue_reducer_reported(body.node, stored)
+                if _closed_q:
+                    result["queue_closed"] = _closed_q
                 if status in ("done", "blocked"):
                     parent = org.node(body.node)["parent"]
                     if parent:
