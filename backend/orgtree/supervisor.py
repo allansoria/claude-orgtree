@@ -5632,6 +5632,26 @@ def _run_one_turn(slug: str, nid: str,
                                       f"%, {_why})")
                             except LedgerError:
                                 pass
+                # Work-queue items-per-session guard (Inc 3): a v1 worker
+                # never dies mid-queue, so without this its context piles up
+                # across its whole stream (the 178k-bloat, design §5). Same
+                # in-place swap as the auto-cheap-compact above, but fired on
+                # a completion boundary rather than an occupancy bar.
+                if not is_cmd:
+                    _wq = org.queue_of_worker(nid)
+                    if _wq and org.queue_should_compact(nid, _wq):
+                        try:
+                            _rq = org.cheap_compact(SYSTEM, nid)
+                            export_predecessor_transcript(
+                                org, nid,
+                                old_sid=str(_rq.get("old_session") or ""))
+                            org.queue_note_compacted(nid, _wq)
+                            store.save_org(org)
+                            print(f"[orgtree] {slug}/{nid}: queue "
+                                  f"cheap-compact (items-per-session "
+                                  f"boundary on '{_wq}')")
+                        except LedgerError:
+                            pass
                 pending = None if is_cmd \
                     else (org.d.get("notices") or {}).pop(nid, None)
                 mail = [] if is_cmd else org.take_mail(nid)

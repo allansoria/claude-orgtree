@@ -2465,6 +2465,8 @@ class Org:
             "cost": {"total_usd": round(
                 sum(float(d.get("cost_usd") or 0.0) for d in done), 6)},
             "overlaps": q.get("overlaps", []),
+            "spawn": q.get("spawn"),
+            "per_worker": q.get("per_worker", {}),
             "created": q.get("created"),
             "closed_at": q.get("closed_at"),
         }
@@ -2708,14 +2710,40 @@ class Org:
         return specs
 
     def queue_should_compact(self, worker: str, qid: str) -> bool:
-        """Whether this worker hit an items-per-session completion boundary."""
+        """Whether this worker just crossed an items-per-session boundary and
+        has not been compacted for it yet. The supervisor polls this after a
+        worker's turn; `queue_note_compacted` closes the boundary so a
+        multi-turn item doesn't re-trigger on every turn while `done` sits on
+        the multiple (the 178k-bloat guard, design §5)."""
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return False
+        stats = cast("dict[str, dict[str, Any]]", q.get("per_worker") or {}
+                     ).get(worker) or {}
+        done = int(stats.get("done") or 0)
+        step = int(cast("dict[str, Any]", q["config"])["items_per_session"])
+        return (done > 0 and done % step == 0
+                and int(stats.get("compacted_at") or -1) != done)
+
+    def queue_note_compacted(self, worker: str, qid: str) -> None:
+        """Record that `worker`'s session was re-minted at its current
+        done-count, so `queue_should_compact` stops firing for this boundary."""
         q = self._queue(qid)
-        per_worker = cast("dict[str, dict[str, Any]]",
-                          q.get("per_worker") or {})
-        done = int((per_worker.get(worker) or {}).get("done") or 0)
-        items_per_session = int(
-            cast("dict[str, Any]", q["config"])["items_per_session"])
-        return done > 0 and done % items_per_session == 0
+        stats = cast("dict[str, dict[str, Any]]",
+                     q.setdefault("per_worker", {})).setdefault(
+                         worker, {"done": 0})
+        stats["compacted_at"] = int(stats.get("done") or 0)
+
+    def queue_of_worker(self, nid: str) -> str | None:
+        """The qid this node was spawned into as a worker, or None. Cheap
+        scan of `queues[*].spawn.workers` — the supervisor calls it once per
+        turn to decide whether the items-per-session guard applies."""
+        for qid, q in cast("dict[str, dict[str, Any]]",
+                           self.d.get("queues") or {}).items():
+            if nid in ((q.get("spawn") or {}).get("workers") or []):
+                return qid
+        return None
 
     # ------------------------------------------------------------------ hire
     def hire(self, actor: str, parent: str | None, tier: str, grant: int, name: str,

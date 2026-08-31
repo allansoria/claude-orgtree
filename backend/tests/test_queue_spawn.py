@@ -237,11 +237,113 @@ def test_compaction_predicate():
           lambda: eq(org.d["queues"]["q"]["per_worker"]["worker"]["done"], 3))
 
 
+def test_compaction_boundary_closes():
+    print("§4 queue_should_compact / queue_note_compacted — boundary closes")
+    org = Org.create("boundary")
+    with store.DOC_LOCK:
+        org.queue_create(USER, "q", mk("a", "b", "c", "d"),
+                         {"items_per_session": 2})
+        # take once; every queue_done hands back (and claims) the next item
+        org.queue_take("w", "q", now_ts=100.0)
+        org.queue_done("w", "q", "a", None, now_ts=100.5)
+        org.queue_done("w", "q", "b", None, now_ts=101.5)
+        at_boundary = org.queue_should_compact("w", "q")
+        org.queue_note_compacted("w", "q")
+        after_note = org.queue_should_compact("w", "q")
+        # a multi-turn item: done stays at 2 across several polls
+        still_quiet = org.queue_should_compact("w", "q")
+        org.queue_done("w", "q", "c", None, now_ts=110.5)
+        org.queue_done("w", "q", "d", None, now_ts=111.5)
+        at_next = org.queue_should_compact("w", "q")
+
+    check("true on the first items-per-session boundary",
+          lambda: eq(at_boundary, True))
+    check("note_compacted closes that boundary",
+          lambda: eq((after_note, still_quiet), (False, False)))
+    check("true again at the next multiple", lambda: eq(at_next, True))
+
+    print("§5 queue_of_worker")
+    o2 = Org.create("owner")
+    with store.DOC_LOCK:
+        o2.queue_create(USER, "batch", mk("a"))
+        o2.d["queues"]["batch"]["spawn"] = {"workers": ["batch-w1", "batch-w2"]}
+    check("names the queue a spawned worker belongs to",
+          lambda: eq(o2.queue_of_worker("batch-w1"), "batch"))
+    check("None for a node that is not a queue worker",
+          lambda: eq(o2.queue_of_worker("someone-else"), None))
+
+
+def test_spawn_endpoint():
+    print("§6 POST /queues/{qid}/spawn — hire + kick (shared workspace)")
+    try:
+        from fastapi.testclient import TestClient
+        from orgtree import api, supervisor
+    except Exception as exc:                               # noqa: BLE001
+        print(f"  note: web stack not importable ({exc}); skipping endpoint")
+        return
+
+    kicked: list[tuple[str, str]] = []
+    supervisor.send_message = (                            # type: ignore[assignment]
+        lambda slug, nid, text, **kw: kicked.append((nid, text)) or {})
+
+    slug = "spawn-http"
+    try:
+        store.delete_org(slug)
+    except LedgerError:
+        pass
+    org = store.create_org(slug)
+    with store.DOC_LOCK:
+        org.queue_create(USER, "rev",
+                         mk("a", "b", "c"),
+                         {"workers": 2, "workspace": "shared",
+                          "worker_template": {"tier": "haiku",
+                                              "charter": "Review it."}})
+        store.save_org(org)
+
+    c = TestClient(api.app)
+    r = c.post(f"/api/orgs/{slug}/queues/rev/spawn", json={})
+    check("spawn returns 200 with two workers",
+          lambda: eq((r.status_code, len(r.json()["spawn"]["workers"])),
+                     (200, 2)))
+    back = store.load_org(slug)
+    check("both workers are live top-level nodes named rev-w1/rev-w2",
+          lambda: eq(sorted(n for n in back.nodes
+                            if n.startswith("rev-w")),
+                     ["rev-w1", "rev-w2"]))
+    check("each worker's charter starts with the shipped WORKER_CHARTER",
+          lambda: eq(all(back.nodes[n]["charter"].startswith(WORKER_CHARTER)
+                         for n in ("rev-w1", "rev-w2")), True))
+    check("the supervisor was asked to kick both workers",
+          lambda: eq(sorted(n for n, _ in kicked), ["rev-w1", "rev-w2"]))
+    check("queue_of_worker now resolves the hired node",
+          lambda: eq(back.queue_of_worker("rev-w1"), "rev"))
+    r2 = c.post(f"/api/orgs/{slug}/queues/rev/spawn", json={})
+    check("a second spawn is refused (409)",
+          lambda: eq(r2.status_code, 409))
+    # per-worker without repo_root is refused on a separate queue
+    with store.DOC_LOCK:
+        o3 = store.load_org(slug)
+        o3.queue_create(USER, "pw", mk("x"),
+                        {"workspace": "per-worker",
+                         "worker_template": {"tier": "haiku"}})
+        store.save_org(o3)
+    r4 = c.post(f"/api/orgs/{slug}/queues/pw/spawn", json={})
+    check("per-worker spawn without repo_root is refused (422)",
+          lambda: eq(r4.status_code, 422))
+
+    try:
+        store.delete_org(slug)
+    except LedgerError:
+        pass
+
+
 def main():
     try:
         test_git_worktrees()
         test_spawn_plan()
         test_compaction_predicate()
+        test_compaction_boundary_closes()
+        test_spawn_endpoint()
         print(f"\n{PASS} checks passed")
     finally:
         remove_test_dir(_TMP)

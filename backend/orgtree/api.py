@@ -39,8 +39,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, model_validator
 
 from . import ledger as ledger_mod
-from . import (accounts, codex_limits, limits, net, providers, sandbox, store,
-               subproxy, supervisor)
+from . import (accounts, codex_limits, limits, net, providers, queueworker,
+               sandbox, store, subproxy, supervisor)
 from .ledger import LedgerError, Org, USER, VIS_LEVELS, norm_dirs, norm_tools
 
 if TYPE_CHECKING:
@@ -2704,6 +2704,96 @@ async def queue_close(slug: str, qid: str, request: Request) -> dict[str, Any]:
         store.save_org(org)
     await hub.changed(slug)
     return r
+
+
+class QueueSpawn(Body):
+    # required when config.workspace == "per-worker": the repo each worker
+    # gets an isolated `git worktree` of.
+    repo_root: str | None = None
+    base_ref: str = "HEAD"
+
+
+@app.post("/api/orgs/{slug}/queues/{qid}/spawn")
+async def queue_spawn(slug: str, qid: str, body: QueueSpawn,
+                      request: Request) -> dict[str, Any]:
+    """Inc 3: hire `config.workers` workers from the queue's worker_template,
+    give each its own `git worktree` when workspace=='per-worker', and kick
+    each into the take/done loop. Loopback/user only; one shot per queue."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    kicks: list[str] = []
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+            st = org.queue_status(qid)             # 404s a missing queue
+        except LedgerError as e:
+            raise HTTPException(404 if "no such queue" in str(e) else 422,
+                                str(e))
+        if st["closed"]:
+            raise HTTPException(422, f"queue {qid!r} is closed")
+        qd = org.d["queues"][qid]
+        if (qd.get("spawn") or {}).get("workers"):
+            raise HTTPException(
+                409, f"queue {qid!r} already spawned "
+                     f"{qd['spawn']['workers']}")
+        try:
+            specs = org.queue_spawn_plan(qid, repo_root=body.repo_root)
+        except LedgerError as e:
+            raise HTTPException(422, str(e))
+
+        workspace = st["config"]["workspace"]
+        worktrees: list[dict[str, str]] = []
+        if workspace == "per-worker":
+            if not body.repo_root:
+                raise HTTPException(
+                    422, "workspace is 'per-worker' — repo_root is required so "
+                         "each worker gets its own git worktree")
+            dest = os.path.join(store.scratch_root(slug), "queue", qid)
+            try:
+                worktrees = queueworker.make_worktrees(
+                    body.repo_root, dest, qid, len(specs),
+                    base_ref=body.base_ref)
+            except queueworker.WorktreeError as e:
+                raise HTTPException(422, f"worktree setup failed: {e}")
+            for spec, wt in zip(specs, worktrees):
+                spec["add_dirs"] = [{"path": wt["path"], "mode": "rw"}]
+
+        made: list[str] = []
+        try:
+            for spec in specs:
+                tier = provider_hire_gate(org, spec["tier"], spec.get("model"))
+                res = org.hire(USER, None, tier, int(spec["grant"] or 0),
+                               spec["name"], spec["add_dirs"],
+                               tools=spec["tools"],
+                               org_visibility=spec["org_visibility"],
+                               charter=spec["charter"],
+                               or_slug=spec.get("model"))
+                node = str(res["node"])
+                if spec.get("effort"):
+                    org.set_scope(USER, node, effort=spec["effort"])
+                made.append(node)
+        except LedgerError as e:
+            # nothing is saved on this path — the whole spawn rolls back with
+            # the dropped `org`; `made` names how far the plan got.
+            raise HTTPException(
+                422, f"spawn aborted after planning {len(made)}/{len(specs)} "
+                     f"workers: {e}")
+
+        qd["spawn"] = {**(qd.get("spawn") or {}), "workers": made,
+                       "worktrees": worktrees, "workspace": workspace}
+        qd["phase"] = "draining"
+        store.save_org(org)
+        kicks = made
+
+    for node in kicks:
+        supervisor.send_message(
+            slug, node,
+            f"(orgtree) You are a work-queue worker for queue '{qid}'. Start "
+            f"now: call orgtree_queue_take with qid '{qid}', do the item, then "
+            f"orgtree_queue_done — it hands you the next one. Stop when it "
+            f"returns empty.")
+    await hub.changed(slug)
+    return store.load_org(slug).queue_status(qid)
 
 
 class AskAnswer(Body):
