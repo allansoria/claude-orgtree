@@ -125,6 +125,39 @@ denials surface as `step_type:"tool"` `state:"ERROR"` with
 | **D-AG-3** | No system-prompt / instruction flag. | orgtree's per-agent identity prompt is delivered as the **first `user` message** of the conversation (a "system turn"), the same fallback the design considered for OpenRouter. `--agent` is not used (no way to define one headlessly per node). |
 | **D-AG-4** | `agy mcp add` is a **global persistent** config, no per-session override. | Per-node identity for `python -m orgtree.mcptool` (needs a distinct `ORGTREE_NODE` per agent) cannot ride a fixed global `--env`. Options: (a) register the orgtree server ONCE with **no** node env and have `mcptool` read `ORGTREE_ORG`/`ORGTREE_NODE` from the **`agy` process environment** orgtree sets per spawn — REQUIRES verifying `agy` passes its process env through to stdio MCP children; (b) rewrite the global config per spawn under a lock (serialises `agy` turns — unacceptable); (c) skip MCP entirely for MVP and let `agy` agents run with local tools only (no org powers — they cannot message peers, hire, ask). MVP: **(a)** if env-passthrough holds, else **(c)** with the limitation stated. |
 
+### ✅ D-AG-4 — the env-passthrough question is ANSWERED (measured 2026-09-01)
+
+D-AG-4's option (a) rested on one unverified precondition: *"REQUIRES
+verifying `agy` passes its process env through to stdio MCP children."*
+Nobody had checked, so the MVP took option (c) — no MCP at all, `agy` agents
+as worker leaves with no org powers.
+
+**Measured, and it holds.** A throwaway stdio MCP server registered with
+`agy mcp add` and NO `--env` flag, spawned by an `agy --input-format
+stream-json` turn, dumped its own environment: **90 variables, including the
+`ORGTREE_ORG` / `ORGTREE_NODE` set only in the parent `agy` process.**
+
+```
+ORGTREE_ORG          = 'probeorg'
+ORGTREE_NODE         = 'probenode'
+ORGTREE_PROBE_MARKER = 'd-ag-4-passthrough'
+```
+
+So option (a) is implementable exactly as written: register
+`python -m orgtree.mcptool` ONCE in the global `agy` config with no node env,
+and let `mcptool` read its identity from the environment orgtree already sets
+per spawn. The global-config-is-shared problem does not bite, because the
+config carries no per-node data — the *process* does.
+
+That would lift `agy` agents from worker leaves to full org citizens
+(`orgtree_message`, `orgtree_hire`, `orgtree_ask`, `orgtree_status`, and the
+work-queue verbs). Not built yet; this note exists so the next increment
+starts from a measurement instead of the same open question. Two things to
+settle when it is: the global config is machine-wide, so a non-orgtree `agy`
+session would also see the server (harmless — `mcptool` with no
+`ORGTREE_NODE` should refuse), and `agy`'s `call_mcp_tool` indirection means
+the tool names reach the model differently than on the CLI lanes.
+
 ### Synthetic seat band (D-AG-2 corollary)
 
 With no cost data, seats can't be price-honest per the playbook §0. Simplest:
