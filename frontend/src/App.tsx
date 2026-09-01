@@ -694,7 +694,8 @@ export default function App() {
               </header>
               <QueuePanel slug={slug} qids={tree.queues ?? []}
                 workerModels={Object.fromEntries(
-                  [...flatNodes(tree)].map(([id, node]) => [id, node.tier]))} />
+                  [...flatNodes(tree)].map(([id, node]) => [id, node.tier]))}
+                onPlanned={() => refreshTree(slug)} />
               <OrgCanvas tree={tree} op={op} slug={slug} toast={toast}
                 mailEvt={mailEvt}
                 onInbox={(jump: unknown) => {
