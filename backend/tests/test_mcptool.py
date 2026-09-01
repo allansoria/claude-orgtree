@@ -401,8 +401,9 @@ def _():
     # +orgtree_cheap_compact (FR-24); +orgtree_request_scope (FR-13);
     # +orgtree_watchdog (FR-18); +orgtree_send_notice (2026-08-19);
     # +orgtree_prime_restart (FR-27, 2026-08-27);
-    # +orgtree_queue_take / _done / _fail (work-queue Inc 2, 2026-08-31)
-    assert len(tools) == 30, [x["name"] for x in tools]
+    # +orgtree_queue_take / _done / _fail (work-queue Inc 2, 2026-08-31);
+    # +orgtree_queue_plan (auto-partition Inc B, 2026-08-31)
+    assert len(tools) == 31, [x["name"] for x in tools]
     for c in tools:
         assert c["name"].startswith("orgtree_"), c
         assert len(c["description"]) > 20, c
@@ -556,7 +557,7 @@ _DISPATCH = sorted(set(__import__("re").findall(r'"(orgtree_\w+)"', _AGENT_CALL)
 ALIASES = {"orgtree_self_update": "orgtree_self_restart"}
 
 
-@t("the catalogue and the /api/agent dispatch name exactly the same 30 verbs")
+@t("the catalogue and the /api/agent dispatch name exactly the same 31 verbs")
 def _():
     assert sorted(CARDS) == sorted(set(_DISPATCH) - set(ALIASES)), \
         f"drift: cards {sorted(set(CARDS) - set(_DISPATCH))}, " \
@@ -568,8 +569,9 @@ def _():
     # +orgtree_request_scope (FR-13) + orgtree_watchdog (FR-18, 2026-08-12);
     # +orgtree_send_notice (mail that never wakes, 2026-08-19);
     # +orgtree_prime_restart (FR-27, the deferred restart, 2026-08-27);
-    # +orgtree_queue_take / _done / _fail (work-queue Inc 2, 2026-08-31)
-    assert len(CARDS) == 30, len(CARDS)
+    # +orgtree_queue_take / _done / _fail (work-queue Inc 2, 2026-08-31);
+    # +orgtree_queue_plan (auto-partition Inc B, 2026-08-31)
+    assert len(CARDS) == 31, len(CARDS)
 
 
 @t("☠ the deprecated self_update alias is dispatchable but NOT advertised")
@@ -724,11 +726,13 @@ def _():
     # them having already decided to reorganize, and finds them in their cards.
     # queue_take/_done/_fail (work-queue Inc 2, 2026-08-31) are the same: only
     # a queue WORKER calls them, and its charter names the loop explicitly, so
-    # the standing prompt says nothing about them.
+    # the standing prompt says nothing about them. queue_plan (auto-partition
+    # Inc B) likewise: it is reached by an explicit ask to propose a
+    # partition, never by a moment that arrives unbidden.
     assert absent == ["orgtree_list_orgs", "orgtree_move",
                       "orgtree_queue_done", "orgtree_queue_fail",
-                      "orgtree_queue_take", "orgtree_rename",
-                      "orgtree_switch_model"], \
+                      "orgtree_queue_plan", "orgtree_queue_take",
+                      "orgtree_rename", "orgtree_switch_model"], \
         f"the recital gap changed — update or retire this pin: {absent}"
     # …and the read-down pair is gated on HAVING reports: an agent with none
     # would be told to go read a subtree it does not have

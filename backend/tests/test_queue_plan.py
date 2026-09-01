@@ -25,7 +25,7 @@ with open(os.path.join(os.environ["ORGTREE_DATA"], "defaults.json"), "w",
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from orgtree import store                                       # noqa: E402
-from orgtree.ledger import LedgerError                          # noqa: E402
+from orgtree.ledger import USER, LedgerError                    # noqa: E402
 
 PASS = 0
 
@@ -186,6 +186,59 @@ def main():
     check("…and the cards are grouped under their file, not their position",
           lambda: eq([len(i["payload"]["members"]) for i in b7["items"]],
                      [3, 2, 1]))
+
+    print("§8 orgtree_queue_plan — the AGENT lane (Inc B)")
+    org = store.load_org(slug)
+    org.hire(USER, None, "haiku", 0, "planner",
+             add_dirs=[{"path": repo, "mode": "rw"}],
+             tools={"bash": True, "mcp": []}, org_visibility="team",
+             charter="propose partitions")
+    org.hire(USER, None, "haiku", 0, "blindfold",
+             add_dirs=[], tools={"bash": True, "mcp": []},
+             org_visibility="team", charter="holds nothing")
+    store.save_org(org)
+
+    def agent(node, **args):
+        return c.post("/api/agent", json={"org": slug, "node": node,
+                                          "tool": "orgtree_queue_plan",
+                                          "args": args})
+
+    ra = agent("planner", root=repo, strategy="group-by-field",
+               globs=["cards/curated/*.json"],
+               units=cards, group_by="file")
+    ba = ra.json()
+    check("an agent gets the same 3-item disjoint proposal",
+          lambda: eq((ra.status_code, len(ba["items"]),
+                      ba["stats"]["overlaps"]), (200, 3, [])))
+    check("the result says PROPOSAL ONLY and that it spent nothing",
+          lambda: eq("PROPOSAL ONLY" in ba["status"]
+                     and "nothing spent" in ba["status"], True))
+    check("proposing creates no queue",
+          lambda: eq("cards" in store.load_org(slug).d["queues"]
+                     and len(store.load_org(slug).d["queues"]) == 1, True))
+
+    rw = agent("planner", root=repo, strategy="group-by-field",
+               globs=["cards/curated/*.json"], group_by="file",
+               units=[{"key": "c0", "payload": {"file": "cards/curated/simic.json"},
+                       "writes": ["../../etc/passwd"]}])
+    bw = rw.json()
+    check("rule 2 holds over the wire: an agent's own `writes` never lands",
+          lambda: eq([i["writes"] for i in bw["items"]],
+                     [["cards/curated/simic.json"]]))
+    check("…and it is REPORTED as a refusal, not silently dropped",
+          lambda: eq([x["rule"] for x in bw["refusals"]], [2]))
+    check("a refused plan says so in its status line",
+          lambda: eq("NOT usable" in bw["status"], True))
+
+    rb = agent("blindfold", root=repo, strategy="by-dir", dirs=["cards"])
+    check("an agent that does not hold the root is refused (422) even though "
+          "the ORG holds it",
+          lambda: eq((rb.status_code, "you do not hold" in rb.text),
+                     (422, True)))
+
+    ro = agent("planner", root=outside, strategy="by-dir", dirs=["."])
+    check("a root outside the org entirely is refused too",
+          lambda: eq(ro.status_code, 422))
 
     try:
         store.delete_org(slug)

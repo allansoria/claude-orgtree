@@ -3622,7 +3622,8 @@ class AgentCall(Body):
 _ARG_STRS = ("node", "to", "from", "target", "grantee", "parent", "new_parent",
              "name", "tier", "kind", "body", "action", "status", "summary",
              "reason", "charter", "team_charter", "org_visibility", "effort",
-             "path", "qid", "item_id",
+             "path", "qid", "item_id", "root", "strategy", "group_by",
+             "out_prefix",
              # D-160: the one-call hire's own text arguments. `permission_mode`
              # joins them at the same time — it has always been text-only, and
              # retool simply never had it normalised, so a container landed in
@@ -3858,10 +3859,50 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
     except LedgerError as e:
         raise HTTPException(422, str(e))
     if body.tool in ("orgtree_read_transcript", "orgtree_read_scratch",
-                     "orgtree_chart", "orgtree_send_file"):
+                     "orgtree_chart", "orgtree_send_file",
+                     "orgtree_queue_plan"):
         try:
             org = store.load_org(body.org)
             org.node(body.node)
+            if body.tool == "orgtree_queue_plan":
+                # Inc B: a PROPOSAL. Read-shaped like its neighbours here —
+                # it walks the filesystem and mutates nothing, so it runs
+                # outside DOC_LOCK and never writes the doc.
+                #
+                # ⚠ THE AGENT'S ROOT IS CLAMPED TO ITS OWN GRANTS, not the
+                # org's. `_plan_root` answers "does this org hold it"; an
+                # agent may hold strictly less, and a planner that could list
+                # a folder its caller cannot read would be a disclosure
+                # channel (the plan echoes every path back).
+                _root = _plan_root(org, str(a.get("root") or ""))
+                _sc = org.node(body.node)["scope"]
+                _held = [os.path.realpath(d["path"])
+                         for d in norm_dirs(_sc.get("add_dirs"))]
+                if not any(_root == h or _root.startswith(h + os.sep)
+                           for h in _held):
+                    raise HTTPException(
+                        422, f"you do not hold {a.get('root')!r} — plan inside "
+                             f"a folder you have been granted: {_held}")
+                _listing = _plan_listing(
+                    _root, cast("list[str] | None", a.get("globs")))
+                _spec = {k: v for k, v in a.items()
+                         if k in ("strategy", "units", "group_by", "files",
+                                  "dirs", "out_prefix", "payload_template",
+                                  "limits")}
+                try:
+                    _p = autopartition.plan(_spec, listing=_listing)
+                except (ValueError, KeyError, TypeError) as e:
+                    raise HTTPException(422, f"cannot plan: {e}")
+                _p["listed"] = len(_listing)
+                _p["status"] = (
+                    "PROPOSAL ONLY — nothing was created and nothing spent. "
+                    + (f"{len(_p['refusals'])} refusal(s): this partition is "
+                       f"NOT usable as it stands — fix what each names and "
+                       f"plan again."
+                       if _p["refusals"] else
+                       f"{len(_p['items'])} disjoint item(s). Report it to "
+                       f"whoever asked; only the user can create the queue."))
+                return _p
             if body.tool == "orgtree_chart":
                 # D-178: archived nodes are hidden from the default chart (it
                 # is rebuilt into every turn of every agent); this flag is the
