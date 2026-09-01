@@ -2663,8 +2663,12 @@ def _plan_root(org: Org, root: str) -> str:
     actually holds (its workspace or a granted dir). The planner turns paths
     into agent work; an unchecked root would walk the operator's filesystem."""
     real = os.path.realpath(root)
-    allowed = [org.d.get("workspace") or ""] + [
-        d["path"] for d in norm_dirs(org.d.get("dirs"))]
+    # `dirs` already carries the workspace for an org made by create_org, so
+    # de-duplicate: the refusal message below lists these, and printing the
+    # workspace twice reads like a bug in the grant (live smoke, 2026-08-31).
+    allowed = list(dict.fromkeys(
+        [org.d.get("workspace") or ""]
+        + [d["path"] for d in norm_dirs(org.d.get("dirs"))]))
     for a in allowed:
         if not a:
             continue
