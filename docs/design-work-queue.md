@@ -269,6 +269,32 @@ cost visibility every K items instead of once at the very end.
 the queue is drained, go idle. A worker that treats a pause as a stop idles
 with work outstanding.
 
+### Quota accounting is IN the queue (2026-09-01)
+
+The measurement above was made by hand, from readings taken when someone
+remembered — which is how the mixed-crew run's number ended up muddied by
+the operator's own session. A run measured from a remembered number is a run
+not measured.
+
+So the queue stamps it: `queue_stamp_usage(qid, when, reading)` records a
+cache-only quota snapshot at spawn and again on drain, and `queue_status`
+reports the per-pool delta beside the per-node dollars. Pools are separate
+because providers are: Claude's session/weekly windows and Codex's own
+limits both have a readable percentage; Antigravity bills $0 with no
+published quota (D-AG-2) and OpenRouter is metered dollars with no window,
+so for those `cost.by_worker` already is the whole story.
+
+Two honesty constraints, both load-bearing:
+
+- **Cache-only.** A spawn must never add an upstream usage request; a pool
+  that is stale or unavailable simply does not appear. A missing baseline
+  beats a slow spawn or an invented number, and an absent reading is a
+  no-op rather than a zero.
+- **A window delta is a CEILING, not the queue's cost.** Anything else on
+  the account moves the same window — including the operator's own session,
+  which on 2026-09-01 was the larger consumer. `queue_status` says so in
+  the payload itself, so nobody reads the number as more than it is.
+
 ### On quota, not dollars
 
 `< $5 of real overhead` was the wrong success metric for subscription-billed
@@ -278,6 +304,33 @@ scarce resource is the QUOTA WINDOW. Measured: 12 card files ≈ 48% of a
 corpus needs several windows — the queue removes coordination waste, not the
 work itself. Judge a queue run by quota consumed per item, and size the run
 to the window.
+
+### The stall detector — idle is not finished (2026-09-01)
+
+A worker stops legitimately for exactly ONE reason: `take` returned a plain
+empty, so the queue is drained. Everything else that ends a turn leaves it
+idle holding no claim while items sit pending, and nothing re-drives it.
+
+Measured on the first mixed-provider run: an OpenRouter worker emitted
+`orgtree_queue_take` as PROSE — `<function=orgtree_queue_take>…` — so no
+tool ran, its turn ended, and the queue quietly ran a worker short until it
+was nudged by hand. The pause path (above) re-drives itself; this one had
+no path at all.
+
+`queue_worker_stalled(worker, qid)` answers "idle, no claim, items pending,
+queue still draining?" after every worker turn. If so the supervisor nudges
+it back to `take` — telling it explicitly to make a REAL tool call, since
+that was the observed failure — and counts the nudges. Past
+`_QUEUE_NUDGE_MAX` it stops and tells the user ONCE. A worker that will
+restart does so on the first prod; one that will not is a model or lane
+fault, and prodding it forever burns quota to no effect while the other
+workers are already draining the queue. Any completion clears the count.
+
+⚠ The counter uses `stats.get(k, -1)`, not `stats.get(k) or -1`: the marker
+is legitimately 0 for a worker that has finished nothing, and 0 is falsy —
+the `or` form reset on every call, so the cap could never be reached and a
+dead worker would have been nudged forever. Caught by the unit test, not by
+reading.
 
 ## 4. Deferred (explicit non-goals for v1)
 

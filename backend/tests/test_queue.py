@@ -166,6 +166,43 @@ def main():
                      {"id": "0001", "payload": {"n": "0001"},
                       "writes": ["b.py"], "attempts": 0}))
 
+    print("§5b quota accounting — the budget that actually stops work")
+    # cost_usd is NOTIONAL on a subscription lane: a sonnet crew bills $0
+    # real and still exhausts a 5-hour window, which is what ends a run
+    # (measured: 12 card files ≈ 48 points; the run was cut at 99%).
+    u = Org.create("usage")
+    u.queue_create(USER, "q", mk(("0000", ["a.py"])))
+    check("no snapshots ⇒ no usage report (never a fabricated zero)",
+          lambda: eq(u.queue_status("q")["usage"], None))
+    check("an unavailable peek is a NO-OP, not an empty baseline",
+          lambda: (u.queue_stamp_usage("q", "spawn", {}),
+                   eq(u.queue_status("q")["usage"], None))[1])
+    u.queue_stamp_usage("q", "spawn",
+                        {"claude": {"session": 32, "weekly_all": 67},
+                         "codex": {"primary": 10}})
+    check("a baseline alone reports, with no end and no delta",
+          lambda: eq(u.queue_status("q")["usage"]["pools"]["claude"]["session"],
+                     {"start": 32, "end": None, "delta": None}))
+    u.queue_stamp_usage("q", "drained",
+                        {"claude": {"session": 79, "weekly_all": 69},
+                         "codex": {"primary": 44}})
+    rep = u.queue_status("q")["usage"]
+    check("PER-POOL deltas — the whole point of a mixed crew is legible",
+          lambda: eq({p: {k: v["delta"] for k, v in ks.items()}
+                      for p, ks in rep["pools"].items()},
+                     {"claude": {"session": 47, "weekly_all": 2},
+                      "codex": {"primary": 34}}))
+    check("…and it says plainly that a window delta is a CEILING, not the "
+          "queue's cost alone",
+          lambda: eq("not this queue alone" in rep["note"], True))
+    u.queue_stamp_usage("q", "drained", {"claude": {"session": 80}})
+    check("a later stamp replaces the earlier one for that phase",
+          lambda: eq(u.queue_status("q")["usage"]["pools"]["claude"]["session"]
+                     ["end"], 80))
+    check("a pool present at one end only still reports, delta None",
+          lambda: eq(u.queue_status("q")["usage"]["pools"]["codex"]["primary"],
+                     {"start": 10, "end": None, "delta": None}))
+
     print("§6 queue_close")
     o6 = Org.create("q6")
     o6.queue_create(USER, "c", mk(("0000", ["a.py"])))

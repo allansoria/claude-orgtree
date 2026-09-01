@@ -2531,6 +2531,8 @@ class Org:
                     float(claim.get("cost_usd") or 0.0)
                     for claim in claimed.values()), 6)},
             "overlaps": q.get("overlaps", []),
+            # quota, not dollars — see queue_stamp_usage
+            "usage": self._queue_usage_report(q),
             "spawn": q.get("spawn"),
             "reduce": q.get("reduce"),
             "per_worker": q.get("per_worker", {}),
@@ -2677,6 +2679,113 @@ class Org:
         claimed_items[worker] = item
         stats["stream"] = streamed + 1
         return {"item": item}
+
+    def queue_stamp_usage(self, qid: str, when: str,
+                          reading: dict[str, Any]) -> None:
+        """Record a QUOTA snapshot against this queue.
+
+        ⚠ DOLLARS ARE NOT THE BUDGET on a subscription lane. `cost_usd` is
+        notional there — a sonnet crew bills $0 real and still exhausts a
+        5-hour window, which is what actually stops work (measured
+        2026-09-01: 12 card files ≈ 48 points of a session; the run had to be
+        cut at 99%). Each provider draws on a DIFFERENT pool, so the honest
+        report is per-pool and the whole argument for a mixed crew is
+        legible only if the queue records it.
+
+        `reading` is `{pool: {kind: percent}}` supplied by the caller —
+        cache-only peeks live in api/limits, and this module does no I/O.
+        `when` is "spawn" or "drained"; queue_status derives the delta.
+
+        ⚠ The delta is the WINDOW's movement, not this queue's alone —
+        anything else on the account moves it too, including the operator's
+        own session. It is a ceiling on what the queue cost, and honest only
+        as that; `cost.by_worker` remains the per-node truth."""
+        if not reading:
+            return
+        usage = cast("dict[str, Any]",
+                     self._queue(qid).setdefault("usage", {}))
+        usage[when] = {"at": now(), "pools": reading}
+
+    def _queue_usage_report(self, q: dict[str, Any]) -> dict[str, Any] | None:
+        """`{pool: {kind: {start, end, delta}}}` from the stamped snapshots,
+        or None when nothing was stamped."""
+        usage = cast("dict[str, dict[str, Any]]", q.get("usage") or {})
+        start = cast("dict[str, Any]", (usage.get("spawn") or {}).get("pools")
+                     or {})
+        end = cast("dict[str, Any]", (usage.get("drained") or {}).get("pools")
+                   or {})
+        if not start and not end:
+            return None
+        out: dict[str, Any] = {}
+        for pool in sorted(set(start) | set(end)):
+            a = cast("dict[str, Any]", start.get(pool) or {})
+            b = cast("dict[str, Any]", end.get(pool) or {})
+            kinds: dict[str, Any] = {}
+            for kind in sorted(set(a) | set(b)):
+                s, e = a.get(kind), b.get(kind)
+                kinds[kind] = {
+                    "start": s, "end": e,
+                    "delta": (int(e) - int(s)
+                              if isinstance(s, int) and isinstance(e, int)
+                              else None)}
+            out[pool] = kinds
+        return {"pools": out,
+                "at": {k: cast("dict[str, Any]", v).get("at")
+                       for k, v in usage.items()},
+                "note": "window movement, not this queue alone — other work "
+                        "on the same account moves it too; a ceiling on the "
+                        "queue's cost, with cost.by_worker the per-node truth"}
+
+    def queue_worker_stalled(self, worker: str, qid: str) -> dict[str, Any]:
+        """Did this worker just end a turn with WORK LEFT AND NOTHING TO DO?
+
+        A worker stops for exactly one legitimate reason: `take` returned a
+        plain empty, meaning the queue is drained. Everything else that ends
+        a turn — the model garbling a tool call, a transport error, an agent
+        deciding it is finished — leaves it idle holding no claim while items
+        sit pending, and NOTHING re-drives it. Measured 2026-09-01: an
+        OpenRouter worker emitted its `orgtree_queue_take` as prose, executed
+        nothing, went idle, and the queue simply ran a worker short until it
+        was nudged by hand.
+
+        So the supervisor asks after every worker turn. Returns
+        ``{"stalled": bool, "pending": n, "nudges": n}``; `nudges` counts how
+        many times this worker has been prodded WITHOUT completing anything
+        since, and is reset by any completion (`queue_done` bumps `done`).
+        A worker that cannot be revived must not be prodded forever — the
+        caller stops at a cap, and a model that never forms a tool call
+        correctly is a lane problem for a human, not a retry loop."""
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return {"stalled": False, "pending": 0, "nudges": 0}
+        if q.get("closed") or q.get("phase") != "draining":
+            return {"stalled": False, "pending": 0, "nudges": 0}
+        pending = len(cast("list[Any]", q["pending"]))
+        stats = cast("dict[str, dict[str, Any]]",
+                     q.setdefault("per_worker", {})).setdefault(
+                         worker, {"done": 0})
+        if (not pending
+                or worker in cast("dict[str, Any]", q["claimed"])
+                or int(stats.get("stream") or 0) > 0):
+            # holding work, or paused at the ceiling (that path re-drives
+            # itself), or genuinely nothing left — not a stall
+            return {"stalled": False, "pending": pending,
+                    "nudges": int(stats.get("nudges") or 0)}
+        # A completion since the last nudge clears the count.
+        # ⚠ `stats.get(k, -1)`, NOT `stats.get(k) or -1`: the marker is
+        # legitimately 0 for a worker that has finished nothing yet, and 0 is
+        # falsy — the `or` form reset the counter on every call, so the cap
+        # could never be reached and a dead worker would be nudged forever.
+        done_now = int(stats.get("done") or 0)
+        if int(stats.get("nudged_at_done", -1)) != done_now:
+            stats["nudges"] = 0
+            stats["nudged_at_done"] = done_now
+        n = int(stats.get("nudges") or 0) + 1
+        stats["nudges"] = n
+        self._log("queue_worker_stalled", worker,
+                  {"qid": qid, "pending": pending, "nudge": n}, [])
+        return {"stalled": True, "pending": pending, "nudges": n}
 
     def queue_end_stream(self, worker: str, qid: str) -> bool:
         """A turn boundary: this worker may be handed items again. Called from

@@ -228,6 +228,42 @@ def main():
     check("a genuine drain is empty WITHOUT `paused` — the worker may stop",
           lambda: eq((fin.get("empty"), fin.get("paused")), (True, None)))
 
+    print("§6c the stall detector — idle with work left is NOT a finish")
+    # A worker stops legitimately for exactly one reason: a plain empty take.
+    # Anything else that ends a turn (a garbled tool call, a transport error)
+    # leaves it idle while items sit pending and nothing re-drives it.
+    # Measured 2026-09-01: an OpenRouter worker wrote its take as PROSE,
+    # executed nothing, and the queue silently ran a worker short.
+    st = Org.create("stall")
+    st.queue_create(USER, "q", mk(("a", []), ("b", []), ("c", [])))
+    check("idle, no claim, items pending ⇒ stalled, and nudges escalate",
+          lambda: eq([st.queue_worker_stalled("w", "q")["nudges"]
+                      for _ in range(3)], [1, 2, 3]))
+    check("…the escalation is what lets a cap exist (0 is falsy — the "
+          "counter must not reset on a worker that has finished nothing)",
+          lambda: eq(st.queue_worker_stalled("w", "q")["nudges"], 4))
+    st.queue_take("w", "q", 1.0)
+    check("holding a claim is not a stall",
+          lambda: eq(st.queue_worker_stalled("w", "q")["stalled"], False))
+    st.queue_end_stream("w", "q")
+    st.queue_done("w", "q", "a", None, now_ts=2.0)   # auto-claims b
+    st.queue_end_stream("w", "q")
+    st.queue_fail("w", "q", "b", "gave up")          # claim dropped, requeued
+    check("a completion since the last nudge CLEARS the count",
+          lambda: eq(st.queue_worker_stalled("w", "q")["nudges"], 1))
+    drained = Org.create("stall-drained")
+    drained.queue_create(USER, "q", mk(("only", [])))
+    drained.queue_take("w", "q", 1.0)
+    drained.queue_done("w", "q", "only", None, now_ts=2.0)
+    check("a genuinely drained queue is never a stall (the worker MAY stop)",
+          lambda: eq(drained.queue_worker_stalled("w", "q"),
+                     {"stalled": False, "pending": 0, "nudges": 0}))
+    closed = Org.create("stall-closed")
+    closed.queue_create(USER, "q", mk(("a", []), ("b", [])))
+    closed.queue_close(USER, "q")
+    check("a closed queue is never a stall, however much is pending",
+          lambda: eq(closed.queue_worker_stalled("w", "q")["stalled"], False))
+
     print("§7 ordered:true — global concurrency 1")
     ordered = Org.create("ordered")
     ordered.queue_create(USER, "q", mk(("head", ["a"]), ("tail", ["b"])),

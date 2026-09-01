@@ -8116,6 +8116,15 @@ def _turn_sig(res: dict[str, Any]) -> str:
     return ""
 
 
+#: how many times a stalled queue worker is nudged back to `take` before it
+#: is left alone and the user is told once. Small on purpose: a worker that
+#: will restart does so on the first prod; one that will not is a model or
+#: lane fault (measured: an OpenRouter worker writing its tool call as prose),
+#: and prodding it forever burns quota to no effect while the other workers
+#: are already draining the queue.
+_QUEUE_NUDGE_MAX = 2
+
+
 def _queue_breaker_tick(slug: str, nid: str, res: dict[str, Any]) -> None:
     """Inc 5 per-item circuit breaker — runs after EVERY worker turn (all
     provider legs land in `_after_turn`). Books the turn against the node's
@@ -8167,8 +8176,38 @@ def _queue_breaker_tick(slug: str, nid: str, res: dict[str, Any]) -> None:
             if booked or not claim:
                 # nothing to breaker-check this turn; persist whatever the
                 # stream reset / booking changed and fall through to the sends
-                if booked or paused:
-                    store.save_org(org)
+                #
+                # …but FIRST: a worker holding no claim with items still
+                # pending is a STALL, not a finish. Only a plain empty `take`
+                # ends a worker legitimately; anything else that kills a turn
+                # (a garbled tool call, a transport error) leaves it idle
+                # while the queue runs a worker short. Nudge it — with a cap,
+                # because a model that cannot form a tool call is a lane
+                # problem for a human, not a retry loop.
+                if not paused:
+                    stall = org.queue_worker_stalled(nid, qid)
+                    if stall["stalled"] and stall["nudges"] <= _QUEUE_NUDGE_MAX:
+                        redrive = (nid,
+                                   f"(orgtree) You are idle but queue "
+                                   f"'{qid}' still has {stall['pending']} "
+                                   f"item(s) and you hold none. Call "
+                                   f"orgtree_queue_take for '{qid}' now — as "
+                                   f"a REAL tool call, not text. Stop only "
+                                   f"when it returns empty without a pause.")
+                    elif stall["stalled"]:
+                        # say it once, to the user, and leave it alone
+                        if stall["nudges"] == _QUEUE_NUDGE_MAX + 1:
+                            org.to_user_inbox({
+                                "from": SYSTEM, "kind": "notice",
+                                "at": now_iso(),
+                                "body": (f"Queue '{qid}': worker '{nid}' has "
+                                         f"gone idle with {stall['pending']} "
+                                         f"item(s) left and did not restart "
+                                         f"after {_QUEUE_NUDGE_MAX} nudges. "
+                                         f"Its model may not be forming tool "
+                                         f"calls correctly. The other workers "
+                                         f"carry on; the items are not lost.")})
+                store.save_org(org)   # the stall counter is state too
             else:
                 item_id = str(claim.get("item_id") or "")
                 d = org.queue_tick_item(
@@ -8186,6 +8225,12 @@ def _queue_breaker_tick(slug: str, nid: str, res: dict[str, Any]) -> None:
                                f"({d['reason']}). Call orgtree_queue_take for "
                                f"'{qid}' to pick up the next item.")
                     if fail.get("queue_drained"):
+                        # the breaker can be the LAST event of a queue, so it
+                        # owes the closing quota reading too (api stamps the
+                        # worker-driven drains)
+                        from . import api as _api      # noqa: PLC0415 — cycle
+                        org.queue_stamp_usage(qid, "drained",
+                                              _api._usage_reading())
                         fr = org.queue_fire_reducer(qid)
                         if fr.get("reducer"):
                             wake_reducer = str(fr["reducer"])

@@ -2815,6 +2815,34 @@ async def queue_close(slug: str, qid: str, request: Request) -> dict[str, Any]:
     return r
 
 
+def _usage_reading() -> dict[str, Any]:
+    """Quota standing across the pools we can read, as
+    `{pool: {kind: percent}}` — for `Org.queue_stamp_usage`.
+
+    ⚠ CACHE-ONLY, both of them. A queue spawn must not be able to add an
+    upstream usage request (`limits.peek` / `codex_limits.peek` exist for
+    exactly this); a stale or absent pool simply does not appear, and a
+    missing baseline is better than a slow spawn or a wrong number.
+
+    Only the metered lanes have a window to read. Antigravity bills $0 with
+    no published quota (D-AG-2) and OpenRouter is real dollars with no
+    window at all — for those, `cost.by_worker` is already the whole story."""
+    out: dict[str, Any] = {}
+    for pool, fn in (("claude", limits.peek), ("codex", codex_limits.peek)):
+        try:
+            p = fn()
+        except Exception:                                    # noqa: BLE001
+            continue
+        if not p.get("available"):
+            continue
+        rows = {str(x.get("kind")): x.get("percent")
+                for x in (p.get("limits") or [])
+                if isinstance(x.get("percent"), int)}
+        if rows:
+            out[pool] = rows
+    return out
+
+
 class QueueSpawn(Body):
     # required when config.workspace == "per-worker": the repo each worker
     # gets an isolated `git worktree` of.
@@ -2900,6 +2928,10 @@ async def queue_spawn(slug: str, qid: str, body: QueueSpawn,
         qd["spawn"] = {**(qd.get("spawn") or {}), "workers": made,
                        "worktrees": worktrees, "workspace": workspace}
         qd["phase"] = "draining"
+        # the quota BASELINE, taken at the last moment before any worker can
+        # burn anything — a run measured from a remembered number is a run
+        # not measured at all (2026-09-01)
+        org.queue_stamp_usage(qid, "spawn", _usage_reading())
         store.save_org(org)
         kicks = made
 
@@ -4552,7 +4584,11 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                     cost_usd=cost_usd,
                     turns=_arg_int(a, "turns", 0))
                 if result.get("queue_drained"):
-                    _fr = org.queue_fire_reducer(str(a.get("qid") or ""))
+                    _q = str(a.get("qid") or "")
+                    # the closing quota reading, paired with the spawn
+                    # baseline so the run reports its own window cost
+                    org.queue_stamp_usage(_q, "drained", _usage_reading())
+                    _fr = org.queue_fire_reducer(_q)
                     if _fr.get("reducer"):
                         reducer_kicks.append(str(_fr["reducer"]))
             elif body.tool == "orgtree_queue_fail":
@@ -4561,7 +4597,11 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                     str(a.get("item_id") or ""),
                     str(a.get("reason") or ""))
                 if result.get("queue_drained"):
-                    _fr = org.queue_fire_reducer(str(a.get("qid") or ""))
+                    _q = str(a.get("qid") or "")
+                    # the closing quota reading, paired with the spawn
+                    # baseline so the run reports its own window cost
+                    org.queue_stamp_usage(_q, "drained", _usage_reading())
+                    _fr = org.queue_fire_reducer(_q)
                     if _fr.get("reducer"):
                         reducer_kicks.append(str(_fr["reducer"]))
             elif body.tool == "orgtree_status":

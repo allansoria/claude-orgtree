@@ -326,6 +326,50 @@ def main():
         except LedgerError:
             pass
 
+        print("§9 a STALLED worker is nudged back, then left alone")
+        # The 2026-09-01 OpenRouter stall: turn ended, no claim, items
+        # pending, nothing re-drove it. Now the post-turn hook notices.
+        sent.clear()
+        slug3 = "stall-http"
+        try:
+            store.delete_org(slug3)
+        except LedgerError:
+            pass
+        o = store.create_org(slug3)
+        with store.DOC_LOCK:
+            o.queue_create(USER, "s", mk("a", "b", "c"),
+                           {"workers": 1, "workspace": "shared",
+                            "items_per_session": 9,
+                            "worker_template": {"tier": "haiku"}})
+            store.save_org(o)
+        TestClient(api.app).post(f"/api/orgs/{slug3}/queues/s/spawn", json={})
+        w = store.load_org(slug3).d["queues"]["s"]["spawn"]["workers"][0]
+        # the worker never claimed anything — exactly the observed stall
+        sent.clear()
+        supervisor._queue_breaker_tick(slug3, w, {"total_cost_usd": 0.0})
+        check("an idle worker with pending items is nudged back to take",
+              lambda: eq(any(n == w and "still has 3 item(s)" in t
+                             for n, t in sent), True))
+        check("the nudge says to make a REAL tool call (the observed failure "
+              "was a tool call written as prose)",
+              lambda: eq(any("not text" in t for _n, t in sent), True))
+        for _ in range(supervisor._QUEUE_NUDGE_MAX):
+            supervisor._queue_breaker_tick(slug3, w, {"total_cost_usd": 0.0})
+        sent.clear()
+        supervisor._queue_breaker_tick(slug3, w, {"total_cost_usd": 0.0})
+        check("past the cap it is NOT nudged again (a dead model is not a "
+              "retry loop)",
+              lambda: eq([t for n, t in sent if n == w], []))
+        inbox = store.load_org(slug3).d.get("user_inbox") or []
+        log = store.load_org(slug3).d.get("user_mail_log") or []
+        check("…and the user is told ONCE that a worker gave up",
+              lambda: eq(sum(1 for m in inbox + log
+                             if "gone idle" in str(m.get("body", ""))), 1))
+        try:
+            store.delete_org(slug3)
+        except LedgerError:
+            pass
+
     print(f"\n{PASS} checks passed")
 
 
