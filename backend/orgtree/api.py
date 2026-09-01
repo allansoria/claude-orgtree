@@ -14,6 +14,7 @@ pings "changed" after every successful op so the UI refreshes. Session spawning 
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import importlib.util
 import json
 import os
@@ -39,8 +40,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, model_validator
 
 from . import ledger as ledger_mod
-from . import (accounts, codex_limits, limits, net, providers, queueworker,
-               sandbox, store, subproxy, supervisor)
+from . import (accounts, autopartition, codex_limits, limits, net, providers,
+               queueworker, sandbox, store, subproxy, supervisor)
 from .ledger import LedgerError, Org, USER, VIS_LEVELS, norm_dirs, norm_tools
 
 if TYPE_CHECKING:
@@ -2649,31 +2650,135 @@ async def document_dismiss(slug: str, did: str) -> dict[str, Any]:
 
 # ---- work queues (design-work-queue.md Inc 1) — state + lifecycle only.
 # Loopback/user path (never the kiosk): a queue spawns workers and spends.
+# ---- auto-partitioning (design-auto-partition.md Inc A) --------------------
+# `autopartition.plan` is pure and does NO I/O by design — the caller supplies
+# the file listing. That listing is the security-relevant half, so it is built
+# HERE, containment-checked against the org's own dir grants, and never taken
+# from the request as paths.
+_PLAN_MAX_LISTING = 20000     # a walk that big is a mis-pointed root, not a plan
+
+
+def _plan_root(org: Org, root: str) -> str:
+    """Resolve `root` and refuse it unless it sits inside a directory this org
+    actually holds (its workspace or a granted dir). The planner turns paths
+    into agent work; an unchecked root would walk the operator's filesystem."""
+    real = os.path.realpath(root)
+    allowed = [org.d.get("workspace") or ""] + [
+        d["path"] for d in norm_dirs(org.d.get("dirs"))]
+    for a in allowed:
+        if not a:
+            continue
+        base = os.path.realpath(a)
+        if real == base or real.startswith(base + os.sep):
+            return real
+    raise HTTPException(
+        422, f"root {root!r} is not inside this org's folders — grant it on "
+             f"the org first (holdings: {[a for a in allowed if a]})")
+
+
+def _plan_listing(root: str, globs: list[str] | None) -> list[str]:
+    """Repo-relative, forward-slashed, sorted paths that EXIST under `root`.
+    `.git` and other dot-directories are skipped: they are never work items
+    and walking them dwarfs the real listing."""
+    pats = [g for g in (globs or []) if g.strip()] or ["*"]
+    out: list[str] = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for f in sorted(files):
+            rel = os.path.relpath(os.path.join(base, f), root).replace("\\", "/")
+            if any(fnmatch.fnmatch(rel, p) for p in pats):
+                out.append(rel)
+                if len(out) > _PLAN_MAX_LISTING:
+                    raise HTTPException(
+                        422, f"more than {_PLAN_MAX_LISTING} files matched under "
+                             f"{root!r} — narrow `root` or `globs`")
+    return sorted(out)
+
+
+class QueuePlan(Body):
+    # the directory the paths are relative to; must be inside the org's dirs
+    root: str
+    strategy: str
+    globs: list[str] | None = None          # which files form the listing
+    spec: dict[str, Any] = {}               # strategy args (units, dirs, …)
+
+
+@app.post("/api/orgs/{slug}/queues/plan")
+def queue_plan(slug: str, body: QueuePlan, request: Request) -> dict[str, Any]:
+    """DRY RUN — build a partition and return it. Creates NOTHING: no queue,
+    no hires, no doc write. A partition you can look at before spending
+    anything is what makes auto-partitioning safe to trust
+    (design-auto-partition.md §4.2)."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    try:
+        org = store.load_org(slug)
+    except LedgerError as e:
+        raise HTTPException(404, str(e))
+    root = _plan_root(org, body.root)
+    listing = _plan_listing(root, body.globs)
+    spec = {**body.spec, "strategy": body.strategy}
+    try:
+        r = autopartition.plan(spec, listing=listing)
+    except (ValueError, KeyError, TypeError) as e:
+        raise HTTPException(422, f"cannot plan: {e}")
+    return {**r, "root": root, "listed": len(listing)}
+
+
 class QueueCreate(Body):
     qid: str
-    items: list[dict[str, Any]]
+    # either an explicit item list (Inc 1) …
+    items: list[dict[str, Any]] | None = None
+    # … or the same spec `POST …/queues/plan` takes, planned server-side
+    plan: QueuePlan | None = None
     config: dict[str, Any] | None = None
 
 
 @app.post("/api/orgs/{slug}/queues")
 async def queue_create(slug: str, body: QueueCreate,
                        request: Request) -> dict[str, Any]:
-    """Register a pre-filled work queue (partition.partition()['items'] as
-    `items`). Inc 1: state only — nothing spawns. Refuses an overlapping
-    write-set on a 'shared' workspace."""
+    """Register a pre-filled work queue. Either an explicit `items` list
+    (Inc 1) or a `plan` spec run through the same planner as the dry run
+    (design-auto-partition.md §4.2). Nothing spawns; an overlapping write-set
+    on a 'shared' workspace is refused."""
     if _public_slug(request):
         raise HTTPException(404, "not found")
+    if (body.items is None) == (body.plan is None):
+        raise HTTPException(422, "give exactly one of `items` or `plan`")
+    planned: dict[str, Any] | None = None
     with store.DOC_LOCK:
         try:
             org = store.load_org(slug)
         except LedgerError as e:
             raise HTTPException(404, str(e))
+        items = body.items
+        if body.plan is not None:
+            # ⚠ re-planned HERE, against a listing taken now — not carried
+            # from an earlier dry run. Files appear and vanish between a plan
+            # and its acceptance (design-auto-partition.md §7, "listing
+            # drift"); planning under the same lock that creates the queue is
+            # what keeps a stale plan from being run.
+            p = body.plan
+            listing = _plan_listing(_plan_root(org, p.root), p.globs)
+            try:
+                planned = autopartition.plan(
+                    {**p.spec, "strategy": p.strategy}, listing=listing)
+            except (ValueError, KeyError, TypeError) as e:
+                raise HTTPException(422, f"cannot plan: {e}")
+            if planned["refusals"]:
+                raise HTTPException(
+                    422, "the partition was refused: " + "; ".join(
+                        f"[rule {r['rule']}] {r['why']}"
+                        for r in planned["refusals"]))
+            items = planned["items"]
         try:
-            r = org.queue_create(USER, body.qid, body.items, body.config)
+            r = org.queue_create(USER, body.qid, items, body.config)
         except LedgerError as e:
             raise HTTPException(422, str(e))
         store.save_org(org)
     await hub.changed(slug)
+    if planned is not None:
+        r["planned"] = planned["stats"]
     return r
 
 
