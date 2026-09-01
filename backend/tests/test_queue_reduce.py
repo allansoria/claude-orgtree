@@ -364,7 +364,43 @@ def main():
         log = store.load_org(slug3).d.get("user_mail_log") or []
         check("…and the user is told ONCE that a worker gave up",
               lambda: eq(sum(1 for m in inbox + log
-                             if "gone idle" in str(m.get("body", ""))), 1))
+                             if "did not restart after" in str(m.get("body", ""))), 1))
+
+        print("§9b …and an UNFINISHED CLAIM is a stall too (the 30-min hole)")
+        # deepseek took item 0000, made 21 real tool calls, then its turn
+        # ended with the item unfinished and the claim intact. Only the lease
+        # would have freed it — half an hour of an unattended run doing
+        # nothing. The nudge must say FINISH IT, not "take another".
+        # a FRESH org: §9 above deliberately exhausted that worker's nudge
+        # budget, and an exhausted counter would mask this case entirely
+        slug4 = "held-http"
+        try:
+            store.delete_org(slug4)
+        except LedgerError:
+            pass
+        o = store.create_org(slug4)
+        with store.DOC_LOCK:
+            o.queue_create(USER, "s", mk("a", "b"),
+                           {"workers": 1, "workspace": "shared",
+                            "items_per_session": 9,
+                            "worker_template": {"tier": "haiku"}})
+            store.save_org(o)
+        TestClient(api.app).post(f"/api/orgs/{slug4}/queues/s/spawn", json={})
+        w4 = store.load_org(slug4).d["queues"]["s"]["spawn"]["workers"][0]
+        with store.DOC_LOCK:
+            o = store.load_org(slug4)
+            o.queue_take(w4, "s", now_ts=1.0)
+            store.save_org(o)
+        sent.clear()
+        supervisor._queue_breaker_tick(slug4, w4, {"total_cost_usd": 0.0})
+        msg = " ".join(t for n, t in sent if n == w4)
+        check("a worker holding an unfinished item at a turn boundary is "
+              "nudged, by ITEM ID",
+              lambda: eq(("still held queue item" in msg
+                          and "'a'" in msg), True))
+        check("…and told to close THAT item, not to take a new one",
+              lambda: eq(("orgtree_queue_done" in msg
+                          and "Do not take a new item" in msg), True))
         try:
             store.delete_org(slug3)
         except LedgerError:

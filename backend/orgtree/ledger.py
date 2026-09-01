@@ -2762,16 +2762,31 @@ class Org:
         if q.get("closed") or q.get("phase") != "draining":
             return {"stalled": False, "pending": 0, "nudges": 0}
         pending = len(cast("list[Any]", q["pending"]))
+        claim = cast("dict[str, dict[str, Any]]",
+                     q["claimed"]).get(worker)
         stats = cast("dict[str, dict[str, Any]]",
                      q.setdefault("per_worker", {})).setdefault(
                          worker, {"done": 0})
-        if (not pending
-                or worker in cast("dict[str, Any]", q["claimed"])
-                or int(stats.get("stream") or 0) > 0):
-            # holding work, or paused at the ceiling (that path re-drives
-            # itself), or genuinely nothing left — not a stall
-            return {"stalled": False, "pending": pending,
+        # ⚠ A CLAIM IS NOT PROOF OF PROGRESS. This is asked at a TURN
+        # BOUNDARY — the worker's turn is over — so "holds an item" and
+        # "is working on it" have come apart. Measured 2026-09-01: an
+        # OpenRouter worker took item 0000, made 21 real tool calls, then
+        # its turn simply ended with the item unfinished and the claim
+        # intact. Nothing noticed, because the first cut of this method
+        # treated any claim-holder as busy; only the 30-minute LEASE would
+        # have freed it. That is a designed safety net, not a plan — half an
+        # hour of an unattended run with a worker doing nothing.
+        #
+        # So an unfinished claim at a turn boundary is a stall too. The
+        # nudge tells it to finish THAT item rather than take a new one,
+        # which is also why `item_id` is reported.
+        if not claim and (not pending
+                          or int(stats.get("stream") or 0) > 0):
+            # paused at the ceiling (that path re-drives itself), or
+            # genuinely nothing left — not a stall
+            return {"stalled": False, "pending": pending, "item_id": None,
                     "nudges": int(stats.get("nudges") or 0)}
+        held = str(claim.get("item_id") or "") if claim else None
         # A completion since the last nudge clears the count.
         # ⚠ `stats.get(k, -1)`, NOT `stats.get(k) or -1`: the marker is
         # legitimately 0 for a worker that has finished nothing yet, and 0 is
@@ -2784,8 +2799,10 @@ class Org:
         n = int(stats.get("nudges") or 0) + 1
         stats["nudges"] = n
         self._log("queue_worker_stalled", worker,
-                  {"qid": qid, "pending": pending, "nudge": n}, [])
-        return {"stalled": True, "pending": pending, "nudges": n}
+                  {"qid": qid, "pending": pending, "item_id": held,
+                   "nudge": n}, [])
+        return {"stalled": True, "pending": pending, "item_id": held,
+                "nudges": n}
 
     def queue_end_stream(self, worker: str, qid: str) -> bool:
         """A turn boundary: this worker may be handed items again. Called from

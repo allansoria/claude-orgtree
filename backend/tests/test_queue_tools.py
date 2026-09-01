@@ -242,15 +242,29 @@ def main():
     check("…the escalation is what lets a cap exist (0 is falsy — the "
           "counter must not reset on a worker that has finished nothing)",
           lambda: eq(st.queue_worker_stalled("w", "q")["nudges"], 4))
+    # ⚠ A CLAIM IS NOT PROOF OF PROGRESS. This is asked at a TURN BOUNDARY,
+    # so "holds an item" and "is working on it" have come apart. Measured:
+    # an OpenRouter worker took 0000, made 21 real tool calls, then its turn
+    # ended with the item unfinished and the claim intact — and only the
+    # 30-MINUTE LEASE would have freed it.
     st.queue_take("w", "q", 1.0)
-    check("holding a claim is not a stall",
-          lambda: eq(st.queue_worker_stalled("w", "q")["stalled"], False))
-    st.queue_end_stream("w", "q")
+    st.queue_end_stream("w", "q")          # what the supervisor does first
+    check("an UNFINISHED CLAIM at a turn boundary is a stall too, and names "
+          "the held item",
+          lambda: eq({k: v for k, v in st.queue_worker_stalled("w", "q").items()
+                      if k in ("stalled", "item_id")},
+                     {"stalled": True, "item_id": "a"}))
     st.queue_done("w", "q", "a", None, now_ts=2.0)   # auto-claims b
     st.queue_end_stream("w", "q")
-    st.queue_fail("w", "q", "b", "gave up")          # claim dropped, requeued
     check("a completion since the last nudge CLEARS the count",
           lambda: eq(st.queue_worker_stalled("w", "q")["nudges"], 1))
+    st.queue_fail("w", "q", "b", "gave up")          # requeued, claim dropped
+    st.queue_end_stream("w", "q")
+    check("claimless with the requeued item pending is still a stall, with "
+          "no item to name",
+          lambda: eq({k: v for k, v in st.queue_worker_stalled("w", "q").items()
+                      if k in ("stalled", "item_id")},
+                     {"stalled": True, "item_id": None}))
     drained = Org.create("stall-drained")
     drained.queue_create(USER, "q", mk(("only", [])))
     drained.queue_take("w", "q", 1.0)

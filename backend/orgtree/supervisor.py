@@ -8173,68 +8173,74 @@ def _queue_breaker_tick(slug: str, nid: str, res: dict[str, Any]) -> None:
             claim = None if booked else cast(
                 "dict[str, Any]",
                 (org.d["queues"][qid].get("claimed") or {})).get(nid)
-            if booked or not claim:
-                # nothing to breaker-check this turn; persist whatever the
-                # stream reset / booking changed and fall through to the sends
-                #
-                # …but FIRST: a worker holding no claim with items still
-                # pending is a STALL, not a finish. Only a plain empty `take`
-                # ends a worker legitimately; anything else that kills a turn
-                # (a garbled tool call, a transport error) leaves it idle
-                # while the queue runs a worker short. Nudge it — with a cap,
-                # because a model that cannot form a tool call is a lane
-                # problem for a human, not a retry loop.
-                if not paused:
-                    stall = org.queue_worker_stalled(nid, qid)
-                    if stall["stalled"] and stall["nudges"] <= _QUEUE_NUDGE_MAX:
-                        redrive = (nid,
-                                   f"(orgtree) You are idle but queue "
-                                   f"'{qid}' still has {stall['pending']} "
-                                   f"item(s) and you hold none. Call "
-                                   f"orgtree_queue_take for '{qid}' now — as "
-                                   f"a REAL tool call, not text. Stop only "
-                                   f"when it returns empty without a pause.")
-                    elif stall["stalled"]:
-                        # say it once, to the user, and leave it alone
-                        if stall["nudges"] == _QUEUE_NUDGE_MAX + 1:
-                            org.to_user_inbox({
-                                "from": SYSTEM, "kind": "notice",
-                                "at": now_iso(),
-                                "body": (f"Queue '{qid}': worker '{nid}' has "
-                                         f"gone idle with {stall['pending']} "
-                                         f"item(s) left and did not restart "
-                                         f"after {_QUEUE_NUDGE_MAX} nudges. "
-                                         f"Its model may not be forming tool "
-                                         f"calls correctly. The other workers "
-                                         f"carry on; the items are not lost.")})
-                store.save_org(org)   # the stall counter is state too
-            else:
+            if claim:
+                # the worker's turn ended holding an item — book the turn
+                # against THAT item and check the per-item caps
                 item_id = str(claim.get("item_id") or "")
                 d = org.queue_tick_item(
                     nid, qid, cost_usd=turn_cost, turn_sig=_turn_sig(res))
-                if not d["trip"]:
-                    store.save_org(org)      # persist the telemetry bump
-                else:
+                if d["trip"]:
                     fail = org.queue_fail(nid, qid, item_id, str(d["reason"]),
                                           _breaker=True)
-                    # a trip supersedes a stream pause: the item died, so the
-                    # worker is told THAT, not "continue your batch"
+                    # a trip supersedes everything else: the item died, so
+                    # the worker is told THAT, not "finish it" or "continue"
                     redrive = (nid,
                                f"(orgtree) Queue item '{item_id}' was "
                                f"auto-failed by the circuit breaker "
                                f"({d['reason']}). Call orgtree_queue_take for "
                                f"'{qid}' to pick up the next item.")
                     if fail.get("queue_drained"):
-                        # the breaker can be the LAST event of a queue, so it
-                        # owes the closing quota reading too (api stamps the
-                        # worker-driven drains)
-                        from . import api as _api      # noqa: PLC0415 — cycle
+                        # the breaker can be a queue's LAST event, so it owes
+                        # the closing quota reading too
+                        from . import api as _api   # noqa: PLC0415 — cycle
                         org.queue_stamp_usage(qid, "drained",
                                               _api._usage_reading())
                         fr = org.queue_fire_reducer(qid)
                         if fr.get("reducer"):
                             wake_reducer = str(fr["reducer"])
-                    store.save_org(org)
+            # ⚠ THE STALL CHECK RUNS ON BOTH PATHS, and that is the whole
+            # point. A worker stops legitimately for exactly one reason: a
+            # plain empty `take`. It can also stop holding NOTHING (a garbled
+            # tool call) or holding an UNFINISHED ITEM (measured: 21 real
+            # tool calls, then the turn just ended) — and the first cut of
+            # this checked only the claimless case, because it lived inside
+            # the `not claim` branch. The held-claim worker fell through to
+            # the breaker and was never nudged; only the 30-minute lease
+            # would have freed it.
+            if not paused and not redrive:
+                stall = org.queue_worker_stalled(nid, qid)
+                if stall["stalled"] and stall["nudges"] <= _QUEUE_NUDGE_MAX:
+                    held = stall.get("item_id")
+                    redrive = (nid, (
+                        f"(orgtree) Your turn ended while you still held "
+                        f"queue item '{held}' in '{qid}', unfinished. Finish "
+                        f"it now and call orgtree_queue_done (or "
+                        f"orgtree_queue_fail if you cannot) — as a REAL tool "
+                        f"call, not text. Do not take a new item until this "
+                        f"one is closed."
+                        if held else
+                        f"(orgtree) You are idle but queue '{qid}' still has "
+                        f"{stall['pending']} item(s) and you hold none. Call "
+                        f"orgtree_queue_take for '{qid}' now — as a REAL tool "
+                        f"call, not text. Stop only when it returns empty "
+                        f"without a pause."))
+                elif stall["stalled"] and stall["nudges"] == _QUEUE_NUDGE_MAX + 1:
+                    # say it once, to the user, and leave it alone
+                    org.to_user_inbox({
+                        "from": SYSTEM, "kind": "notice", "at": now_iso(),
+                        "body": (
+                            f"Queue '{qid}': worker '{nid}' stopped "
+                            + (f"holding item '{stall.get('item_id')}' "
+                               f"unfinished"
+                               if stall.get("item_id") else
+                               f"idle with {stall['pending']} item(s) left")
+                            + f" and did not restart after "
+                              f"{_QUEUE_NUDGE_MAX} nudges. Its model may not "
+                              f"be forming tool calls correctly. The other "
+                              f"workers carry on; nothing is lost — a held "
+                              f"item returns to the queue when its lease "
+                              f"expires.")})
+            store.save_org(org)      # telemetry and the stall counter are state
     except Exception:                                           # noqa: BLE001
         return
     if redrive:

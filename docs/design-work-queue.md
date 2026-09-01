@@ -317,8 +317,26 @@ tool ran, its turn ended, and the queue quietly ran a worker short until it
 was nudged by hand. The pause path (above) re-drives itself; this one had
 no path at all.
 
-`queue_worker_stalled(worker, qid)` answers "idle, no claim, items pending,
-queue still draining?" after every worker turn. If so the supervisor nudges
+**THREE SHAPES, one question.** A worker stops legitimately for exactly one
+reason: `take` returned a plain empty. It can stop wrongly in three ways —
+paused at the ceiling (that path re-drives itself), idle holding NOTHING,
+or idle holding an UNFINISHED ITEM. The last one is the subtle one and it
+was missed twice: a claim looks like progress, so the first cut treated any
+claim-holder as busy. But this is asked at a TURN BOUNDARY — the turn is
+over — so "holds an item" and "is working on it" have come apart. Measured
+2026-09-01: an OpenRouter worker took item 0000, made 21 real tool calls,
+then its turn simply ended with the item unfinished and the claim intact.
+Only the 30-minute LEASE would have freed it. That is a safety net, not a
+plan.
+
+⚠ And the check must run on BOTH branches of the post-turn hook. Its first
+placement was inside the `not claim` arm, so a held-claim worker fell
+through to the breaker and was never nudged at all — the fix was invisible
+for exactly the case it was written for, and the unit test caught it.
+
+`queue_worker_stalled(worker, qid)` answers "did this worker stop with work
+outstanding?" after every worker turn, and names the held item when there is
+one so the nudge can say FINISH THAT rather than "take another". If so the supervisor nudges
 it back to `take` — telling it explicitly to make a REAL tool call, since
 that was the observed failure — and counts the nudges. Past
 `_QUEUE_NUDGE_MAX` it stops and tells the user ONCE. A worker that will
