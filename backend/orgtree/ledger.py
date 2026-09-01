@@ -2386,6 +2386,21 @@ class Org:
         if wt is not None and not isinstance(wt, dict):
             raise LedgerError("config.worker_template must be an object")
         cfg["worker_template"] = wt or {}
+        # a MIXED CREW: one template per worker, so the queue can span
+        # provider lanes (and therefore quota pools). `workers` follows the
+        # list rather than sitting beside it and disagreeing.
+        wts = src.get("worker_templates")
+        if wts is not None:
+            if not isinstance(wts, list) or not wts:
+                raise LedgerError(
+                    "config.worker_templates must be a non-empty list of "
+                    "objects, one per worker")
+            for i, t in enumerate(cast("list[Any]", wts), start=1):
+                if not isinstance(t, dict):
+                    raise LedgerError(
+                        f"config.worker_templates[{i - 1}] is not an object")
+            cfg["worker_templates"] = list(cast("list[Any]", wts))
+            cfg["workers"] = len(cast("list[Any]", wts))
         rd = src.get("reducer")
         if rd is not None and not isinstance(rd, dict):
             raise LedgerError("config.reducer must be an object or null")
@@ -2827,17 +2842,40 @@ class Org:
 
     def queue_spawn_plan(self, qid: str, *,
                          repo_root: str | None = None) -> list[dict[str, Any]]:
-        """Build hire-shaped worker specs without hiring or running workers."""
+        """Build hire-shaped worker specs without hiring or running workers.
+
+        ⚠ WORKERS MAY BE A MIXED CREW. `config.worker_templates` (a list)
+        gives one template per worker, so a queue can run a Codex worker, an
+        Antigravity worker and an OpenRouter worker side by side; the single
+        `worker_template` stays valid and means "all N the same".
+
+        The point is not variety for its own sake — IT IS THE QUOTA POOLS.
+        Every provider bills a different one: Claude has the 5-hour session
+        window, Codex its own usage limit, Antigravity Google OAuth at $0,
+        OpenRouter real metered dollars with no window at all. A homogeneous
+        Claude crew drains one window and stops (measured: 6 card files ≈ 47
+        points of a session). Spread across lanes, the same work runs from
+        four independent budgets — and the expensive-but-careful lane can be
+        saved for the reducer, which is one node instead of N.
+
+        `workers` is derived from the list when one is given, so the count
+        and the crew cannot disagree."""
         q = self._queue(qid)
         config = cast("dict[str, Any]", q["config"])
-        template = cast("dict[str, Any]", config["worker_template"])
-        tier = template.get("tier")
-        if not tier:
-            raise LedgerError(
-                f"queue {qid!r} worker_template needs a tier to spawn")
+        raw = config.get("worker_templates")
+        if isinstance(raw, list) and raw:
+            templates = [cast("dict[str, Any]", t) for t in
+                         cast("list[Any]", raw)]
+        else:
+            templates = [cast("dict[str, Any]", config["worker_template"])
+                         ] * int(config["workers"])
         specs: list[dict[str, Any]] = []
         names: list[str] = []
-        for i in range(1, int(config["workers"]) + 1):
+        for i, template in enumerate(templates, start=1):
+            tier = template.get("tier")
+            if not tier:
+                raise LedgerError(
+                    f"queue {qid!r}: worker template {i} needs a tier to spawn")
             name = f"{qid}-w{i}"
             names.append(name)
             specs.append({
@@ -2854,7 +2892,8 @@ class Org:
             })
         q["spawn"] = {"repo_root": repo_root, "planned": names, "at": now()}
         self._log("queue_spawn_plan", USER,
-                  {"qid": qid, "repo_root": repo_root, "planned": names}, [])
+                  {"qid": qid, "repo_root": repo_root, "planned": names,
+                   "tiers": [s["tier"] for s in specs]}, [])
         return specs
 
     def queue_should_compact(self, worker: str, qid: str) -> bool:

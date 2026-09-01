@@ -2868,8 +2868,12 @@ async def queue_spawn(slug: str, qid: str, body: QueueSpawn,
                 spec["add_dirs"] = [{"path": wt["path"], "mode": "rw"}]
 
         made: list[str] = []
+        spec = {}
         try:
             for spec in specs:
+                # gated PER WORKER: a mixed crew spans provider lanes, so
+                # each one meets its own door (a signed-out Codex must not
+                # look like a broken queue)
                 tier = provider_hire_gate(org, spec["tier"], spec.get("model"))
                 res = org.hire(USER, None, tier, int(spec["grant"] or 0),
                                spec["name"], spec["add_dirs"],
@@ -2881,12 +2885,17 @@ async def queue_spawn(slug: str, qid: str, body: QueueSpawn,
                 if spec.get("effort"):
                     org.set_scope(USER, node, effort=spec["effort"])
                 made.append(node)
-        except LedgerError as e:
+        except (LedgerError, HTTPException) as e:
             # nothing is saved on this path — the whole spawn rolls back with
-            # the dropped `org`; `made` names how far the plan got.
+            # the dropped `org`. NAME THE LANE: on a mixed crew "spawn failed"
+            # is useless, because the answer is nearly always "that one
+            # provider is signed out", and which one decides what you do next.
+            why = e.detail if isinstance(e, HTTPException) else str(e)
             raise HTTPException(
-                422, f"spawn aborted after planning {len(made)}/{len(specs)} "
-                     f"workers: {e}")
+                422, f"spawn aborted at worker {len(made) + 1}/{len(specs)} "
+                     f"({spec.get('name')}, tier {spec.get('tier')!r}): {why}"
+                     + (f" — {made} were planned before it and none were kept."
+                        if made else ""))
 
         qd["spawn"] = {**(qd.get("spawn") or {}), "workers": made,
                        "worktrees": worktrees, "workspace": workspace}

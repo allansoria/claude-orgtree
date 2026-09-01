@@ -199,6 +199,48 @@ def test_spawn_plan():
                       org.d["events"][-1]["actor"]),
                      ("queue_spawn_plan", USER)))
 
+    print("§2b a MIXED CREW — one template per worker, spanning providers")
+    # The point is the QUOTA POOLS: Claude's session window, Codex's own
+    # limit, Antigravity at $0 and OpenRouter's metered dollars are four
+    # independent budgets. A homogeneous crew drains one of them.
+    mixed = Org.create("spawn-mixed")
+    with store.DOC_LOCK:
+        mixed.queue_create(USER, "q", mk("a", "b", "c"), {
+            "workers": 99,          # must be overridden by the list
+            "worker_templates": [
+                {"tier": "sol", "charter": "codex"},
+                {"tier": "orbit", "charter": "antigravity"},
+                {"tier": "spark", "model": "qwen/qwen3-coder-flash",
+                 "charter": "openrouter"},
+            ],
+            "reducer": {"tier": "sonnet", "charter": "merge"}})
+        mspecs = mixed.queue_spawn_plan("q", repo_root="/r")
+    check("workers is DERIVED from the list — the count cannot disagree "
+          "with the crew",
+          lambda: eq(mixed.d["queues"]["q"]["config"]["workers"], 3))
+    check("one worker per template, in order, across three providers",
+          lambda: eq([(s["name"], s["tier"], s["model"]) for s in mspecs],
+                     [("q-w1", "sol", None), ("q-w2", "orbit", None),
+                      ("q-w3", "spark", "qwen/qwen3-coder-flash")]))
+    check("every worker still gets the shipped WORKER_CHARTER plus its own",
+          lambda: eq(all(s["charter"].startswith(WORKER_CHARTER)
+                         and s["charter"].endswith(t)
+                         for s, t in zip(mspecs, ("codex", "antigravity",
+                                                  "openrouter"))), True))
+    check("the spawn record names the tiers, so a mixed crew is auditable",
+          lambda: eq(mixed.d["events"][-1]["detail"]["tiers"],
+                     ["sol", "orbit", "spark"]))
+
+    bad_mix = Org.create("spawn-mixed-notier")
+    with store.DOC_LOCK:
+        bad_mix.queue_create(USER, "q", mk("a"), {
+            "worker_templates": [{"tier": "sol"}, {"charter": "oops"}]})
+    raises(LedgerError, "worker template 2 needs a tier",
+           lambda: bad_mix.queue_spawn_plan("q"))
+    raises(LedgerError, "non-empty list",
+           lambda: Org.create("spawn-mixed-empty").queue_create(
+               USER, "q", mk("a"), {"worker_templates": []}))
+
     missing = Org.create("spawn-missing-tier")
     with store.DOC_LOCK:
         missing.queue_create(USER, "q", mk("a"), {
