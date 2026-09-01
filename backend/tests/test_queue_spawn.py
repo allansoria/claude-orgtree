@@ -221,6 +221,12 @@ def test_compaction_predicate():
         third = org.queue_done("worker", "q", second["item"]["id"], None,
                                now_ts=102.0)
         after_two = org.queue_should_compact("worker", "q")
+        # items_per_session=2 ⇒ the stream is now at its ceiling and `third`
+        # is a PAUSE, not an item. A turn boundary is what re-opens it —
+        # exactly what _queue_breaker_tick does after every worker turn.
+        paused_at_ceiling = bool(third.get("paused"))
+        reopened = org.queue_end_stream("worker", "q")
+        third = org.queue_take("worker", "q", now_ts=102.5)
         fourth = org.queue_done("worker", "q", third["item"]["id"], None,
                                 now_ts=103.0)
         after_three = org.queue_should_compact("worker", "q")
@@ -233,6 +239,9 @@ def test_compaction_predicate():
           lambda: eq((third["item"]["id"], after_two), ("three", True)))
     check("predicate is false again after the next completion",
           lambda: eq((fourth["item"]["id"], after_three), ("four", False)))
+    check("the stream paused AT the items_per_session ceiling, and a turn "
+          "boundary reopened it",
+          lambda: eq((paused_at_ceiling, reopened), (True, True)))
     check("queue_done persisted the per-worker completion count",
           lambda: eq(org.d["queues"]["q"]["per_worker"]["worker"]["done"], 3))
 
@@ -252,6 +261,10 @@ def test_compaction_boundary_closes():
         after_note = org.queue_should_compact("w", "q")
         # a multi-turn item: done stays at 2 across several polls
         still_quiet = org.queue_should_compact("w", "q")
+        # the stream is at its ceiling; a turn boundary reopens it (the
+        # supervisor does this after every worker turn)
+        org.queue_end_stream("w", "q")
+        org.queue_take("w", "q", now_ts=110.0)
         org.queue_done("w", "q", "c", None, now_ts=110.5)
         org.queue_done("w", "q", "d", None, now_ts=111.5)
         at_next = org.queue_should_compact("w", "q")

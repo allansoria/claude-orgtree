@@ -1003,8 +1003,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Claim the next eligible item from a work queue. You may hold "
             "only one claim in a queue; finish it with orgtree_queue_done or "
-            "orgtree_queue_fail before taking again. Returns {item} or "
-            "{empty: true}."),
+            "orgtree_queue_fail before taking again. Returns {item}, or "
+            "{empty: true} — and if that empty also carries `paused: true` "
+            "you have hit the queue's per-turn batch limit: END YOUR TURN, "
+            "you will be re-driven to continue. A plain empty means the queue "
+            "is drained; go idle."),
         "inputSchema": {
             "type": "object",
             "properties": {"qid": {"type": "string"}},
@@ -1015,7 +1018,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "orgtree_queue_done",
         "description": (
             "Record the result for your claimed queue item and atomically "
-            "claim the next eligible item. Returns {item} or {empty: true}."),
+            "claim the next eligible item. Returns {item}, or {empty: true} "
+            "— with `paused: true` meaning END YOUR TURN (batch limit, you "
+            "will be re-driven), without it meaning the queue is drained."),
         "inputSchema": {
             "type": "object",
             "properties": {

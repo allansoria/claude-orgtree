@@ -233,6 +233,52 @@ input twice → identical output).
 - Tests: a planted runaway item is auto-failed, worker continues; budget
   accounting matches.
 
+### ⚠ The stream gate — what the first real run taught (2026-09-01)
+
+The MTG re-run (§0's success criterion) drained clean: 12/12 items, zero
+dead letters, zero interventions, no collisions, ~22 minutes against ~1.5
+hours. But it exposed a hole this design created for itself.
+
+**`queue_done` returns the next item, so a worker never ends its turn.**
+Three workers each did four card files inside ONE turn. Everything orgtree
+does at a turn boundary therefore never happened:
+
+- no cost or occupancy booked — the org reported `$0.00` for twenty minutes
+  while the real burn was ~48% of a session quota window;
+- no `items_per_session` compaction — the 178k-bloat guard never fired;
+- **no circuit breaker** — `_queue_breaker_tick` hangs off `_after_turn`, so
+  `per_item_budget_usd` and `per_item_turn_cap` were inert. The protection
+  built for the $9.75 runaway could not run in the mode the queue encourages.
+
+The efficiency win (§1.4, "communication per item ≈ one tool call in, one
+out") had quietly removed the boundary every guarantee was nailed to.
+
+**Fix: make the boundary happen.** `_queue_take_next` counts what a worker
+has been handed since its last boundary and, at `items_per_session`, returns
+`{empty: true, paused: true, reason: …}` instead of an item. The worker ends
+its turn; `_after_turn` books the cost, runs the breaker and the compaction
+guard; `queue_end_stream` clears the counter and the supervisor re-drives it.
+The unhanded item stays PENDING — a pause loses no work, and another worker
+may take it meanwhile.
+
+Cost: one turn boundary per K items. Buys back every guarantee, plus live
+cost visibility every K items instead of once at the very end.
+
+⚠ Two kinds of empty now exist and the worker charter must distinguish them:
+`{empty, paused}` = end your turn, you will be re-driven; plain `{empty}` =
+the queue is drained, go idle. A worker that treats a pause as a stop idles
+with work outstanding.
+
+### On quota, not dollars
+
+`< $5 of real overhead` was the wrong success metric for subscription-billed
+lanes: sonnet workers cost $0 real and the criterion passes trivially. The
+scarce resource is the QUOTA WINDOW. Measured: 12 card files ≈ 48% of a
+5-hour session window (~4 points/file, $11.66 notional). The full 94-file
+corpus needs several windows — the queue removes coordination waste, not the
+work itself. Judge a queue run by quota consumed per item, and size the run
+to the window.
+
 ## 4. Deferred (explicit non-goals for v1)
 
 - **Dynamic queues that refill while running** — needs "a queue with pending

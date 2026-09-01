@@ -190,6 +190,44 @@ def main():
                           "at": "1970-01-01T00:01:51.000Z",
                           "lease_until": 121.0}}))
 
+    print("§6b the stream gate — a worker cannot drain a queue in one turn")
+    # THE 2026-09-01 LESSON. queue_done hands the next item back in the same
+    # call, so three live workers each did four files inside ONE turn: no cost
+    # booked, no occupancy, no compaction and NO CIRCUIT BREAKER, because all
+    # of that hangs off _after_turn. The gate forces the boundary back.
+    gate = Org.create("gate")
+    gate.queue_create(USER, "q", mk(("a", []), ("b", []), ("c", []), ("d", [])),
+                      {"items_per_session": 2})
+    r = gate.queue_take("w", "q", 1.0)
+    r2 = gate.queue_done("w", "q", "a", None, now_ts=2.0)
+    r3 = gate.queue_done("w", "q", "b", None, now_ts=3.0)
+    check("the first items_per_session items flow without a boundary",
+          lambda: eq((r["item"]["id"], r2["item"]["id"]), ("a", "b")))
+    check("the NEXT take is a pause, not an item, and says why",
+          lambda: eq((r3.get("item"), r3.get("empty"), r3.get("paused"),
+                      "END YOUR TURN" in str(r3.get("reason"))),
+                     (None, True, True, True)))
+    check("☠ the unhanded item stays PENDING — a pause loses no work",
+          lambda: eq(gate.d["queues"]["q"]["pending"][0]["id"], "c"))
+    check("a paused worker holds no claim (its turn is meant to end)",
+          lambda: eq(gate.d["queues"]["q"]["claimed"], {}))
+    check("taking again while paused stays paused (no way to talk past it)",
+          lambda: eq(gate.queue_take("w", "q", 4.0).get("paused"), True))
+    reopened = gate.queue_end_stream("w", "q")
+    r4 = gate.queue_take("w", "q", 5.0)
+    check("a turn boundary reopens the stream and reports it was paused",
+          lambda: eq((reopened, r4["item"]["id"]), (True, "c")))
+    check("end_stream on a worker that was NOT at the ceiling reports False "
+          "(nothing to re-drive)",
+          lambda: eq(gate.queue_end_stream("w", "q"), False))
+
+    empty_q = Org.create("gate-empty")
+    empty_q.queue_create(USER, "q", mk(("only", [])), {"items_per_session": 9})
+    empty_q.queue_take("w", "q", 1.0)
+    fin = empty_q.queue_done("w", "q", "only", None, now_ts=2.0)
+    check("a genuine drain is empty WITHOUT `paused` — the worker may stop",
+          lambda: eq((fin.get("empty"), fin.get("paused")), (True, None)))
+
     print("§7 ordered:true — global concurrency 1")
     ordered = Org.create("ordered")
     ordered.queue_create(USER, "q", mk(("head", ["a"]), ("tail", ["b"])),

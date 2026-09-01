@@ -80,8 +80,13 @@ WORKER_CHARTER: Final[str] = (
     "changes on your branch BEFORE finishing the item — the reducer merges "
     "committed branches, not a dirty tree. Then `orgtree_queue_done` with "
     "your result (pass `turns` = how many turns this item took, and "
-    "`cost_usd` if you know it) — it hands you the next item. When it "
-    "returns empty, stop and go idle. Work ONE item at a time; do not carry "
+    "`cost_usd` if you know it) — it hands you the next item.\n"
+    "TWO KINDS OF EMPTY. `{empty: true, paused: true}` means you have hit "
+    "this queue's per-turn batch limit: END YOUR TURN immediately and say so "
+    "— you will be re-driven to continue, and the items are still there. "
+    "A plain `{empty: true}` with NO pause means the queue is genuinely "
+    "drained: stop and go idle. Never keep calling take against a pause.\n"
+    "Work ONE item at a time; do not carry "
     "a finished item's detail into the next; if your context passes 60k, "
     "compact. If a tool call returns \"unknown tool\" or you cannot read a "
     "file, `orgtree_queue_fail` the item with that reason and continue — "
@@ -2553,7 +2558,24 @@ class Org:
         lease metadata). The full item lives in a private sibling map while
         claimed so expiry and done/fail can recover its payload and writes.
         Callers hold store.DOC_LOCK; this helper deliberately takes no lock.
-        """
+
+        ⚠ AND IT PAUSES THE STREAM EVERY `items_per_session` ITEMS.
+        `queue_done` hands the next item back in the same call, so a worker
+        drains item after item INSIDE ONE TURN — measured 2026-09-01, three
+        workers each did four card files in a single turn. Everything orgtree
+        does per turn therefore never ran: no cost or occupancy booked (the
+        org read $0.00 for 20 minutes while the real burn was ~48% of a
+        session window), no compaction, and — worst — no circuit breaker,
+        because `_queue_breaker_tick` fires from `_after_turn`. The
+        protections were all wired to a boundary the design's own efficiency
+        had removed.
+
+        Rather than duplicate that machinery mid-turn, this MAKES the
+        boundary happen: after `items_per_session` items the worker is handed
+        `{"empty": true, "paused": true}` instead of work, so its turn ends,
+        `_after_turn` books the turn and runs the breaker and the compaction
+        guard, and the supervisor re-drives it for the next stream. Costs one
+        turn boundary per K items; buys back every guarantee."""
         q = self._queue(qid)
         if q.get("closed") or q.get("phase") != "draining":
             raise LedgerError(f"queue {qid!r} is not draining")
@@ -2616,6 +2638,21 @@ class Org:
         if pick is None:
             return {"empty": True}
 
+        # the stream gate (see the docstring): count what this worker has been
+        # handed since its last turn boundary, and stop at the ceiling. The
+        # item stays PENDING — nothing is lost, another worker may take it, and
+        # this one gets it on its next stream if it is still there.
+        stats = cast("dict[str, dict[str, Any]]",
+                     q.setdefault("per_worker", {})).setdefault(
+                         worker, {"done": 0})
+        streamed = int(stats.get("stream") or 0)
+        step = int(config["items_per_session"])
+        if streamed >= step:
+            return {"empty": True, "paused": True,
+                    "reason": (f"stream limit: {streamed} item(s) this turn "
+                               f"(items_per_session={step}). END YOUR TURN "
+                               f"now — you will be re-driven to continue.")}
+
         item = pending.pop(pick)
         claimed[worker] = {
             "item_id": item["id"],
@@ -2623,7 +2660,26 @@ class Org:
             "lease_until": now_ts + int(config["lease_seconds"]),
         }
         claimed_items[worker] = item
+        stats["stream"] = streamed + 1
         return {"item": item}
+
+    def queue_end_stream(self, worker: str, qid: str) -> bool:
+        """A turn boundary: this worker may be handed items again. Called from
+        the supervisor's post-turn hook. Returns True when the worker had
+        actually been paused at the ceiling, so the caller knows to re-drive
+        it rather than leave it idle."""
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return False
+        stats = cast("dict[str, dict[str, Any]]",
+                     q.get("per_worker") or {}).get(worker)
+        if not stats:
+            return False
+        was = int(stats.get("stream") or 0)
+        stats["stream"] = 0
+        return was >= int(cast("dict[str, Any]", q["config"])
+                          ["items_per_session"])
 
     def queue_take(self, worker: str, qid: str,
                    now_ts: float | None = None) -> dict[str, Any]:

@@ -283,6 +283,49 @@ def main():
         except LedgerError:
             pass
 
+        print("§8 the stream boundary re-drives a paused worker")
+        # A paused worker holds no claim and has been told to end its turn.
+        # If nothing re-drove it, it would idle forever with items pending —
+        # which is worse than the bug the pause exists to fix.
+        sent.clear()
+        slug2 = "stream-http"
+        try:
+            store.delete_org(slug2)
+        except LedgerError:
+            pass
+        o = store.create_org(slug2)
+        with store.DOC_LOCK:
+            o.queue_create(USER, "s", mk("a", "b", "c"),
+                           {"workers": 1, "workspace": "shared",
+                            "items_per_session": 1,
+                            "worker_template": {"tier": "haiku"}})
+            store.save_org(o)
+        TestClient(api.app).post(f"/api/orgs/{slug2}/queues/s/spawn", json={})
+        w = store.load_org(slug2).d["queues"]["s"]["spawn"]["workers"][0]
+        with store.DOC_LOCK:
+            o = store.load_org(slug2)
+            o.queue_take(w, "s", now_ts=1.0)
+            nxt = o.queue_done(w, "s", "a", None, now_ts=2.0)
+            store.save_org(o)
+        check("items_per_session=1 ⇒ the second item is a pause",
+              lambda: eq(nxt.get("paused"), True))
+        sent.clear()
+        supervisor._queue_breaker_tick(slug2, w, {"total_cost_usd": 0.01})
+        check("the post-turn hook re-drives the paused worker to continue",
+              lambda: eq(any(n == w and "Stream boundary" in t
+                             for n, t in sent), True))
+        check("…and the stream is reopened, so it gets a real item next",
+              lambda: eq(store.load_org(slug2)
+                         .queue_take(w, "s", now_ts=3.0)["item"]["id"], "b"))
+        sent.clear()
+        supervisor._queue_breaker_tick(slug2, w, {"total_cost_usd": 0.01})
+        check("a worker that was NOT paused is not re-driven",
+              lambda: eq([t for n, t in sent if "Stream boundary" in t], []))
+        try:
+            store.delete_org(slug2)
+        except LedgerError:
+            pass
+
     print(f"\n{PASS} checks passed")
 
 

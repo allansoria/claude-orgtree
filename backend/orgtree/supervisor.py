@@ -8139,33 +8139,57 @@ def _queue_breaker_tick(slug: str, nid: str, res: dict[str, Any]) -> None:
             if not qid:
                 return
             turn_cost = float(res.get("total_cost_usd") or 0.0)
+            # THE TURN BOUNDARY IS THE POINT (2026-09-01). `_queue_take_next`
+            # pauses a worker after `items_per_session` items precisely so
+            # this runs; clearing the stream counter here is what lets it be
+            # handed work again, and `paused` tells us it stopped because we
+            # told it to, not because the queue is empty — so it must be
+            # re-driven or it idles forever with items still pending.
+            paused = org.queue_end_stream(nid, qid)
+            if paused:
+                redrive = (nid, f"(orgtree) Stream boundary — you paused after "
+                                f"a batch of items so the org could book your "
+                                f"cost. Continue: call orgtree_queue_take for "
+                                f"'{qid}'. Stop only when it returns empty "
+                                f"WITHOUT a pause reason.")
+            # ⚠ ONE EXIT from here down, so the sends at the tail always run:
+            # every early `return` inside this lock used to drop a pending
+            # `redrive` on the floor, which for a paused worker means it idles
+            # forever with items still pending.
+            #
             # This turn is the one during which the worker called queue_done /
             # queue_fail for an item it just finished — book its cost to THAT
-            # item, not to whatever it claimed next, and stop.
-            if org.queue_book_final_turn(nid, qid, cost_usd=turn_cost):
-                store.save_org(org)
-                return
-            claim = cast("dict[str, Any]",
-                         (org.d["queues"][qid].get("claimed") or {})).get(nid)
-            if not claim:
-                return
-            item_id = str(claim.get("item_id") or "")
-            d = org.queue_tick_item(
-                nid, qid, cost_usd=turn_cost, turn_sig=_turn_sig(res))
-            if not d["trip"]:
-                store.save_org(org)          # persist the telemetry bump
-                return
-            fail = org.queue_fail(nid, qid, item_id, str(d["reason"]),
-                                  _breaker=True)
-            redrive = (nid, f"(orgtree) Queue item '{item_id}' was auto-failed "
-                            f"by the circuit breaker ({d['reason']}). Call "
-                            f"orgtree_queue_take for '{qid}' to pick up the "
-                            f"next item.")
-            if fail.get("queue_drained"):
-                fr = org.queue_fire_reducer(qid)
-                if fr.get("reducer"):
-                    wake_reducer = str(fr["reducer"])
-            store.save_org(org)
+            # item, not to whatever it claimed next.
+            booked = org.queue_book_final_turn(nid, qid, cost_usd=turn_cost)
+            claim = None if booked else cast(
+                "dict[str, Any]",
+                (org.d["queues"][qid].get("claimed") or {})).get(nid)
+            if booked or not claim:
+                # nothing to breaker-check this turn; persist whatever the
+                # stream reset / booking changed and fall through to the sends
+                if booked or paused:
+                    store.save_org(org)
+            else:
+                item_id = str(claim.get("item_id") or "")
+                d = org.queue_tick_item(
+                    nid, qid, cost_usd=turn_cost, turn_sig=_turn_sig(res))
+                if not d["trip"]:
+                    store.save_org(org)      # persist the telemetry bump
+                else:
+                    fail = org.queue_fail(nid, qid, item_id, str(d["reason"]),
+                                          _breaker=True)
+                    # a trip supersedes a stream pause: the item died, so the
+                    # worker is told THAT, not "continue your batch"
+                    redrive = (nid,
+                               f"(orgtree) Queue item '{item_id}' was "
+                               f"auto-failed by the circuit breaker "
+                               f"({d['reason']}). Call orgtree_queue_take for "
+                               f"'{qid}' to pick up the next item.")
+                    if fail.get("queue_drained"):
+                        fr = org.queue_fire_reducer(qid)
+                        if fr.get("reducer"):
+                            wake_reducer = str(fr["reducer"])
+                    store.save_org(org)
     except Exception:                                           # noqa: BLE001
         return
     if redrive:
