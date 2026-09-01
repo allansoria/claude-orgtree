@@ -334,33 +334,53 @@ sandbox/kiosk admission (holdout, §0) · provider routing preferences
 rate-limit-driven freezes (telemetry is normalized and carried in the turn
 result for a later P2).
 
-### ⚠ D-OR-8 — no file/shell tools on the OpenRouter lane (KNOWN GAP, fix deferred)
+### ✅ D-OR-8 — file/shell tools on the OpenRouter lane (CLOSED 2026-09-01)
 
-`_openrouter_leg` attaches ONLY `mcptool.TOOLS` (the `orgtree_*` power tools,
-answered via the `/api/agent` loopback). It attaches NO `bash` / `read` /
-`edit` / `glob` / `grep`. In the Claude and Codex lanes those are native
-tools of the spawned CLI; the OpenRouter lane has no CLI, so an OpenRouter
-node can message/hire/report but **cannot touch the filesystem** — any such
-node hired into a reviewer/fixer/legwork seat fails ("unknown orgtree tool"
-as the model guesses at a file reader that isn't there). Observed live
-2026-08-30 across deepseek-v4-flash, glm-5.3-flash, qwen3-coder-next — a lane
-gap, not a model verdict.
+**The gap (recorded 2026-08-30).** `_openrouter_leg` attached ONLY
+`mcptool.TOOLS` — the `orgtree_*` power tools — and no `bash` / `read` /
+`edit` / `glob` / `grep`. In every other lane those are native tools of the
+spawned CLI; this lane has no CLI, so an OpenRouter node could
+message/hire/report but **could not touch the filesystem**. Any such node
+hired into a reviewer/fixer/legwork seat failed, the model guessing at a file
+reader that was not there. Observed live across deepseek-v4-flash,
+glm-5.3-flash and qwen3-coder-next — a lane gap, not a model verdict. It
+became the top item once the work queue shipped: a queue worker's whole job
+is to edit files, so the cheap bands were locked out of the workload they
+suit best.
 
-- **Interim (no code):** treat OpenRouter as a **coordination-tier** provider
-  — its nodes may only hold roles that use `orgtree_*` tools (coordinator,
-  router, planner), never a filesystem role. Enforce in the hire UI / docs.
-- **Proper fix — OPTION A, user-approved for a future task (2026-08-30):**
-  implement `bash` / `read_file` / `write_file` / `edit_file` / `glob` /
-  `grep` as client-answered tool cards in `_openrouter_leg` alongside
-  `mcptool.TOOLS`. Each handler runs in the node's `cwd`, enforces its
-  `add_dirs` (path + ro/rw) as the sandbox boundary, and is gated by the
-  node's `tools` dict (`bash:false` ⇒ tool not offered; `edit:false` ⇒ no
-  write tools). ~200–400 LOC + a hermetic suite. This is the logical
-  completion of D-OR-1 ("orgtree is the agent harness for this lane"): if
-  orgtree runs the loop, orgtree supplies the whole tool surface, not just
-  the power tools. Option B (bridge a filesystem/shell MCP server via a
-  stdio-MCP client in `openrouterrun.py`) is the reuse-a-protocol
-  alternative if hand-rolling the layer is unattractive.
+**Fixed by Option A**, per [[design-or-filetools.md]]: `backend/orgtree/
+filetools.py` supplies six client-answered cards (`read_file`, `glob`,
+`grep`, `write_file`, `edit_file`, `bash`), and `_openrouter_leg` offers them
+beside `mcptool.TOOLS`, gated on the node's own scope. This is the logical
+completion of D-OR-1 — if orgtree runs the loop, orgtree supplies the whole
+tool surface, not just the power tools. (Option B, bridging a filesystem MCP
+server, stays the alternative if the surface ever grows enough to want a
+protocol; see that doc's §3.1 for why it was not taken now.)
+
+What holds the boundary:
+
+- **The sandbox is the node's `add_dirs`, enforced in the handler, never in
+  the prompt.** Every path is `os.path.realpath`-resolved, then checked
+  separator-anchored against each grant — the anchor stops a sibling dir
+  (`<base>-x` for a grant on `<base>`) and the realpath catches a symlink
+  pointing out.
+- **The node's own scratch is an IMPLICIT rw grant** — parity with the CLI
+  lanes, which are spawned with `cwd=scratch`. `add_dirs` has always meant
+  "and also these".
+- **The `tools` dict gates the SURFACE**: `bash:false` ⇒ the card is absent,
+  not refused late. `dispatch` re-checks anyway (defence in depth), and the
+  leg routes on `filetools.TOOL_NAMES` so a gated-off name is refused with a
+  reason rather than falling through to the loopback.
+- **A read-only grant gets no writes and no shell** — a shell with nowhere
+  legitimate to write is a sandbox with no floor.
+
+**The interim "coordination-tier only" advice is withdrawn.** An OpenRouter
+node may hold a filesystem role like any other provider's.
+
+Proven: `test_filetools.py` (the module, incl. the containment cases),
+`test_openrouter_dispatch.py` §6 (the seam over the real wire), and live —
+an OpenRouter model running as a work-queue worker (see design-or-filetools.md
+§4 Inc 3).
 
 ## 9. Recon — DONE 2026-08-29
 

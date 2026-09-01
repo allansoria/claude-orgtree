@@ -298,6 +298,36 @@ def main() -> None:
         check("edit_file refuses zero matches",
               lambda: has(zero, "was not found", "zero-match edit"))
 
+        print("§6b a relative path falls back from cwd to the grants")
+        # A work-queue worker's cwd is its scratch, but its files live in a
+        # granted worktree, and the task names them relative to THAT. Two
+        # OpenRouter workers hit exactly this live (2026-09-01).
+        far = os.path.join(root, "far")
+        os.makedirs(os.path.join(far, "notes"), exist_ok=True)
+        with open(os.path.join(far, "notes", "simic.md"), "w",
+                  encoding="utf-8") as f:
+            f.write("# simic\n")
+        two = [{"path": rw, "mode": "rw"}, {"path": far, "mode": "rw"}]
+        found = tool("read_file", {"path": "notes/simic.md"},
+                     dirs=two, cwd=rw)
+        check("a relative path missing under cwd resolves in a grant",
+              lambda: has(found, "# simic", "grant fallback"))
+        fresh = tool("write_file", {"path": "brand-new.txt", "content": "x"},
+                     dirs=two, cwd=rw)
+        check("a path that exists NOWHERE still lands in cwd",
+              lambda: (eq(isinstance(fresh, str), True, "write type"),
+                       eq(os.path.exists(os.path.join(rw, "brand-new.txt")),
+                          True, "new file in cwd")))
+        sib2 = os.path.join(root, "far-x")
+        os.makedirs(sib2, exist_ok=True)
+        with open(os.path.join(sib2, "leak.txt"), "w", encoding="utf-8") as f:
+            f.write("LEAK\n")
+        leak = tool("read_file", {"path": "../far-x/leak.txt"},
+                    dirs=two, cwd=rw)
+        check("☠ the fallback does not weaken containment",
+              lambda: (has(leak, "Refused", "containment held"),
+                       eq("LEAK" in leak, False, "content never returned")))
+
         print("§7 dispatch never raises — unknown, absent, wrong-kind, bad types")
         unknown = dispatch("not_a_tool", {}, dirs=dirs, cwd=rw,
                            allow_bash=True, allow_edit=True)

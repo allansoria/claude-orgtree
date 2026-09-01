@@ -207,20 +207,45 @@ def _inside(full: str, base: str) -> bool:
 
 def _resolve(path: object, *, dirs: object, cwd: object,
              write: bool) -> tuple[str | None, str | None]:
+    """Resolve one path argument to a contained absolute path, or explain why
+    not.
+
+    ⚠ A RELATIVE PATH IS TRIED AGAINST cwd FIRST, THEN AGAINST EACH GRANT.
+    The agent's cwd is its own scratch, but its work usually lives in a
+    granted directory somewhere else — a work-queue worker's git worktree,
+    say — and a task naturally names files relative to THAT ("notes/x.md").
+    Resolving only against cwd made every such path miss: measured
+    2026-09-01, two OpenRouter workers each called read_file with the
+    payload's own relative path and got "no regular file" in their scratch
+    while the file sat in their worktree.
+
+    The fallback probes for EXISTENCE, in grant order, and is therefore
+    deterministic; a relative path that exists nowhere still resolves
+    against cwd, so a NEW file lands in the working directory as expected.
+    Containment is unweakened: whichever candidate wins goes through exactly
+    the same realpath + separator-anchored test below."""
     if not isinstance(path, str):
         return None, "Invalid arguments: path must be a string."
     if "\0" in path:
         return None, "Invalid arguments: path contains a NUL character."
     if not isinstance(cwd, str):
         return None, "Invalid arguments: cwd must be a string."
+    roots = _grant_roots(dirs)
     try:
-        candidate = path if os.path.isabs(path) else os.path.join(cwd, path)
-        full = os.path.realpath(candidate)
+        if os.path.isabs(path):
+            full = os.path.realpath(path)
+        else:
+            full = os.path.realpath(os.path.join(cwd, path))
+            if not os.path.exists(full):
+                for base, _mode in roots:
+                    alt = os.path.realpath(os.path.join(base, path))
+                    if os.path.exists(alt):
+                        full = alt
+                        break
     except (OSError, ValueError) as exc:
         return None, f"Invalid path {path!r}: {exc}"
 
-    modes = [mode for base, mode in _grant_roots(dirs)
-             if _inside(full, base)]
+    modes = [mode for base, mode in roots if _inside(full, base)]
     if not modes:
         return None, f"Refused: path is outside every granted directory: {path!r}"
     if write and "rw" not in modes:
