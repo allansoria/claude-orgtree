@@ -100,6 +100,11 @@ class FakeOpenRouter:
     def __init__(self, scenario: str = "plain", *, model: str = MODEL) -> None:
         self.scenario = scenario
         self.model = model
+        # scenario "filetool" (D-OR-8): one tool call whose NAME AND ARGS the
+        # test picks, so the file/shell surface can be driven over the real
+        # wire without a scenario per tool.
+        self.tool_name = "read_file"
+        self.tool_args: dict[str, Any] = {}
         self.requests: list[dict[str, Any]] = []
         self.headers: list[dict[str, str]] = []
         self.urls: list[str] = []
@@ -163,7 +168,11 @@ class FakeOpenRouter:
             return (self._tool_events("call-2", "orgtree_ping",
                                       ['{"message":"again"}'],
                                       prompt=18, cost=0.003), None, None)
-        if self.scenario in ("tool", "multi"):
+        if self.scenario == "filetool" and number == 1:
+            return (self._tool_events("call-f", self.tool_name,
+                                      [json.dumps(self.tool_args)],
+                                      prompt=10, cost=0.002), None, None)
+        if self.scenario in ("tool", "multi", "filetool"):
             result = self.requests[-1]["messages"][-1]["content"]
             return (self._plain_events(f"tool said: {result}", prompt=24,
                                        output=5, cached=4, cost=0.004), None, None)

@@ -40,6 +40,15 @@ class DirGrant(TypedDict):
     mode: Literal["rw", "ro"]
 
 
+# Every tool this module answers, offered or not. The caller ROUTES on this,
+# not on what `cards` returned: a name that is ours but was gated off must
+# reach `dispatch` (which refuses it) rather than fall through to whatever
+# the caller does with unknown names — for the OpenRouter leg that would be
+# the ledger's loopback, which has no gate to enforce and would answer with a
+# confusing "unreachable" instead of "bash is disabled for this node".
+TOOL_NAMES: frozenset[str] = frozenset({
+    "read_file", "glob", "grep", "write_file", "edit_file", "bash"})
+
 _READ_BYTES = 60_000
 _GLOB_RESULTS = 500
 _GREP_MATCHES = 200
@@ -553,8 +562,7 @@ def dispatch(name: str, args: dict[str, Any], *, dirs: list[DirGrant],
     try:
         if not isinstance(name, str):
             return "Unknown tool: tool name must be a string."
-        known = {"read_file", "glob", "grep", "write_file", "edit_file", "bash"}
-        if name not in known:
+        if name not in TOOL_NAMES:
             return f"Unknown tool: {name!r}."
         if not isinstance(args, dict):
             return "Invalid arguments: expected an object."

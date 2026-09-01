@@ -255,6 +255,163 @@ def main():
            "the pre-interrupt delta streamed")
     check("interrupt_turn stops the in-process loop; the turn completes", t5)
 
+    # ── §6 D-OR-8: the file/shell surface (design-or-filetools.md Inc 2) ──
+    # This lane has no CLI, so bash/read/edit exist only because the leg
+    # hands them over. What is proved here is the SEAM: the surface is built
+    # from the node's own scope, and a file call is answered in-process by
+    # filetools instead of going out the loopback (which serves org powers
+    # and would have no authority to enforce here anyway).
+    print("§6 D-OR-8 file/shell tools on the openrouter lane")
+
+    def mkfileorg(label, *, dirs, tools=None):
+        org = store.create_org(f"zz orfile {label}")
+        t = {"bash": True, "web": False, "edit": True,
+             "subagents": False, "mcp": []}
+        t.update(tools or {})
+        r = org.hire(USER, None, "spark", 2, "or", add_dirs=dirs, tools=t,
+                     org_visibility="team", charter="a d-or-8 test")
+        nid = r["node"]
+        org.d["nodes"][nid]["or_slug"] = MODEL
+        store.save_org(org)
+        return org.d["slug"], nid
+
+    def wire_tools(fake):
+        """The tool NAMES the leg actually put on the wire. The runner
+        normalises each card into OpenAI's {type, function:{name,…}} shape,
+        so read the name from there — this asserts what the MODEL was
+        offered, not what the leg intended."""
+        return [t["function"]["name"]
+                for t in (fake.requests[0].get("tools") or [])]
+
+    grant = os.path.join(DATA, "grant6")
+    os.makedirs(grant, exist_ok=True)
+    with open(os.path.join(grant, "note.txt"), "w", encoding="utf-8") as f:
+        f.write("first line\nsecond line\n")
+    outside = os.path.join(DATA, "outside6")
+    os.makedirs(outside, exist_ok=True)
+    with open(os.path.join(outside, "secret.txt"), "w", encoding="utf-8") as f:
+        f.write("SECRET\n")
+
+    rw = [{"path": grant, "mode": "rw"}]
+
+    def t6a():
+        global CURRENT_FAKE
+        s, n = mkfileorg("surface", dirs=rw)
+        CURRENT_FAKE = FakeOpenRouter("plain")
+        run_turn(s, n, "hello")
+        names = wire_tools(CURRENT_FAKE)
+        eq({"read_file", "glob", "grep", "write_file", "edit_file",
+            "bash"} <= set(names), True,
+           f"all six file cards on the wire ({names})")
+        eq(any(x.startswith("orgtree_") for x in names), True,
+           "the org powers are still there")
+
+    check("a granted node is offered the file/shell cards alongside "
+          "orgtree_*", t6a)
+
+    def t6b():
+        global CURRENT_FAKE
+        # NO add_dirs — but the node's own scratch is an implicit rw grant on
+        # every lane (the CLI lanes get it by being spawned with cwd=scratch),
+        # so it still has somewhere to work. What it must NOT have is reach
+        # outside that.
+        s, n = mkfileorg("nogrant", dirs=[])
+        CURRENT_FAKE = FakeOpenRouter("plain")
+        run_turn(s, n, "hello")
+        eq("read_file" in wire_tools(CURRENT_FAKE), True,
+           "a grantless node still works in its own scratch")
+        CURRENT_FAKE = FakeOpenRouter("filetool")
+        CURRENT_FAKE.tool_name = "read_file"
+        CURRENT_FAKE.tool_args = {"path": os.path.join(grant, "note.txt")}
+        run_turn(s, n, "reach out")
+        result = CURRENT_FAKE.requests[1]["messages"][-1]["content"]
+        eq(("second line" in result, "Refused" in result), (False, True),
+           f"…and cannot reach another node's grant ({result[:100]!r})")
+
+    check("a node with no add_dirs still holds its own scratch — and only "
+          "that", t6b)
+
+    def t6c():
+        global CURRENT_FAKE
+        s, n = mkfileorg("noedit", dirs=rw, tools={"edit": False})
+        CURRENT_FAKE = FakeOpenRouter("plain")
+        run_turn(s, n, "hello")
+        names = set(wire_tools(CURRENT_FAKE))
+        eq(("write_file" in names, "edit_file" in names,
+            "read_file" in names), (False, False, True),
+           f"edit:false removes only the write cards ({sorted(names)})")
+
+    check("the node's tools dict gates the SURFACE, not the call "
+          "(edit:false ⇒ absent)", t6c)
+
+    def t6d():
+        global CURRENT_FAKE
+        s, n = mkfileorg("nobash", dirs=rw, tools={"bash": False})
+        CURRENT_FAKE = FakeOpenRouter("plain")
+        run_turn(s, n, "hello")
+        eq("bash" in wire_tools(CURRENT_FAKE), False,
+           "bash:false ⇒ no shell on the wire")
+
+    check("bash:false removes the shell", t6d)
+
+    def t6e():
+        global CURRENT_FAKE
+        s, n = mkfileorg("read", dirs=rw)
+        CURRENT_FAKE = FakeOpenRouter("filetool")
+        CURRENT_FAKE.tool_name = "read_file"
+        CURRENT_FAKE.tool_args = {"path": os.path.join(grant, "note.txt")}
+        run_turn(s, n, "read it")
+        # the leg answered in-process: the second request carries the tool
+        # result, and it is the file's real content
+        result = CURRENT_FAKE.requests[1]["messages"][-1]["content"]
+        eq("second line" in result, True,
+           f"the model got the file back ({result[:120]!r})")
+
+    check("a read_file call is answered in-process from the granted dir", t6e)
+
+    def t6f():
+        global CURRENT_FAKE
+        s, n = mkfileorg("write", dirs=rw)
+        target = os.path.join(grant, "written.txt")
+        CURRENT_FAKE = FakeOpenRouter("filetool")
+        CURRENT_FAKE.tool_name = "write_file"
+        CURRENT_FAKE.tool_args = {"path": target, "content": "hi\n"}
+        run_turn(s, n, "write it")
+        eq(os.path.exists(target)
+           and open(target, encoding="utf-8").read(), "hi\n",
+           "the write landed on disk")
+
+    check("a write_file call really writes inside the grant", t6f)
+
+    def t6g():
+        global CURRENT_FAKE
+        s, n = mkfileorg("contain", dirs=rw)
+        CURRENT_FAKE = FakeOpenRouter("filetool")
+        CURRENT_FAKE.tool_name = "read_file"
+        CURRENT_FAKE.tool_args = {"path": os.path.join(outside, "secret.txt")}
+        run_turn(s, n, "read the secret")
+        result = CURRENT_FAKE.requests[1]["messages"][-1]["content"]
+        eq(("SECRET" in result, "Refused" in result), (False, True),
+           f"containment held over the leg ({result[:120]!r})")
+
+    check("☠ a path outside the grant is REFUSED, and its content never "
+          "reaches the model", t6g)
+
+    def t6h():
+        global CURRENT_FAKE
+        # the card was never offered; the dispatch must refuse it anyway
+        s, n = mkfileorg("gateagain", dirs=rw, tools={"bash": False})
+        CURRENT_FAKE = FakeOpenRouter("filetool")
+        CURRENT_FAKE.tool_name = "bash"
+        CURRENT_FAKE.tool_args = {"command": "echo pwned"}
+        run_turn(s, n, "shell out")
+        result = CURRENT_FAKE.requests[1]["messages"][-1]["content"]
+        eq(("pwned" in result, "disabled" in result), (False, True),
+           f"an unoffered bash is still refused ({result[:120]!r})")
+
+    check("defence in depth: calling a tool that was never offered is "
+          "refused, not run", t6h)
+
     print()
     if FAIL:
         for label, tb in FAIL:

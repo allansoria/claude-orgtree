@@ -5030,7 +5030,7 @@ def _openrouter_leg(slug: str, nid: str, org: Org, st: dict[str, Any],
     `/api/agent` the codex `_tool_call` uses, so the ledger enforces
     authority identically.
     """
-    from . import openrouterrun, mcptool  # noqa: PLC0415 — openrouter lane only
+    from . import openrouterrun, mcptool, filetools  # noqa: PLC0415 — openrouter lane only
     from types import SimpleNamespace     # noqa: PLC0415
     import urllib.error                   # noqa: PLC0415
     import urllib.request                 # noqa: PLC0415
@@ -5068,12 +5068,53 @@ def _openrouter_leg(slug: str, nid: str, org: Org, st: dict[str, Any],
                   and str(n.get("session_id") or "")
                   == str(n.get("openrouter_thread") or "") else None)
 
+    # D-OR-8 (design-or-filetools.md): the org powers AND the file/shell
+    # surface. Every other lane gets bash/read/edit from the CLI it spawns;
+    # this lane has no CLI, so orgtree hands them over itself or the node
+    # cannot touch a file at all. `cards` gates on the node's own scope —
+    # a tool the node may not use is ABSENT, not refused at call time.
+    _sc = n.get("scope") or {}
+    _tools = cast("dict[str, Any]", _sc.get("tools") or {})
+    # ⚠ THE NODE'S OWN SCRATCH IS AN IMPLICIT RW GRANT, and it has to be, for
+    # parity with every other lane: there the CLI is spawned with `cwd=cwd`
+    # and the OS lets it work in its own directory — `add_dirs` has always
+    # meant "and ALSO these", never "only these". Without it a relative path
+    # resolves against a cwd that is in no grant, so `read_file("note.txt")`
+    # is refused in the agent's own working directory (caught wiring this
+    # up, 2026-09-01), and a node granted nothing would have no place to
+    # work at all.
+    _fdirs = cast("list[filetools.DirGrant]",
+                  [{"path": cwd, "mode": "rw"},
+                   *(_sc.get("add_dirs") or [])])
+    _fcards = filetools.cards(
+        dirs=_fdirs,
+        allow_bash=bool(_tools.get("bash", True)),
+        allow_edit=bool(_tools.get("edit", True)))
     dyn = [{"type": "function", "name": t["name"],
             "description": t["description"], "inputSchema": t["inputSchema"]}
-           for t in mcptool.TOOLS]
+           for t in mcptool.TOOLS] + [
+        {"type": "function", "name": c["name"],
+         "description": c["description"], "inputSchema": c["inputSchema"]}
+        for c in _fcards]
     port = os.environ.get("ORGTREE_PORT", "7360")
 
     def _tool_call(tool: str, args: dict[str, Any]) -> str:
+        # D-OR-8: file/shell calls are answered IN PROCESS by filetools —
+        # they touch the filesystem, not the doc, so they never go through
+        # the loopback (which is the ledger's authority door, and has none
+        # to enforce here). `filetools.dispatch` re-checks the gates and
+        # containment itself.
+        #
+        # ⚠ Routed on TOOL_NAMES — every name this module owns — NOT on the
+        # cards actually offered. A gated-off name (`bash` under bash:false)
+        # is still ours, and must reach dispatch to be REFUSED; routing it to
+        # the loopback instead answered "orgtree API unreachable", which
+        # tells the model nothing about why (caught wiring this up).
+        if tool in filetools.TOOL_NAMES:
+            return filetools.dispatch(
+                tool, args, dirs=_fdirs, cwd=cwd,
+                allow_bash=bool(_tools.get("bash", True)),
+                allow_edit=bool(_tools.get("edit", True)))
         # byte-identical to the codex leg's `_tool_call`: identity asserted
         # by the supervisor, authority enforced by the ledger behind
         # /api/agent. Loopback HTTP keeps the lanes the same.
