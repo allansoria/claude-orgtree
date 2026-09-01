@@ -41,7 +41,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Final, TypedDict
+from typing import Any, Final, TypedDict, cast
 
 from .ledger import MODELS as _LEDGER_MODELS
 from .ledger import TIERS as _LEDGER_TIERS
@@ -979,6 +979,62 @@ def _agy_account() -> dict[str, Any]:
     return out
 
 
+def agy_mcp_config_path() -> str:
+    """`agy`'s MACHINE-WIDE MCP registry (`<agy home>/config/mcp_config.json`).
+    One file for every `agy` session on the box — that is D-AG-4."""
+    return os.path.join(_agy_home(), "config", "mcp_config.json")
+
+
+def agy_mcp_register(python: str, backend_dir: str,
+                     port: str) -> dict[str, Any]:
+    """Ensure `python -m orgtree.mcptool` is registered as an `agy` stdio MCP
+    server. Idempotent; returns {"changed": bool, "path": str} or
+    {"error": str} — never raises, because a registration failure must
+    degrade an `agy` agent to a worker leaf, not fail its turn.
+
+    ⚠ NO PER-NODE ENV IS WRITTEN, and that is the whole design (D-AG-4).
+    `agy mcp add` is global, so a config carrying ORGTREE_NODE would pin every
+    `agy` agent on the machine to one identity. Instead the entry carries only
+    what is constant — interpreter, module, PYTHONPATH, port — and identity
+    rides the PROCESS environment orgtree sets per spawn, which `agy` passes
+    through to stdio MCP children (measured 2026-09-01;
+    design-antigravity.md). `mcptool` refuses when that identity is absent, so
+    an `agy` session orgtree did not start sees no tools.
+
+    Written as JSON rather than shelled out to `agy mcp add`: no subprocess on
+    the turn path, and other servers in the file are preserved exactly."""
+    path = agy_mcp_config_path()
+    entry: dict[str, Any] = {
+        "command": python,
+        "args": ["-m", "orgtree.mcptool"],
+        "env": {"PYTHONPATH": backend_dir, "ORGTREE_PORT": port},
+        "disabled": False,
+    }
+    try:
+        cfg: dict[str, Any] = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                cfg = cast("dict[str, Any]", loaded)
+        servers = cfg.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+        servers = cast("dict[str, Any]", servers)
+        if servers.get("orgtree") == entry:
+            return {"changed": False, "path": path}
+        servers["orgtree"] = entry
+        cfg["mcpServers"] = servers
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, path)
+        return {"changed": True, "path": path}
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        return {"error": f"{type(e).__name__}: {e}", "path": path}
+
+
 _agy_status_cache: tuple[float, dict[str, Any]] | None = None
 
 
@@ -1171,8 +1227,8 @@ def providers_payload(claude_status: dict[str, Any]) -> dict[str, Any]:
             # hire gate enforces. `agy` authenticates from ~/.gemini's OAuth
             # store, so "connected" == "oauth_creds.json present". ⚠ D-AG-1:
             # a hired agy agent gets FULL local tools within its folder grants
-            # (scope.tools is not enforceable on this lane); D-AG-4: it has no
-            # orgtree MCP yet, so it is a worker leaf (no message/hire/ask).
+            # (scope.tools is not enforceable on this lane). D-AG-4 is CLOSED:
+            # it gets the orgtree MCP server like any other lane.
             "hire_enabled": bool(antigravity.get("connected")),
             "reason": (
                 None if antigravity.get("connected")

@@ -21,6 +21,27 @@ from typing import Any, cast
 
 ORG: str = os.environ.get("ORGTREE_ORG", "")
 NODE: str = os.environ.get("ORGTREE_NODE", "")
+# ⚠ AN IDENTITY-LESS SERVER OFFERS NOTHING AND ANSWERS NOTHING (D-AG-4).
+#
+# Every other lane hands this server its identity in a per-spawn MCP config,
+# so a missing ORGTREE_NODE could only ever be a bug. The Antigravity lane
+# cannot: `agy mcp add` writes a MACHINE-WIDE config, so the registration is
+# visible to every `agy` session on this machine — including a plain
+# interactive one the operator starts themselves, which orgtree never spawned
+# and whose environment carries no node. Such a session must not be able to
+# message, hire, retire or spend on anybody's org.
+#
+# Identity comes from the PROCESS environment orgtree sets per spawn
+# (measured 2026-09-01: `agy` passes its env through to stdio MCP children),
+# so "no identity" is exactly "orgtree did not start this". Refuse by
+# advertising an EMPTY tool list — the model never sees a verb it cannot use
+# — and by refusing any call that arrives anyway.
+IDENTIFIED: bool = bool(ORG and NODE)
+_NO_IDENTITY = (
+    "orgtree: this MCP server has no agent identity (ORGTREE_ORG / "
+    "ORGTREE_NODE are unset), so it offers no tools. It is registered "
+    "machine-wide for the Antigravity lane and only answers inside a session "
+    "orgtree started for a specific agent.")
 PORT: str = os.environ.get("ORGTREE_PORT", "7360")
 # sandboxed kiosk orgs (containers) reach the backend through the bridge
 # listener instead of loopback: an explicit base URL + the org's secret
@@ -608,9 +629,8 @@ TOOLS: list[dict[str, Any]] = [
             "signed in on this machine); "
             "spark 1, ember 2, flare 5, blaze 10, nova 20 (OpenRouter price "
             "bands — hireable only while an OPENROUTER_API_KEY is set); "
-            "orbit 2 (Antigravity `agy` — hireable while it is signed in; a "
-            "worker leaf: full local tools in its folders, but no "
-            "message/hire/ask); "
+            "orbit 2 (Antigravity `agy` — hireable while it is signed in; "
+            "full local tools in its folders, which its scope CANNOT narrow); "
             "seat + grant must fit within YOUR free credits. "
             "ONE CALL IS ENOUGH: this tool also takes the fields you would "
             "otherwise have to orgtree_retool in straight afterwards "
@@ -1252,7 +1272,12 @@ def main() -> None:
                 "serverInfo": {"name": "orgtree", "version": "1.0.0"},
             })
         elif method == "tools/list":
-            reply(id_, {"tools": TOOLS})
+            # see IDENTIFIED: a machine-wide registration must be inert
+            # outside a session orgtree started for a named agent
+            reply(id_, {"tools": TOOLS if IDENTIFIED else []})
+        elif method == "tools/call" and not IDENTIFIED:
+            reply(id_, {"content": [{"type": "text", "text": _NO_IDENTITY}],
+                        "isError": True})
         elif method == "tools/call":
             raw_args = params.get("arguments")
             out = call_api(str(params.get("name", "")),

@@ -90,6 +90,16 @@ if argv_probe:
     with open(argv_probe, "w", encoding="utf-8") as stream:
         json.dump(sys.argv[1:], stream)
 
+# D-AG-4: the leg gives this process the node identity that a stdio MCP child
+# will inherit (real `agy` passes its env through — measured 2026-09-01), so a
+# test can assert what the orgtree MCP server would see.
+env_probe = os.environ.get("FAKEAGY_ENV_PROBE")
+if env_probe:
+    with open(env_probe, "w", encoding="utf-8") as stream:
+        json.dump({k: os.environ.get(k) for k in
+                   ("ORGTREE_ORG", "ORGTREE_NODE", "ORGTREE_PORT",
+                    "PYTHONPATH")}, stream)
+
 # fork a long-lived grandchild the way real `agy` forks its engine/subagent/
 # browser children, so a test can prove AgyClient.close() reaps the TREE.
 _child_pidfile = os.environ.get("FAKEAGY_CHILD_PIDFILE")

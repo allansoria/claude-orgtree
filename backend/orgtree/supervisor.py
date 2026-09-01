@@ -5304,10 +5304,14 @@ def _agy_leg(slug: str, nid: str, org: Org, st: dict[str, Any],
       · D-AG-2 — the wire reports tokens, no cost; the turn books $0.
       · D-AG-3 — no system-prompt flag; identity rides the first user
         message (handled inside AgyTurn).
-      · D-AG-4 — `agy mcp` config is global-only, so this MVP attaches NO
-        orgtree MCP server: an `agy` agent is a WORKER LEAF — it cannot
-        orgtree_message peers, hire, or ask. A per-home isolation path is a
-        later increment.
+      · D-AG-4 CLOSED 2026-09-01 — `agy mcp` config is global-only, so the
+        orgtree MCP server is registered ONCE with no node env, and identity
+        rides the process env this leg sets (`agy` passes its environment
+        through to stdio MCP children — measured). An `agy` agent is a FULL
+        org citizen: message, hire, ask, status, the queue verbs. `mcptool`
+        offers an EMPTY tool list when that identity is absent, so a plain
+        interactive `agy` session on this machine sees the server and can do
+        nothing with it.
     """
     from . import agyrun               # noqa: PLC0415 — antigravity lane only
     del images                         # agy image input is unverified (MVP)
@@ -5394,11 +5398,24 @@ def _agy_leg(slug: str, nid: str, org: Org, st: dict[str, Any],
                                      "id": f"agy-{time.time_ns()}",
                                      "text": name})
 
+    # D-AG-4 closed: give this agent its org powers. The registration is
+    # MACHINE-WIDE (that is the deviation) so it carries no node — identity
+    # rides the process env below, which `agy` passes through to stdio MCP
+    # children (measured 2026-09-01). A failure here is not fatal: the agent
+    # degrades to the old worker-leaf behaviour and the reason is printed
+    # once, rather than the turn dying over a config file.
+    _port = os.environ.get("ORGTREE_PORT", "7360")
+    _reg = providers.agy_mcp_register(sys.executable, BACKEND_DIR, _port)
+    if _reg.get("error"):
+        print(f"[orgtree] {slug}/{nid}: agy MCP registration failed "
+              f"({_reg['error']}) — this agent runs as a worker leaf "
+              f"(local tools only, no orgtree_* verbs)")
     turn = agyrun.AgyTurn(
         providers.agy_argv(exe), cwd=cwd, model=model_id, effort=effort,
         conversation_id=resume_cid, add_dirs=add_dirs, identity=ident,
         on_event=_on_event,
-        env_extra={"ORGTREE_ORG": slug, "ORGTREE_NODE": nid})
+        env_extra={"ORGTREE_ORG": slug, "ORGTREE_NODE": nid,
+                   "ORGTREE_PORT": _port, "PYTHONPATH": BACKEND_DIR})
 
     t0 = time.time()
     stop = threading.Event()

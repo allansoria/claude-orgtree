@@ -574,6 +574,35 @@ def _():
     assert len(CARDS) == 31, len(CARDS)
 
 
+@t("☠ an IDENTITY-LESS server offers no tools and answers no call (D-AG-4)")
+def _():
+    """The Antigravity lane registers this server MACHINE-WIDE (`agy mcp add`
+    has no per-session override), so a plain interactive `agy` the operator
+    starts themselves also loads it — with no ORGTREE_NODE, because orgtree
+    did not spawn it. That session must not be able to message, hire, retire
+    or spend on anybody's org. Identity absent ⇒ empty catalogue, and any
+    call that arrives anyway is refused."""
+    e = dict(os.environ)
+    for k in ("ORGTREE_ORG", "ORGTREE_NODE"):
+        e.pop(k, None)
+    e["PYTHONPATH"] = BACKEND
+    p = subprocess.Popen([sys.executable, "-m", "orgtree.mcptool"], env=e,
+                         cwd=BACKEND, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, _err = p.communicate(
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'
+        b'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":'
+        b'{"name":"orgtree_retire","arguments":{"node":"victim"}}}\n',
+        timeout=30)
+    lines = [json.loads(x) for x in out.decode().splitlines() if x.strip()]
+    listed = next(r for r in lines if r.get("id") == 1)
+    called = next(r for r in lines if r.get("id") == 2)
+    assert listed["result"]["tools"] == [], \
+        f"an unidentified server advertised {len(listed['result']['tools'])} tools"
+    assert called["result"]["isError"] is True, called
+    assert "no agent identity" in called["result"]["content"][0]["text"], called
+
+
 @t("☠ the deprecated self_update alias is dispatchable but NOT advertised")
 def _():
     """D-142: the rename cannot strand agents already in flight. A live session

@@ -193,6 +193,86 @@ def main():
            f"refused with the cheap-compact remedy ({le!r})")
     check("_compact_split_body refuses the antigravity lane", t5)
 
+    # ── §5b D-AG-4: org powers via the machine-wide MCP registration ──────
+    print("§5b D-AG-4 — the agy agent gets the orgtree MCP server")
+    s5b, n5b = mkorg("mcp")
+    os.environ["FAKEAGY_SCENARIO"] = "plain"
+    envfile = os.path.join(DATA, "agy-env-probe.json")
+    os.environ["FAKEAGY_ENV_PROBE"] = envfile
+
+    def t5b_env():
+        run_turn(s5b, n5b, "hello")
+        with open(envfile, encoding="utf-8") as f:
+            seen = json.load(f)
+        # `agy` passes its environment to stdio MCP children (measured), so
+        # what the CHILD would see is what the leg put on the agy process.
+        eq((seen.get("ORGTREE_ORG"), seen.get("ORGTREE_NODE")), (s5b, n5b),
+           f"per-spawn identity reaches the agy process ({seen})")
+        eq(bool(seen.get("PYTHONPATH")) and bool(seen.get("ORGTREE_PORT")),
+           True, f"…along with what `python -m orgtree.mcptool` needs ({seen})")
+
+    check("the node's identity rides the PROCESS env, not the config", t5b_env)
+
+    def t5b_cfg():
+        cfg_path = providers.agy_mcp_config_path()
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        entry = cfg["mcpServers"]["orgtree"]
+        eq(entry["args"], ["-m", "orgtree.mcptool"], "the registered command")
+        # ☠ THE DEVIATION'S WHOLE POINT: the config is MACHINE-WIDE, so a
+        # node id written into it would pin every agy agent on the box to one
+        # identity. It must carry only what is constant.
+        eq(sorted(entry["env"]), ["ORGTREE_PORT", "PYTHONPATH"],
+           f"NO per-node env in a global config ({entry['env']})")
+
+    check("☠ the global registration carries no node identity", t5b_cfg)
+
+    def t5b_idem():
+        providers.agy_mcp_register(sys.executable, "/backend", "9")
+        before = open(providers.agy_mcp_config_path(), encoding="utf-8").read()
+        r = providers.agy_mcp_register(sys.executable, "/backend", "9")
+        after = open(providers.agy_mcp_config_path(), encoding="utf-8").read()
+        eq((r.get("changed"), after), (False, before),
+           "re-registering an identical entry rewrites nothing")
+
+    check("registration is idempotent", t5b_idem)
+
+    def t5b_preserve():
+        cfg_path = providers.agy_mcp_config_path()
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        cfg["mcpServers"]["someone-elses"] = {"command": "keepme"}
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        providers.agy_mcp_register(sys.executable, "/elsewhere", "9")
+        back = json.load(open(cfg_path, encoding="utf-8"))
+        eq(back["mcpServers"]["someone-elses"], {"command": "keepme"},
+           "another tool's server survives our write")
+        eq(back["mcpServers"]["orgtree"]["env"]["PYTHONPATH"], "/elsewhere",
+           "…and ours updated")
+
+    check("a user's other MCP servers are preserved", t5b_preserve)
+
+    def t5b_safe():
+        r = providers.agy_mcp_register(sys.executable, "/b", "9")
+        eq("error" in r and r.get("path") is not None, False,
+           "a healthy register reports no error")
+        # an agy "home" that is really a FILE: makedirs cannot create
+        # <file>/config, so the write fails the way a permission problem would
+        bad = os.path.join(DATA, "agyhome-is-a-file")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("not a directory")
+        prev = os.environ.get("ORGTREE_AGY_HOME")
+        try:
+            os.environ["ORGTREE_AGY_HOME"] = bad
+            r2 = providers.agy_mcp_register(sys.executable, "/b", "9")
+            eq("error" in r2, True, "an unwritable config REPORTS, never raises")
+        finally:
+            if prev is not None:
+                os.environ["ORGTREE_AGY_HOME"] = prev
+
+    check("a registration failure is reported, never raised", t5b_safe)
+    os.environ.pop("FAKEAGY_ENV_PROBE", None)
+
     print("§6 interrupt via interrupt_turn")
     os.environ["FAKEAGY_SCENARIO"] = "interrupt"
     s6, n6 = mkorg("interrupt")
