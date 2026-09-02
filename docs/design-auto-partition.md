@@ -142,7 +142,7 @@ the user (or an explicit second call) accepts.
 
 ## 5. Increments
 
-### Inc A — mechanical strategies + dry run (no agent, no tokens)
+### Inc A — mechanical strategies + dry run (no agent, no tokens) (SHIPPED)
 - `backend/orgtree/autopartition.py`: `plan()` with `by-file`, `by-dir`,
   `group-by-field`, `readonly-fanout`, `by-item-output`; rules 1-5 and 7 as
   refusals; delegates to `partition()` for 6.
@@ -154,16 +154,74 @@ the user (or an explicit second call) accepts.
   `group-by-field` producing a disjoint partition where by-count does not;
   determinism.
 
-### Inc B — the agent layer
+### Inc B — the agent layer (SHIPPED)
 - `orgtree_queue_plan` card + dispatch; proposal only, no creation.
 - Charter text for a planner seat.
 - Tests: an agent-shaped `units` list with a hand-written `writes` key is
   IGNORED (rule 2 is structural, not advisory); the proposal never mutates
   the doc.
 
-### Inc C — surface
+### Inc C — surface (SHIPPED)
 - The `QueuePanel` renders a plan (items, overlaps, refusals) with an accept
   action; `queue_create` from an accepted plan.
+
+### Inc D — the full queue surface (the UI is NOT complete without this)
+
+Inc C shipped only *plan → create → read-only status*. The panel can propose
+a partition and write a `pending` queue — and then there is no control for
+anything that actually runs it. Every backend capability past `queue_create`
+is unreachable from the browser:
+
+| Backend capability | endpoint / field | UI control today |
+|---|---|---|
+| queue `config` on create | `POST …/queues` `config{}` — `workers`, `retry_max`, `per_item_budget_usd`, `per_item_turn_cap`, `lease_seconds`, `items_per_session`, `workspace`, `ordered` | none — pure `QUEUE_DEFAULTS` (`ledger.py` `QUEUE_DEFAULTS`) |
+| worker crew | `config.worker_template` / `config.worker_templates[]` — per-worker `{tier, model, charter}`, the mixed-crew feature (`e1414f3`) | none |
+| reducer | `config.reducer` — `{tier, add_dirs[], charter}` | none |
+| **start the queue** | `POST …/queues/{qid}/spawn` `{repo_root, base_ref}` | **none — a created queue can never be spawned from the UI** |
+| stop the queue | `POST …/queues/{qid}/close` | none |
+| dead-letter / retry visibility | `queue_status.failed[]` (`{id, reason, attempts}`) | counts + cost only; `failed[]` is fetched and dropped |
+| explicit `items` (non-partition) | `POST …/queues` `items[]` | plan-only |
+
+**Scope.** Bring the panel up to the backend it already talks to. No new
+backend — every endpoint and field above exists.
+
+- **Create form gains a `config` block.** One collapsible group with the
+  eight scalar knobs, each defaulting to and placeholder-showing its
+  `QUEUE_DEFAULTS` value; `workspace` a two-value select; `ordered` a
+  checkbox. Omitted fields are omitted from the request (not sent as the
+  default) so the backend stays the single source of defaults.
+- **Worker-templates editor.** Repeatable `{tier, model?, charter}` rows.
+  Zero rows ⇒ send neither key (backend hires `workers` copies of the
+  built-in `WORKER_CHARTER`). One row ⇒ `worker_template`. Two or more ⇒
+  `worker_templates[]`. Show the effective worker count
+  (`max(workers, len(templates))`, per `queue_spawn_plan`).
+- **Reducer block.** `tier` select, `add_dirs[]` (`{path, mode}` rows),
+  `charter` textarea. Pre-fill the charter from `REDUCER_CHARTER` with
+  `{qid}` substituted so a reviewer edits rather than writes from scratch.
+- **Spawn control on each `pending` queue.** A "spawn N workers" button in
+  the `queue-status` section. When `config.workspace == "per-worker"` it
+  must collect `repo_root` (required — the 422 says so) and `base_ref`
+  (default `HEAD`). Disable once `spawn.workers` is set; surface the 409
+  ("already spawned") inline.
+- **Close control.** A "close queue" button on any non-`done` queue, behind
+  a confirm; it is idempotent so a double-click is harmless.
+- **Dead-letter view.** Render `failed[]` as a small table (`id`, `attempts`,
+  `reason`) inside `queue-status` whenever it is non-empty — this is the
+  §7 "refusals/failures read as failure" surface and it is currently
+  invisible.
+- **No new safety story.** `queue_create` already re-plans under the doc
+  lock (§7 listing drift) and gates overlap on `shared`; `spawn` is already
+  one-shot and loopback-only. The UI additions carry none of the
+  enforcement — same as Inc C, the browser form is a convenience over
+  endpoints that defend themselves.
+- Tests: the create request omits unset `config` keys; a single template
+  row serialises to `worker_template` and two to `worker_templates`; the
+  spawn button is absent on a `shared` queue's `repo_root` field and
+  present-and-required on a `per-worker` one; `failed[]` renders iff
+  non-empty.
+
+Until Inc D lands, the honest description of the queue UI is "propose and
+stage a partition"; running one is still an API/tool exercise.
 
 ## 6. Deferred (explicit non-goals)
 
