@@ -2560,6 +2560,27 @@ class Org:
             }, [])
         return self.queue_status(qid)
 
+    def queue_delete(self, actor: str, qid: str) -> dict[str, Any]:
+        """Remove a queue record from the org entirely. This is the escape
+        hatch for a queue that can never run — created with no crew, so
+        `spawn` has no tier and `close` only parks it. Refused while a worker
+        still holds a claim: a live crew mid-item must be stopped first.
+
+        The record goes; per-worker worktrees on disk, if any, are left for
+        `git worktree prune` — deleting the ledger entry does no filesystem
+        I/O, same as `close`."""
+        if actor != USER:
+            raise LedgerError("only the user can delete a work queue")
+        q = self._queue(qid)                       # 404s "no such queue: …"
+        claimed = cast("dict[str, Any]", q.get("claimed") or {})
+        if claimed:
+            raise LedgerError(
+                f"queue {qid!r} has {len(claimed)} live claim(s) — close it "
+                "and stop the workers before deleting")
+        cast("dict[str, Any]", self.d.get("queues") or {}).pop(qid, None)
+        self._log("queue_delete", actor, {"qid": qid}, [])
+        return {"deleted": qid}
+
     @staticmethod
     def _queue_iso(ts: float) -> str:
         """Render a queue test-seam timestamp in the ledger's ISO format."""

@@ -79,6 +79,20 @@ interface QueueStatus {
     by_worker: Record<string, number>
     claimed_usd: number
   }
+  // quota-window movement, NOT dollars — on a subscription lane `cost_usd` is
+  // notional and this is the real budget signal (`_queue_usage_report`). null
+  // until the queue has been spawned and has stamped a reading.
+  usage?: {
+    pools: Record<string, Record<string, {
+      start: number | null
+      end: number | null
+      delta: number | null
+      window_reset?: boolean
+      note?: string
+    }>>
+    at?: Record<string, string | null>
+    note?: string
+  } | null
 }
 
 interface QueuePanelProps {
@@ -112,6 +126,27 @@ const lines = (s: string) => s.split('\n').map((x) => x.trim()).filter(Boolean)
 
 const dollars = (n: number | undefined) => `$${(n ?? 0).toFixed(2)}`
 
+const pct = (n: number | null | undefined) => (n == null ? '—' : `${n}%`)
+
+/** `JSON.parse` for a box that must hold an array, with a message that names
+ *  the field and points at the likely cause (smart quotes from a paste are
+ *  the usual "unexpected character at line 1 column 1"). */
+function parseJsonArray(text: string, field: string): unknown[] {
+  const raw = text.trim()
+  if (!raw) return []
+  let v: unknown
+  try {
+    v = JSON.parse(raw)
+  } catch (e: unknown) {
+    const why = e instanceof Error ? e.message : String(e)
+    throw new Error(
+      `the ${field} box is not valid JSON (${why}). It must be an array — `
+      + `check for smart quotes or a trailing comma.`)
+  }
+  if (!Array.isArray(v)) throw new Error(`the ${field} box must be a JSON array`)
+  return v
+}
+
 const leaseLabel = (lease: number | undefined): string => {
   if (lease == null) return '—'
   return new Date(lease * 1000).toLocaleTimeString([], {
@@ -119,23 +154,42 @@ const leaseLabel = (lease: number | undefined): string => {
   })
 }
 
-/** POST to an org-scoped endpoint. Shared by the planner (plan/create) and the
- *  per-queue ops (spawn/close/requeue) — the one place a queue mutation call is
- *  shaped, so the error surface is identical everywhere. */
-async function orgPost(slug: string, path: string,
-                       payload: unknown): Promise<unknown> {
+/** Call an org-scoped endpoint. Shared by the planner (plan/create) and the
+ *  per-queue ops (spawn/close/requeue/delete) — the one place a queue mutation
+ *  call is shaped, so the error surface is identical everywhere. */
+async function orgReq(slug: string, path: string, method: string,
+                      payload?: unknown): Promise<unknown> {
   const r = await fetch(
     `${BASE}/api/orgs/${encodeURIComponent(slug)}${path}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload ?? {}),
-    },
+    method === 'DELETE'
+      ? { method }
+      : {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload ?? {}),
+        },
   )
   const text = await r.text()
-  if (!r.ok) throw new Error(text.slice(0, 600) || `${r.status}`)
-  return text ? JSON.parse(text) as unknown : null
+  if (!r.ok) {
+    // FastAPI errors are {"detail": "…"} — surface just the message
+    let msg = text.slice(0, 600)
+    try {
+      const j = JSON.parse(text) as { detail?: unknown }
+      if (typeof j.detail === 'string') msg = j.detail
+    } catch { /* not JSON — use the raw body */ }
+    throw new Error(msg || `HTTP ${r.status}`)
+  }
+  if (!text) return null
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    throw new Error(
+      `the server sent a non-JSON response (HTTP ${r.status}): ${text.slice(0, 200)}`)
+  }
 }
+
+const orgPost = (slug: string, path: string, payload?: unknown) =>
+  orgReq(slug, path, 'POST', payload)
 
 // ── Inc D config block ────────────────────────────────────────────────────
 // Every knob defaults to and placeholder-shows its backend QUEUE_DEFAULTS
@@ -200,12 +254,21 @@ function QueuePlanner({ slug, onCreated }: {
   slug: string
   onCreated: (qid: string) => void
 }) {
+  // 'strategy' = the Inc A–C partitioner (plan → create). 'items' = the Inc 1
+  // escape hatch: you author the item list yourself and it goes straight to
+  // `POST …/queues` with `items` instead of `plan`. There is no dry run for a
+  // hand-authored list — the backend still runs `_norm_queue_items` and the
+  // overlap gate, so a bad partition is refused, not silently run.
+  const [mode, setMode] = useState<'strategy' | 'items'>('strategy')
   const [root, setRoot] = useState('')
-  const [strategy, setStrategy] = useState<Strategy>('group-by-field')
+  // by-file is the zero-config path (one item per matched file, no units to
+  // author); group-by-field and the other units strategies need a list.
+  const [strategy, setStrategy] = useState<Strategy>('by-file')
   const [globs, setGlobs] = useState('')
   const [groupBy, setGroupBy] = useState('file')
   const [outPrefix, setOutPrefix] = useState('out')
   const [targets, setTargets] = useState('')
+  const [itemsText, setItemsText] = useState('')
   const [qid, setQid] = useState('')
   const [plan, setPlan] = useState<PlanResult | null>(null)
   const [busy, setBusy] = useState(false)
@@ -224,14 +287,25 @@ function QueuePlanner({ slug, onCreated }: {
 
   const needsUnits = UNIT_STRATEGIES.includes(strategy)
 
+  /** Live validity of the `units` box, shown right under it so the error
+   *  points at a box the user can see. Empty box = no hint (not an error —
+   *  "plan" will reject it). */
+  const unitsCheck = useMemo(() => {
+    if (!needsUnits || !targets.trim()) return null
+    try {
+      return { count: parseJsonArray(targets, 'units').length, error: '' }
+    } catch (e: unknown) {
+      return { count: 0, error: e instanceof Error ? e.message : String(e) }
+    }
+  }, [needsUnits, targets])
+
   /** The strategy-specific half of the spec, built from one text box. */
   const buildSpec = (): Record<string, unknown> => {
     if (!needsUnits) {
       return strategy === 'by-file'
         ? { files: lines(targets) } : { dirs: lines(targets) }
     }
-    const units: unknown = JSON.parse(targets || '[]')
-    if (!Array.isArray(units)) throw new Error('units must be a JSON array')
+    const units = parseJsonArray(targets, 'units')
     const spec: Record<string, unknown> = { units }
     if (strategy === 'group-by-field') spec.group_by = groupBy
     if (strategy === 'by-item-output') spec.out_prefix = outPrefix
@@ -286,6 +360,29 @@ function QueuePlanner({ slug, onCreated }: {
     spec: buildSpec(),
   })
 
+  /** Parse the hand-authored `items` box for the local preview. Mirrors the
+   *  backend's id assignment (`f"{i:04d}"` when absent) and its "no payload"
+   *  refusal, so the table the user checks is the one the backend will build. */
+  const parsedItems = useMemo(() => {
+    if (mode !== 'items') return null
+    if (!itemsText.trim()) {
+      return { items: [] as Array<{ id: string; writes: string[] }>, error: '' }
+    }
+    try {
+      const v = parseJsonArray(itemsText, 'items')
+      const items = v.map((it, i) => {
+        const o = (it ?? {}) as Record<string, unknown>
+        if (!('payload' in o)) throw new Error(`item ${i} has no "payload"`)
+        const writes = Array.isArray(o.writes)
+          ? (o.writes as unknown[]).map(String) : []
+        return { id: String(o.id ?? `${i}`.padStart(4, '0')), writes }
+      })
+      return { items, error: '' }
+    } catch (e: unknown) {
+      return { items: [], error: e instanceof Error ? e.message : String(e) }
+    }
+  }, [mode, itemsText])
+
   const doPlan = () => {
     setBusy(true); setErr('')
     void (async () => {
@@ -312,6 +409,21 @@ function QueuePlanner({ slug, onCreated }: {
     })()
   }
 
+  const doCreateItems = () => {
+    setBusy(true); setErr('')
+    void (async () => {
+      try {
+        const config = buildConfig()
+        const items = parseJsonArray(itemsText, 'items')
+        await orgPost(slug, '/queues',
+          config ? { qid, items, config } : { qid, items })
+        onCreated(qid); setQid(''); setItemsText('')
+      } catch (e: unknown) {
+        setErr(e instanceof Error ? e.message : String(e))
+      } finally { setBusy(false) }
+    })()
+  }
+
   const refused = !!plan?.refusals.length
   // How many workers a spawn would hire, per queue_spawn_plan: the template
   // list wins when it has ≥1 entry, otherwise the `workers` count.
@@ -320,32 +432,60 @@ function QueuePlanner({ slug, onCreated }: {
 
   return (
     <section className="queue-plan">
-      <div className="queue-subhead">plan a partition</div>
-      <div className="queue-plan-form">
-        <label>root
-          <input value={root} onChange={(e) => setRoot(e.target.value)}
-            placeholder="a folder this org holds" /></label>
-        <label>strategy
-          <select value={strategy}
-            onChange={(e) => { setStrategy(e.target.value as Strategy); setPlan(null) }}>
-            {STRATEGIES.map((s) => <option key={s} value={s}>{s}</option>)}
-          </select></label>
-        <label>globs
-          <input value={globs} onChange={(e) => setGlobs(e.target.value)}
-            placeholder="one per line; blank = every file" /></label>
-        {strategy === 'group-by-field' && (
-          <label>group_by
-            <input value={groupBy} onChange={(e) => setGroupBy(e.target.value)} /></label>)}
-        {strategy === 'by-item-output' && (
-          <label>out_prefix
-            <input value={outPrefix} onChange={(e) => setOutPrefix(e.target.value)} /></label>)}
+      <div className="queue-subhead">
+        {mode === 'items' ? 'author the item list' : 'plan a partition'}
+        <span className="queue-mode-toggle">
+          <button type="button" className={mode === 'strategy' ? 'on' : ''}
+            onClick={() => { setMode('strategy'); setErr('') }}>strategy</button>
+          <button type="button" className={mode === 'items' ? 'on' : ''}
+            onClick={() => { setMode('items'); setPlan(null); setErr('') }}>explicit items</button>
+        </span>
       </div>
-      <label className="queue-plan-targets">
-        {needsUnits ? 'units (JSON: [{"key","payload"}] — writes are DERIVED, never declared)'
-          : strategy === 'by-file' ? 'files (one per line)' : 'dirs (one per line)'}
-        <textarea value={targets} rows={needsUnits ? 5 : 3}
-          onChange={(e) => setTargets(e.target.value)} />
-      </label>
+
+      {mode === 'strategy' && <>
+        <div className="queue-plan-form">
+          <label>root
+            <input value={root} onChange={(e) => setRoot(e.target.value)}
+              placeholder="a folder this org holds" /></label>
+          <label>strategy
+            <select value={strategy}
+              onChange={(e) => { setStrategy(e.target.value as Strategy); setPlan(null) }}>
+              {STRATEGIES.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select></label>
+          <label>globs
+            <input value={globs} onChange={(e) => setGlobs(e.target.value)}
+              placeholder="one per line; blank = every file" /></label>
+          {strategy === 'group-by-field' && (
+            <label>group_by
+              <input value={groupBy} onChange={(e) => setGroupBy(e.target.value)} /></label>)}
+          {strategy === 'by-item-output' && (
+            <label>out_prefix
+              <input value={outPrefix} onChange={(e) => setOutPrefix(e.target.value)} /></label>)}
+        </div>
+        <label className="queue-plan-targets">
+          {needsUnits ? 'units (JSON: [{"key","payload"}] — writes are DERIVED, never declared)'
+            : strategy === 'by-file' ? 'files (one per line)' : 'dirs (one per line)'}
+          <textarea value={targets} rows={needsUnits ? 5 : 3}
+            onChange={(e) => setTargets(e.target.value)} />
+        </label>
+        {unitsCheck && (unitsCheck.error
+          ? <div className="queue-panel-error">{unitsCheck.error}</div>
+          : <div className="dim">units box: {unitsCheck.count} unit(s), valid JSON</div>)}
+        {needsUnits && !targets.trim() && (
+          <div className="dim">
+            {strategy} needs a units list here — or switch to <b>by-file</b> /
+            {' '}<b>by-dir</b> to partition the files under <code>root</code> with no units.
+          </div>)}
+      </>}
+
+      {mode === 'items' && (
+        <label className="queue-plan-targets">
+          items — JSON array of {'{"payload": …, "writes": [paths]?, "id"?, "attempts"?}'};
+          {' '}you own the partition, the backend still checks it for overlaps
+          <textarea value={itemsText} rows={8}
+            onChange={(e) => setItemsText(e.target.value)} />
+        </label>
+      )}
 
       <details className="queue-cfg">
         <summary>config — workers, budgets, crew, reducer
@@ -458,19 +598,35 @@ function QueuePlanner({ slug, onCreated }: {
         </div>
       </details>
 
-      <div className="queue-plan-actions">
-        <button disabled={busy || !root.trim()} onClick={doPlan}>
-          {busy ? 'working…' : 'plan (dry run)'}</button>
-        {plan && !refused && (
-          <>
-            <input className="queue-plan-qid" value={qid} placeholder="queue id"
-              onChange={(e) => setQid(e.target.value)} />
-            <button className="primary" disabled={busy || !qid.trim()}
-              onClick={doCreate}>create this queue</button>
-          </>)}
-      </div>
+      {mode === 'strategy' && (
+        <div className="queue-plan-actions">
+          <button disabled={busy || !root.trim() || !!unitsCheck?.error}
+            onClick={doPlan}>
+            {busy ? 'working…' : 'plan (dry run)'}</button>
+          {plan && !refused && (
+            <>
+              <input className="queue-plan-qid" value={qid} placeholder="queue id"
+                onChange={(e) => setQid(e.target.value)} />
+              <button className="primary" disabled={busy || !qid.trim()}
+                onClick={doCreate}>create this queue</button>
+            </>)}
+        </div>
+      )}
+
+      {mode === 'items' && (
+        <div className="queue-plan-actions">
+          <input className="queue-plan-qid" value={qid} placeholder="queue id"
+            onChange={(e) => setQid(e.target.value)} />
+          <button className="primary" onClick={doCreateItems}
+            disabled={busy || !qid.trim() || !!parsedItems?.error
+              || !parsedItems?.items.length}>
+            {busy ? 'working…' : 'create this queue'}</button>
+        </div>
+      )}
+
       {err && <div className="queue-panel-error">{err}</div>}
-      {plan && (
+
+      {mode === 'strategy' && plan && (
         <div className="queue-plan-out">
           <div className="dim">
             {plan.stats.items} item(s) from {plan.listed} listed file(s)
@@ -499,37 +655,69 @@ function QueuePlanner({ slug, onCreated }: {
           {plan.items.length > 50 && (
             <div className="dim">…and {plan.items.length - 50} more</div>)}
         </div>)}
+
+      {mode === 'items' && parsedItems && (itemsText.trim() || parsedItems.error) && (
+        <div className="queue-plan-out">
+          {parsedItems.error
+            ? <div className="queue-panel-error">{parsedItems.error}</div>
+            : <>
+                <div className="dim">
+                  {parsedItems.items.length} item(s) — this is exactly what
+                  will be created (the backend re-checks it for overlaps)
+                </div>
+                <div className="queue-table-wrap">
+                  <table>
+                    <thead><tr><th>id</th><th>writes</th></tr></thead>
+                    <tbody>{parsedItems.items.slice(0, 50).map((it) => (
+                      <tr key={it.id}>
+                        <td>{it.id}</td>
+                        <td>{it.writes.length ? it.writes.join(', ') : <i>read-only</i>}</td>
+                      </tr>))}</tbody>
+                  </table>
+                </div>
+                {parsedItems.items.length > 50 && (
+                  <div className="dim">…and {parsedItems.items.length - 50} more</div>)}
+              </>}
+        </div>)}
     </section>
   )
 }
 
-/** Inc D — the run controls for one queue: spawn (once) and close (any time).
- *  Every guard here is a mirror of the backend's: the spawn button hides once
- *  `spawn.workers` is set (api answers a 2nd spawn with 409), `repo_root` is
- *  revealed and required only for a per-worker workspace (api 422s without
- *  it), and close is confirmed but idempotent so a double-click is harmless. */
-function QueueOps({ slug, queue, onMutated }: {
+/** Inc D — the run controls for one queue: spawn (once), close (any time),
+ *  delete (the escape hatch). Every guard mirrors the backend's: spawn hides
+ *  once `spawn.workers` is set (api → 409), `repo_root` is required only for a
+ *  per-worker workspace (api → 422), close is idempotent, and delete is
+ *  refused server-side while a worker holds a claim.
+ *
+ *  A queue with no crew (`worker_template`/`worker_templates` carry no tier)
+ *  can never spawn — `queue_spawn_plan` raises — so we don't offer the button;
+ *  delete is the only move. */
+function QueueOps({ slug, queue, onMutated, onRemoved }: {
   slug: string
   queue: QueueStatus
   onMutated: () => void
+  onRemoved: () => void
 }) {
   const spawned = !!queue.spawn?.workers?.length
   const stopped = !!queue.closed || queue.phase === 'done'
   const perWorker = queue.config.workspace !== 'shared'
+  const hasCrew = !!queue.config.worker_template?.tier
+    || !!queue.config.worker_templates?.some((t) => t.tier)
   const nWorkers = queue.config.worker_templates?.length
     || queue.config.workers || 0
 
   const [repoRoot, setRepoRoot] = useState(queue.spawn?.repo_root ?? '')
   const [baseRef, setBaseRef] = useState('HEAD')
-  const [busy, setBusy] = useState<'' | 'spawn' | 'close'>('')
+  const [busy, setBusy] = useState<'' | 'spawn' | 'close' | 'delete'>('')
   const [err, setErr] = useState('')
 
-  const run = (kind: 'spawn' | 'close', path: string, payload: unknown) => {
+  const run = (kind: 'spawn' | 'close' | 'delete', method: string,
+               path: string, payload?: unknown, after?: () => void) => {
     setBusy(kind); setErr('')
     void (async () => {
       try {
-        await orgPost(slug, path, payload)
-        onMutated()
+        await orgReq(slug, path, method, payload)
+        ;(after ?? onMutated)()
       } catch (e: unknown) {
         setErr(e instanceof Error ? e.message : String(e))
       } finally { setBusy('') }
@@ -540,7 +728,7 @@ function QueueOps({ slug, queue, onMutated }: {
     if (perWorker && !repoRoot.trim()) {
       setErr('workspace is per-worker — repo_root is required'); return
     }
-    run('spawn', `/queues/${encodeURIComponent(queue.qid)}/spawn`, {
+    run('spawn', 'POST', `/queues/${encodeURIComponent(queue.qid)}/spawn`, {
       ...(perWorker ? { repo_root: repoRoot.trim() } : {}),
       base_ref: baseRef.trim() || 'HEAD',
     })
@@ -549,15 +737,19 @@ function QueueOps({ slug, queue, onMutated }: {
   const doClose = () => {
     if (!window.confirm(
       `close queue "${queue.qid}"? workers stop taking new items.`)) return
-    run('close', `/queues/${encodeURIComponent(queue.qid)}/close`, {})
+    run('close', 'POST', `/queues/${encodeURIComponent(queue.qid)}/close`, {})
   }
 
-  // A stopped queue (closed by hand, or drained + reduced) has nothing to
-  // spawn and nothing to close — the whole control drops out.
-  if (stopped) return null
+  const doDelete = () => {
+    if (!window.confirm(
+      `delete queue "${queue.qid}"? this removes the record entirely.`)) return
+    run('delete', 'DELETE', `/queues/${encodeURIComponent(queue.qid)}`,
+      undefined, onRemoved)
+  }
+
   return (
     <div className="queue-ops">
-      {!spawned && (
+      {!spawned && !stopped && (hasCrew ? (
         <>
           {perWorker && (
             <>
@@ -573,12 +765,19 @@ function QueueOps({ slug, queue, onMutated }: {
             {busy === 'spawn' ? 'spawning…' : `spawn ${nWorkers || ''} worker${nWorkers === 1 ? '' : 's'}`.trim()}
           </button>
         </>
-      )}
+      ) : (
+        <span className="dim">no crew — this queue was created without a worker
+          template and can't be spawned; delete it and recreate with one</span>
+      ))}
       {spawned && (
         <span className="dim">spawned {queue.spawn?.workers?.length} · {(queue.spawn?.workers ?? []).join(', ')}</span>
       )}
-      <button disabled={busy !== ''} onClick={doClose}>
-        {busy === 'close' ? 'closing…' : 'close queue'}</button>
+      {!stopped && (
+        <button disabled={busy !== ''} onClick={doClose}>
+          {busy === 'close' ? 'closing…' : 'close queue'}</button>
+      )}
+      <button className="queue-op-del" disabled={busy !== ''} onClick={doDelete}>
+        {busy === 'delete' ? 'deleting…' : 'delete queue'}</button>
       {err && <div className="queue-panel-error">{err}</div>}
     </div>
   )
@@ -664,7 +863,8 @@ export function QueuePanel({ slug, qids, workerModels,
               </div>
 
               <QueueOps slug={slug} queue={queue}
-                onMutated={() => setNonce((n) => n + 1)} />
+                onMutated={() => setNonce((n) => n + 1)}
+                onRemoved={() => { onPlanned?.(); setNonce((n) => n + 1) }} />
 
               <div className="queue-counts" aria-label={`${queue.qid} item counts`}>
                 {(['pending', 'claimed', 'done', 'failed'] as const).map((name) => (
@@ -726,6 +926,38 @@ export function QueuePanel({ slug, qids, workerModels,
                   </div>
                 </div>
               </div>
+
+              {/* the quota-window readout — on a subscription lane this, not
+                  the dollar total, is what actually runs out. Only present
+                  once the queue has stamped a reading (spawn onward). */}
+              {queue.usage?.pools && Object.keys(queue.usage.pools).length > 0 && (
+                <>
+                  <div className="queue-subhead"
+                    title={queue.usage.note || undefined}>
+                    quota window <span className="dim">— % of the pool used, spawn → now</span>
+                  </div>
+                  <div className="queue-table-wrap">
+                    <table>
+                      <thead><tr>
+                        <th>pool</th><th>limit</th><th>at spawn</th><th>now</th><th>Δ</th>
+                      </tr></thead>
+                      <tbody>
+                        {Object.entries(queue.usage.pools).flatMap(([pool, kinds]) =>
+                          Object.entries(kinds).map(([kind, row]) => (
+                            <tr key={`${pool}/${kind}`}>
+                              <td>{pool}</td><td>{kind}</td>
+                              <td>{pct(row.start)}</td><td>{pct(row.end)}</td>
+                              <td>{row.window_reset
+                                ? <span className="dim" title={row.note || undefined}>window reset</span>
+                                : row.delta == null ? '—'
+                                  : `${row.delta > 0 ? '+' : ''}${row.delta}%`}</td>
+                            </tr>
+                          )))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
             </section>
           )
         })}

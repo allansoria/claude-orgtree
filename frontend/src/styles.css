@@ -2278,6 +2278,17 @@ button.danger.solid:hover { background: rgba(241, 76, 76, .24); }
   border-radius: 4px; cursor: pointer;
 }
 
+/* Inc D — strategy vs explicit-items mode toggle, riding in the subhead */
+.queue-mode-toggle { margin-left: 10px; display: inline-flex; gap: 0; }
+.queue-mode-toggle button {
+  font: inherit; font-size: 10px; text-transform: none; letter-spacing: 0;
+  padding: 2px 8px; border: 1px solid var(--line); background: var(--panel-2);
+  color: var(--dim); cursor: pointer;
+}
+.queue-mode-toggle button:first-child { border-radius: 4px 0 0 4px; }
+.queue-mode-toggle button:last-child { border-radius: 0 4px 4px 0; border-left: 0; }
+.queue-mode-toggle button.on { color: var(--fg); background: var(--panel); border-color: var(--accent); }
+
 /* Inc D — the per-queue run controls. Spawn is a primary action and lives
    right under the title; close sits beside it, muted. */
 .queue-ops {
@@ -2297,6 +2308,7 @@ button.danger.solid:hover { background: rgba(241, 76, 76, .24); }
   color: var(--dim); border-radius: 4px; padding: 0 6px; cursor: pointer;
   font-size: 11px; line-height: 1.5;
 }
+.queue-op-del { margin-left: auto; color: var(--bad); border-color: var(--bad); }
 
 @media (max-width: 700px) {
   .queue-panel-body { flex-direction: column; }

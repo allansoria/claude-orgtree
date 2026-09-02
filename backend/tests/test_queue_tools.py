@@ -188,6 +188,50 @@ def test_queue_requeue():
         pass
 
 
+def test_queue_delete():
+    print("§5c queue delete — the escape hatch for a crewless queue")
+    org = Org.create("qdel")
+    org.queue_create(USER, "q", mk(("a", ["a.py"])), {"retry_max": 0})
+    org.queue_create(USER, "keep", mk(("b", ["b.py"])), {"retry_max": 0})
+    out = org.queue_delete(USER, "q")
+    check("delete removes just that queue, leaving the rest",
+          lambda: eq((out, sorted(org.d["queues"])), ({"deleted": "q"}, ["keep"])))
+    raises("no such queue: 'q'", lambda: org.queue_delete(USER, "q"))
+
+    live = Org.create("qdel-live")
+    live.queue_create(USER, "q", mk(("a", ["a.py"])), {"retry_max": 0})
+    live.queue_take("w", "q", 10.0)
+    raises("live claim", lambda: live.queue_delete(USER, "q"))
+    check("a queue with a live claim is untouched",
+          lambda: eq(list(live.d["queues"]), ["q"]))
+
+    from fastapi.testclient import TestClient
+    from orgtree import api
+
+    slug = "qdel-http"
+    try:
+        store.delete_org(slug)
+    except LedgerError:
+        pass
+    routed = store.create_org(slug)
+    with store.DOC_LOCK:
+        routed.queue_create(USER, "q", mk(("a", [])), {"retry_max": 0})
+        store.save_org(routed)
+    client = TestClient(api.app)
+    r1 = client.delete(f"/api/orgs/{slug}/queues/q")
+    check("the HTTP DELETE persists the removal",
+          lambda: eq((r1.status_code, r1.json(),
+                      list(store.load_org(slug).d["queues"])),
+                     (200, {"deleted": "q"}, [])))
+    r2 = client.delete(f"/api/orgs/{slug}/queues/missing")
+    check("DELETE on an unknown queue is 404",
+          lambda: eq(r2.status_code, 404))
+    try:
+        store.delete_org(slug)
+    except LedgerError:
+        pass
+
+
 def main():
     print("§1 MCP cards + /api/agent dispatch")
     cards = {c["name"]: c for c in mcptool.TOOLS}
@@ -303,6 +347,7 @@ def main():
                       fail.d["queues"]["q"]["pending"]), ({}, [])))
 
     test_queue_requeue()
+    test_queue_delete()
 
     print("§6 lease expiry — reclaim without sleeping")
     lease = Org.create("lease")

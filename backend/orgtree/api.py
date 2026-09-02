@@ -2820,6 +2820,24 @@ async def queue_close(slug: str, qid: str, request: Request) -> dict[str, Any]:
     return r
 
 
+@app.delete("/api/orgs/{slug}/queues/{qid}")
+async def queue_delete(slug: str, qid: str, request: Request) -> dict[str, Any]:
+    """Remove a queue record. Refuses while a worker holds a claim — the
+    escape hatch for a queue created with no crew that can never spawn."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+            r = org.queue_delete(USER, qid)
+        except LedgerError as e:
+            raise HTTPException(404 if "no such queue" in str(e) else 422,
+                                str(e))
+        store.save_org(org)
+    await hub.changed(slug)
+    return r
+
+
 @app.post("/api/orgs/{slug}/queues/{qid}/items/{item_id}/requeue")
 async def queue_requeue(slug: str, qid: str, item_id: str,
                         request: Request) -> dict[str, Any]:

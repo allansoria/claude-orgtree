@@ -84,9 +84,11 @@ async function planAndCreate(host: HTMLElement, extra?: () => Promise<void>) {
     (b) => b.textContent === 'create this queue'), 'create')
 }
 
-function mountPanel(qids: string[], statuses: Record<string, unknown>) {
+function mountPanel(qids: string[], statuses: Record<string, unknown>,
+                   onPlanned: () => void = () => {}) {
+  void statuses
   return mountView(
-    <QueuePanel slug="acme" qids={qids} workerModels={{}} onPlanned={() => {}} />,
+    <QueuePanel slug="acme" qids={qids} workerModels={{}} onPlanned={onPlanned} />,
     (el) => el as HTMLElement)
 }
 
@@ -206,7 +208,7 @@ test('§4 spawn: repo_root required for per-worker, absent for shared, gone once
   try {
     // per-worker, not yet spawned
     let calls = stubWithPlan({
-      pw: { qid: 'pw', phase: 'open', config: { workers: 2, workspace: 'per-worker' },
+      pw: { qid: 'pw', phase: 'open', config: { workers: 2, workspace: 'per-worker', worker_template: { tier: 'sonnet' } },
         counts: { pending: 2, claimed: 0, done: 0, failed: 0, total: 2 },
         items: [], failed: [], cost: { total_usd: 0, by_worker: {}, claimed_usd: 0 } },
     })
@@ -230,7 +232,7 @@ test('§4 spawn: repo_root required for per-worker, absent for shared, gone once
 
     // shared workspace: no repo_root field, spawn still offered
     calls = stubWithPlan({
-      sh: { qid: 'sh', phase: 'open', config: { workers: 3, workspace: 'shared' },
+      sh: { qid: 'sh', phase: 'open', config: { workers: 3, workspace: 'shared', worker_template: { tier: 'sonnet' } },
         counts: { pending: 3, claimed: 0, done: 0, failed: 0, total: 3 },
         items: [], failed: [], cost: { total_usd: 0, by_worker: {}, claimed_usd: 0 } },
     })
@@ -246,7 +248,7 @@ test('§4 spawn: repo_root required for per-worker, absent for shared, gone once
       <QueuePanel slug="acme" qids={['pw']} workerModels={{}} onPlanned={() => {}} />,
       (el) => el as HTMLElement)
     stubWithPlan({
-      pw: { qid: 'pw', phase: 'running', config: { workers: 2, workspace: 'per-worker' },
+      pw: { qid: 'pw', phase: 'running', config: { workers: 2, workspace: 'per-worker', worker_template: { tier: 'sonnet' } },
         spawn: { workers: ['pw-w1', 'pw-w2'] },
         counts: { pending: 0, claimed: 2, done: 0, failed: 0, total: 2 },
         items: [], failed: [], cost: { total_usd: 0, by_worker: {}, claimed_usd: 0 } },
@@ -259,29 +261,35 @@ test('§4 spawn: repo_root required for per-worker, absent for shared, gone once
   } finally { realClock() }
 })
 
-test('§5 close is hidden once the queue is done', async () => {
+test('§5 a done queue keeps only delete; an open queue offers close too', async () => {
   useFakeClock()
   try {
     stubWithPlan({
-      d: { qid: 'd', phase: 'done', closed: true, config: { workers: 2, workspace: 'shared' },
+      d: { qid: 'd', phase: 'done', closed: true,
+        config: { workers: 2, workspace: 'shared', worker_template: { tier: 'sonnet' } },
         counts: { pending: 0, claimed: 0, done: 2, failed: 0, total: 2 },
         items: [], failed: [], cost: { total_usd: 1, by_worker: {}, claimed_usd: 0 } },
     })
     const v = await mountPanel(['d'], {})
     await flush()
-    assert.ok(!v.el.querySelector('.queue-ops'),
-      'a done queue must show no run controls at all')
+    const btns = () => [...v.el.querySelectorAll('.queue-ops button')].map((b) => b.textContent)
+    assert.ok(!btns().some((t) => t?.includes('spawn') || t === 'close queue'),
+      'a done queue must not offer spawn or close')
+    assert.ok(btns().includes('delete queue'),
+      'a done queue must still offer delete — it is the only way to remove it')
     await v.unmount()
 
     stubWithPlan({
-      o: { qid: 'o', phase: 'open', config: { workers: 2, workspace: 'shared' },
+      o: { qid: 'o', phase: 'open',
+        config: { workers: 2, workspace: 'shared', worker_template: { tier: 'sonnet' } },
         counts: { pending: 2, claimed: 0, done: 0, failed: 0, total: 2 },
         items: [], failed: [], cost: { total_usd: 0, by_worker: {}, claimed_usd: 0 } },
     })
     const v2 = await mountPanel(['o'], {})
     await flush()
-    assert.ok([...v2.el.querySelectorAll('.queue-ops button')].some(
-      (b) => b.textContent === 'close queue'), 'an open queue must offer close')
+    const btns2 = [...v2.el.querySelectorAll('.queue-ops button')].map((b) => b.textContent)
+    assert.ok(btns2.includes('close queue') && btns2.includes('delete queue'),
+      'an open queue must offer both close and delete')
     await v2.unmount()
   } finally { realClock() }
 })
@@ -342,6 +350,178 @@ test('§7 the tier field is a grouped dropdown, blank until chosen', async () =>
     }
     // an empty template row (blank tier) still emits nothing and blocks create
     // exactly as the free-text version did — covered by §3, unchanged.
+    await v.unmount()
+  } finally { realClock() }
+})
+
+test('§8 explicit-items mode: previews the list and POSTs items, not plan', async () => {
+  useFakeClock()
+  try {
+    const calls = stubWithPlan({})
+    const v = await mountPanel([], {})
+    await click([...v.el.querySelectorAll('.queue-mode-toggle button')].find(
+      (b) => b.textContent === 'explicit items'), 'items mode')
+    // the strategy inputs are gone (the config block, also .queue-plan-form,
+    // stays); the items textarea is here
+    assert.ok(![...v.el.querySelectorAll('input')].some(
+      (i) => (i as HTMLInputElement).placeholder === 'a folder this org holds'),
+      'the strategy root field must be hidden in items mode')
+    assert.ok(![...v.el.querySelectorAll('.queue-plan-actions button')].some(
+      (b) => b.textContent?.includes('plan (dry run)')),
+      'the dry-run button has no place in items mode')
+    const ta = v.el.querySelector('.queue-plan-targets textarea')
+    assert.ok(ta, 'no items textarea')
+
+    // malformed JSON gets a message that names the field, not a raw
+    // "unexpected character at line 1 column 1"
+    await type(ta, 'not json', 'nonsense')
+    assert.match(v.el.querySelector('.queue-plan-out .queue-panel-error')?.textContent ?? '',
+      /items box is not valid JSON/, 'a JSON syntax error must name the field')
+
+    // a payload-less entry surfaces the backend refusal locally and blocks create
+    await type(ta, '[{"writes":["a.txt"]}]', 'bad items')
+    assert.match(v.el.querySelector('.queue-plan-out .queue-panel-error')?.textContent ?? '',
+      /payload/, 'a payload-less item must be flagged before create')
+    const createBtn = () => [...v.el.querySelectorAll('.queue-plan-actions button')].find(
+      (b) => b.textContent === 'create this queue') as HTMLButtonElement | undefined
+    await type(v.el.querySelector('.queue-plan-qid'), 'manual', 'qid')
+    assert.ok(createBtn()?.disabled, 'create must stay disabled while the JSON is invalid')
+
+    // a good list previews and creates
+    await type(ta, '[{"payload":{"n":1},"writes":["a.txt"]},{"payload":{"n":2}}]', 'good items')
+    const rows = [...v.el.querySelectorAll('.queue-plan-out tbody tr')].map(
+      (r) => [...r.querySelectorAll('td')].map((c) => c.textContent))
+    assert.deepEqual(rows, [['0000', 'a.txt'], ['0001', 'read-only']],
+      'the preview must mirror the backend id assignment and writes')
+    await click(createBtn(), 'create items')
+    const create = calls.find((c) => c.path.endsWith('/queues'))
+    assert.ok(create, 'no POST /queues in items mode')
+    const b = create.body as Record<string, unknown>
+    assert.deepEqual(Object.keys(b).sort(), ['items', 'qid'],
+      'items-mode create must send {qid, items}, never a plan')
+    assert.equal((b.items as unknown[]).length, 2)
+    await v.unmount()
+  } finally { realClock() }
+})
+
+test('§10 the units box has a live check that names it and gates the dry run', async () => {
+  useFakeClock()
+  try {
+    const calls = stubWithPlan({})
+    const v = await mountPanel([], {})
+    // switch to a units strategy so the units box is JSON-checked
+    await pick(v.el.querySelector('.queue-plan-form select'), 'group-by-field', 'strategy')
+    const ta = v.el.querySelector('.queue-plan-targets textarea') as HTMLTextAreaElement
+    await type(v.el.querySelector('.queue-plan-form input'), '/repo', 'root')
+    const planBtn = () => [...v.el.querySelectorAll('.queue-plan-actions button')].find(
+      (b) => b.textContent?.includes('plan (dry run)')) as HTMLButtonElement
+
+    await type(ta, "units: not json", 'garbage')
+    assert.match(v.el.textContent ?? '', /units box is not valid JSON/,
+      'the units-box error must name the box')
+    assert.ok(planBtn().disabled, 'a broken units box must block the dry run')
+
+    await type(ta, '[{"key":"a","payload":{}},{"key":"b","payload":{}}]', 'good units')
+    assert.match(v.el.textContent ?? '', /units box: 2 unit\(s\), valid JSON/,
+      'a valid units box must report its count')
+    assert.ok(!planBtn().disabled, 'a valid units box must re-enable the dry run')
+    await v.unmount()
+  } finally { realClock() }
+})
+
+test('§9 the quota-window readout renders once a reading is stamped', async () => {
+  useFakeClock()
+  try {
+    stubWithPlan({
+      q: {
+        qid: 'q', phase: 'draining', config: { workers: 2, workspace: 'shared' },
+        counts: { pending: 0, claimed: 0, done: 2, failed: 0, total: 2 },
+        items: [], failed: [], cost: { total_usd: 0, by_worker: {}, claimed_usd: 0 },
+        usage: {
+          pools: {
+            claude: {
+              session: { start: 20, end: 55, delta: 35 },
+              weekly_all: { start: 60, end: 12, delta: null, window_reset: true,
+                note: 'the quota window reset mid-run' },
+            },
+          },
+          at: { spawn: 's', drained: 'd' },
+          note: 'window movement, not this queue alone',
+        },
+      },
+    })
+    const v = await mountPanel(['q'], {})
+    await flush()
+    const head = [...v.el.querySelectorAll('.queue-subhead')].find(
+      (h) => h.textContent?.includes('quota window'))
+    assert.ok(head, 'no quota-window section')
+    const rows = [...v.el.querySelectorAll('.queue-status table')]
+      .flatMap((t) => [...t.querySelectorAll('tbody tr')])
+      .map((r) => [...r.querySelectorAll('td')].map((c) => c.textContent))
+    assert.ok(rows.some((r) => r[0] === 'claude' && r[1] === 'session'
+      && r[2] === '20%' && r[3] === '55%' && r[4] === '+35%'),
+      `session row wrong: ${JSON.stringify(rows)}`)
+    assert.ok(rows.some((r) => r[1] === 'weekly_all' && r[4] === 'window reset'),
+      'a reset window must say so instead of a bogus delta')
+    await v.unmount()
+
+    // no usage stamped yet ⇒ no section
+    stubWithPlan({
+      q: {
+        qid: 'q', phase: 'draining', config: { workers: 2, workspace: 'shared' },
+        counts: { pending: 2, claimed: 0, done: 0, failed: 0, total: 2 },
+        items: [], failed: [], cost: { total_usd: 0, by_worker: {}, claimed_usd: 0 },
+        usage: null,
+      },
+    })
+    const v2 = await mountPanel(['q'], {})
+    await flush()
+    assert.ok(![...v2.el.querySelectorAll('.queue-subhead')].some(
+      (h) => h.textContent?.includes('quota window')),
+      'no quota-window section before a reading is stamped')
+    await v2.unmount()
+  } finally { realClock() }
+})
+
+test('§11 delete removes a queue; a crewless queue offers no spawn', async () => {
+  useFakeClock()
+  try {
+    let planned = 0
+    const calls = stubWithPlan({
+      // a queue created with no worker template — config carries no tier
+      dead: {
+        qid: 'dead', phase: 'draining',
+        config: { workers: 3, workspace: 'shared', worker_template: {} },
+        counts: { pending: 1, claimed: 0, done: 0, failed: 0, total: 1 },
+        items: [], failed: [], cost: { total_usd: 0, by_worker: {}, claimed_usd: 0 },
+      },
+    })
+    const v = await mountPanel(['dead'], {}, () => { planned++ })
+    await flush()
+
+    // no spawn button — instead the "no crew" note
+    assert.ok(![...v.el.querySelectorAll('.queue-ops button')].some(
+      (b) => b.textContent?.includes('spawn')),
+      'a crewless queue must not offer a spawn button')
+    assert.match(v.el.querySelector('.queue-ops')?.textContent ?? '', /no crew/,
+      'a crewless queue must say why it cannot spawn')
+
+    const delBtn = [...v.el.querySelectorAll('.queue-ops button')].find(
+      (b) => b.textContent === 'delete queue')
+    assert.ok(delBtn, 'every queue must offer delete')
+
+    // confirm() → true, then the DELETE fires and onPlanned (tree refresh) runs
+    const w = (globalThis as unknown as { window: Window & { confirm: unknown } }).window
+    const realConfirm = w.confirm
+    w.confirm = () => true
+    try {
+      await click(delBtn, 'delete')
+    } finally { w.confirm = realConfirm }
+
+    const del = calls.find((c) => c.method === 'DELETE')
+    assert.ok(del, 'delete must issue an HTTP DELETE')
+    assert.equal(del.path, '/api/orgs/acme/queues/dead')
+    assert.ok(planned > 0, 'delete must trigger a tree refresh so the qid drops')
     await v.unmount()
   } finally { realClock() }
 })

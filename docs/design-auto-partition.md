@@ -188,12 +188,31 @@ The gap Inc D was commissioned to close:
 | **start the queue** | `POST …/queues/{qid}/spawn` `{repo_root, base_ref}` | **none — a created queue could never be spawned from the UI** | ✅ spawn button |
 | stop the queue | `POST …/queues/{qid}/close` | none | ✅ close button |
 | dead-letter requeue | `queue_status.failed[]` + `POST …/queues/{qid}/items/{id}/requeue` (new) | list rendered, no action | ✅ per-item `↻` |
-| explicit `items` (non-partition) | `POST …/queues` `items[]` | plan-only | plan-only (still deferred) |
+| explicit `items` (non-partition) | `POST …/queues` `items[]` | plan-only | ✅ "explicit items" mode toggle |
+| remove a queue | `DELETE …/queues/{qid}` (new) | none — `close` only parks it | ✅ "delete queue" button + crewless detection |
+| quota-window usage | `queue_status.usage` (`_queue_usage_report`) | not shown | ✅ per-pool spawn→now table |
 
 **Scope.** Bring the panel up to the backend it already talks to. The only
 new backend is one endpoint — the per-item `requeue` — plus an additive
 `writes` key on dead-letter records; everything else is fields and endpoints
 that already existed.
+
+**Explicit-items mode.** A toggle in the "plan a partition" subhead switches
+the form to a single JSON textarea for a hand-authored `items[]` list, which
+goes straight to `POST …/queues` with `items` instead of `plan`. There is no
+dry run — the user *is* the partition author — but the panel parses the list
+locally and shows the same id/writes preview table (mirroring the backend's
+`f"{i:04d}"` id assignment and its "no payload" refusal), and the backend
+still runs `_norm_queue_items` + the overlap gate, so a bad list is refused
+rather than run. The `config` block applies in both modes.
+
+**Quota-window readout.** `queue_status.usage` (from `_queue_usage_report`,
+`null` until the queue has stamped a reading at spawn) is rendered as a
+per-pool table in the `queue-status` card: `pool · limit · at spawn · now ·
+Δ`. A window that reset mid-run shows "window reset" in the Δ column instead
+of a subtraction across two incomparable windows — the failure mode
+`_queue_usage_report` was written to catch. This is the honest budget signal
+on a subscription lane, where `cost_usd` is notional.
 
 - **Create form gains a `config` block.** One collapsible group with the
   eight scalar knobs, each defaulting to and placeholder-showing its
@@ -223,6 +242,16 @@ that already existed.
   status poll redraws without the button.
 - **Close control.** A "close queue" button on any non-stopped queue, behind
   a confirm; it is idempotent so a double-click is harmless.
+- **Delete control.** `DELETE …/queues/{qid}` → `Org.queue_delete`, behind a
+  confirm, on every queue regardless of phase — `close` only parks a queue,
+  and a queue created with no crew can't be spawned or closed into
+  usefulness, so it needs a real remove. The backend refuses while a worker
+  holds a claim (stop the crew first); a never-spawned or stopped queue
+  drops cleanly, leaving any per-worker worktrees for `git worktree prune`.
+  The panel also **detects a crewless queue** (`config.worker_template` /
+  `worker_templates` carry no `tier`) and replaces the spawn button with a
+  "no crew — delete and recreate" note, since `queue_spawn_plan` would just
+  raise.
 - **Dead-letter requeue.** The "dead letters" list was already rendered;
   Inc D adds a per-item `↻` calling
   `POST …/queues/{qid}/items/{item_id}/requeue`. The endpoint re-normalises
@@ -250,13 +279,24 @@ that already existed.
   field is present-and-required for `per-worker` and absent for `shared`,
   and the whole control is gone once spawned or done; the model catalogue
   fills a row and only adopts the band when the tier is blank; the tier
-  field is a provider-grouped `<select>` carrying every `ALL_TIERS` entry.
+  field is a provider-grouped `<select>` carrying every `ALL_TIERS` entry;
+  explicit-items mode previews the parsed list and POSTs `{qid, items}`, never
+  a plan; the quota-window table renders once `usage` is stamped and shows
+  "window reset" rather than a bogus delta.
   **backend**
   `test_queue_tools.py::test_queue_requeue` — requeue moves an item back and
   a worker retakes it with `attempts == 0`; `writes` survives and the
   concurrency gate still blocks a second writer; `reducing` / `closed` /
   unknown-queue all refuse at both the model and HTTP layers without
   mutating the dead-letter list.
+
+**Deferred within Inc D (future feature).** *Reconfigure a queue in place* —
+a `PATCH …/queues/{qid}` accepting a fresh `config` while `!spawn.workers &&
+!closed`, plus reusing the create form's config block in the `queue-status`
+card. Today a queue created with the wrong crew (or none) is delete-and-
+recreate; that's the accepted stopgap until the PATCH lands. Also deferred:
+an explicit-`items` create path that keeps a plan-style dry run, and a
+`retry` action scoped to the reducer's own `add_dirs`.
 
 ## 6. Deferred (explicit non-goals)
 
