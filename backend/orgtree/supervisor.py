@@ -13157,6 +13157,112 @@ def start_watchdog_engine() -> None:
     threading.Thread(target=run, daemon=True, name="watchdogs").start()
 
 
+#: how often the queue sweeper looks. A stuck queue is not urgent — the
+#: lease it is waiting on is measured in minutes — but it must be bounded,
+#: because before this the wait was FOREVER.
+_QUEUE_SWEEP_S = 60.0
+_queue_sweep_started = False
+
+
+def _worker_busy(slug: str, nid: str) -> bool:
+    """Is this node mid-turn (or with a turn queued behind it)? The sweeper
+    must not nudge a worker that is already working — that is the difference
+    between rescuing a dead queue and interrupting a live one."""
+    st = state(slug, nid)
+    with _state_lock:
+        return bool(st.get("busy") or st.get("responding")
+                    or st.get("queue"))
+
+
+def _queue_sweep_tick() -> None:
+    """One pass over every org's draining queues (see `Org.queue_sweep`).
+
+    ⚠ THIS IS THE ONLY RECOVERY PATH THAT DOES NOT NEED SOMETHING TO HAPPEN
+    FIRST. Every other one hangs off a turn ending or a `take` being called,
+    and on 2026-09-01 that turned out to be a deadlock: two workers ended
+    their turns holding items, every worker went idle, so nothing called
+    take (no lease reclaim) and no turn ended (no stall check). The queue
+    sat at 18/20 for over an hour with both leases long expired and no error
+    anywhere. Recovery that only fires on activity cannot recover from
+    having none."""
+    for row in store.list_orgs():
+        slug = str(row.get("slug") or "")
+        if not slug:
+            continue
+        drives: list[tuple[str, str]] = []
+        try:
+            with store.DOC_LOCK:
+                org = store.load_org(slug)
+                if not org.d.get("queues"):
+                    continue
+                actions = org.queue_sweep()
+                if not actions:
+                    continue
+                for a in actions:
+                    qid = str(a["qid"])
+                    if a["kind"] == "lease_reclaimed":
+                        print(f"[orgtree] {slug}/{qid}: swept a dead claim "
+                              f"from {a['worker']} — item {a['item_id']} "
+                              f"{a['outcome']}")
+                        # the worker that lost it may be idle and able to work
+                        drives.append((str(a["worker"]),
+                                       f"(orgtree) Queue item "
+                                       f"'{a['item_id']}' was taken back from "
+                                       f"you — its lease expired while your "
+                                       f"turn was over. Call "
+                                       f"orgtree_queue_take for '{qid}' to "
+                                       f"pick up work again."))
+                    elif a["kind"] == "idle_with_work":
+                        # ⚠ "holds no claim" is NOT "doing nothing". A worker
+                        # that is mid-turn has simply not called `take` yet —
+                        # true of every worker in the seconds after a spawn —
+                        # and nudging it would interrupt the very work we are
+                        # asking for, once a minute. Runtime state is the
+                        # ledger's blind spot, so the filter lives here.
+                        idle = [w for w in cast("list[str]", a["workers"])
+                                if not _worker_busy(slug, w)]
+                        if not idle:
+                            continue
+                        print(f"[orgtree] {slug}/{qid}: {a['pending']} item(s) "
+                              f"pending and no worker holds anything — "
+                              f"re-driving {idle}")
+                        for w in idle:
+                            drives.append((w, (
+                                f"(orgtree) Queue '{qid}' has {a['pending']} "
+                                f"item(s) waiting and nobody is working. Call "
+                                f"orgtree_queue_take for '{qid}' — as a REAL "
+                                f"tool call. Stop only when it returns empty "
+                                f"without a pause reason.")))
+                store.save_org(org)
+        except Exception:                                        # noqa: BLE001
+            continue
+        # drives OUTSIDE the lock, like every other path here
+        for nid, text in drives:
+            try:
+                send_message(slug, nid, text)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+
+def start_queue_sweeper() -> None:
+    """The clock behind `_queue_sweep_tick`. Started beside the watchdog
+    engine; idle orgs cost one `list_orgs` and a `queues` key check."""
+    global _queue_sweep_started
+    if _queue_sweep_started:
+        return
+    _queue_sweep_started = True
+
+    def run() -> None:
+        while True:
+            time.sleep(_QUEUE_SWEEP_S)
+            try:
+                _queue_sweep_tick()
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    threading.Thread(target=run, daemon=True, name="queue-sweeper").start()
+
+
 def uuid_hex8() -> str:
     import uuid as _uuid
     return _uuid.uuid4().hex[:8]

@@ -406,6 +406,50 @@ def main():
         except LedgerError:
             pass
 
+        print("§9c the SWEEPER tick — rescues a queue with no edges left")
+        slug5 = "sweep-http"
+        try:
+            store.delete_org(slug5)
+        except LedgerError:
+            pass
+        o = store.create_org(slug5)
+        with store.DOC_LOCK:
+            o.queue_create(USER, "s", mk("a", "b", "c"),
+                           {"workers": 2, "workspace": "shared",
+                            "lease_seconds": 1, "retry_max": 1,
+                            "worker_template": {"tier": "haiku"}})
+            store.save_org(o)
+        TestClient(api.app).post(f"/api/orgs/{slug5}/queues/s/spawn", json={})
+        ws = store.load_org(slug5).d["queues"]["s"]["spawn"]["workers"]
+        with store.DOC_LOCK:
+            o = store.load_org(slug5)
+            o.queue_take(ws[0], "s", now_ts=1.0)     # a claim that goes stale
+            store.save_org(o)
+        # the second worker is MID-TURN: nudging it would interrupt the very
+        # work we are asking for
+        stt = supervisor.state(slug5, ws[1])
+        with supervisor._state_lock:
+            stt["busy"] = True
+        sent.clear()
+        supervisor._queue_sweep_tick()
+        qq = store.load_org(slug5).d["queues"]["s"]
+        check("the tick reclaims the stale claim with nobody calling take",
+              lambda: eq((qq["claimed"],
+                          sorted(i["id"] for i in qq["pending"])),
+                         ({}, ["a", "b", "c"])))
+        check("the worker that lost the item is told, and told why",
+              lambda: eq(any(n == ws[0] and "lease expired" in t
+                             for n, t in sent), True))
+        check("☠ a BUSY worker is NOT nudged (rescuing a dead queue must not "
+              "interrupt a live one)",
+              lambda: eq([t for n, t in sent if n == ws[1]], []))
+        with supervisor._state_lock:
+            stt["busy"] = False
+        try:
+            store.delete_org(slug5)
+        except LedgerError:
+            pass
+
     print(f"\n{PASS} checks passed")
 
 

@@ -203,6 +203,35 @@ def main():
           lambda: eq(u.queue_status("q")["usage"]["pools"]["codex"]["primary"],
                      {"start": 10, "end": None, "delta": None}))
 
+    print("§5c a percentage is only comparable WITHIN one window")
+    # The 20-file run spanned the 23:20 session reset and read 65 -> 29,
+    # computing a delta of -36. A number that looks like an answer and is
+    # not is worse than no number.
+    w = Org.create("usage-window")
+    w.queue_create(USER, "q", mk(("0000", [])))
+    w.queue_stamp_usage("q", "spawn", {"claude": {
+        "session": {"pct": 65, "resets_at": "2026-09-01T23:20"},
+        "weekly_all": {"pct": 7, "resets_at": "2026-09-05T05:00"}}})
+    w.queue_stamp_usage("q", "drained", {"claude": {
+        "session": {"pct": 29, "resets_at": "2026-09-02T04:20"},
+        "weekly_all": {"pct": 13, "resets_at": "2026-09-05T05:00"}}})
+    pools = w.queue_status("q")["usage"]["pools"]["claude"]
+    check("a window that ROLLED refuses the subtraction and says so",
+          lambda: eq((pools["session"]["delta"],
+                      pools["session"]["window_reset"],
+                      "cannot be subtracted" in pools["session"]["note"]),
+                     (None, True, True)))
+    check("…while a window that did NOT roll still reports its delta",
+          lambda: eq((pools["weekly_all"]["delta"],
+                      "window_reset" in pools["weekly_all"]), (6, False)))
+    old = Org.create("usage-legacy")
+    old.queue_create(USER, "q", mk(("0000", [])))
+    old.queue_stamp_usage("q", "spawn", {"claude": {"session": 32}})
+    old.queue_stamp_usage("q", "drained", {"claude": {"session": 79}})
+    check("readings stamped as bare ints (pre-2026-09-01) still subtract",
+          lambda: eq(old.queue_status("q")["usage"]["pools"]["claude"]
+                     ["session"]["delta"], 47))
+
     print("§6 queue_close")
     o6 = Org.create("q6")
     o6.queue_create(USER, "c", mk(("0000", ["a.py"])))

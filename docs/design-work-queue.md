@@ -350,6 +350,52 @@ the `or` form reset on every call, so the cap could never be reached and a
 dead worker would have been nudged forever. Caught by the unit test, not by
 reading.
 
+### The sweeper — recovery cannot be edge-triggered (2026-09-01)
+
+The first UNATTENDED run (20 files, 4 workers across three lanes) reached
+18/20 and then stopped dead for three hours. No error, no dead letter, no
+notice — the worst shape a failure can take.
+
+The cause was not a new stall. It was that **every recovery path in this
+design was edge-triggered, and they deadlocked against each other**:
+
+- lease reclaim lives inside `_queue_take_next` — it only runs when some
+  worker CALLS TAKE;
+- the stall detector runs from `_after_turn` — it only fires when a turn
+  ENDS.
+
+Two workers ended their turns holding items. That made every worker idle,
+so nobody called take (no reclaim) and no turn ended (no stall check). Both
+leases expired ~50 minutes in and nothing noticed. Meanwhile the other two
+workers had called take, seen `pending: 0`, and gone idle *legitimately* —
+the items weren't done, they were held by stalled workers.
+
+**A queue whose recovery only fires on activity cannot recover from having
+none.** So `Org.queue_sweep()` runs on a CLOCK (`start_queue_sweeper`, 60 s,
+beside the watchdog engine) and is the one path that assumes nothing is
+happening. It reclaims genuinely expired leases — the single repair needing
+no I/O and no judgement — and reports queues that have work pending with
+nobody holding any of it. Driving agents stays the caller's job.
+
+⚠ `_worker_busy` is the guard that makes it safe: "holds no claim" is not
+"doing nothing". A worker mid-turn simply has not called take yet — true of
+every worker in the seconds after a spawn — and nudging it would interrupt
+the very work being asked for, once a minute. Runtime state is the ledger's
+blind spot, so that filter lives in the supervisor.
+
+PROVEN on the stuck queue itself: `20:43:30` last activity → `23:59:41` two
+`queue_swept` events → `23:59:48` both workers took the reclaimed items →
+20/20, zero dead letters.
+
+### A percentage is only comparable within one window
+
+The same run crossed a session reset and its quota report read
+`session 65 -> 29, delta -36`. A number that looks like an answer and is not
+is worse than no number, so the reading now carries `resets_at` beside the
+percent and the report refuses the subtraction when the window rolled,
+marking `window_reset: true` with a note. An un-rolled pool still reports
+normally (that run's weekly: `7 -> 13, delta 6`).
+
 ## 4. Deferred (explicit non-goals for v1)
 
 - **Dynamic queues that refill while running** — needs "a queue with pending

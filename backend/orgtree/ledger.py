@@ -2680,6 +2680,95 @@ class Org:
         stats["stream"] = streamed + 1
         return {"item": item}
 
+    def queue_sweep(self, now_ts: float | None = None) -> list[dict[str, Any]]:
+        """Find every draining queue that has STOPPED MOVING, and say what to
+        do about it. Returns `[{qid, kind, worker?, item_id?, pending, …}]`.
+
+        ⚠ WHY A TIME-TRIGGERED SWEEP EXISTS AT ALL. Every other recovery path
+        in this design is EDGE-TRIGGERED and they deadlocked against each
+        other, live, on the first unattended run (2026-09-01, 18/20 items):
+
+          · lease reclaim lives inside `_queue_take_next` — it only runs when
+            some worker CALLS TAKE;
+          · the stall detector runs from `_after_turn` — it only fires when a
+            turn ENDS.
+
+        Two workers ended their turns holding items. That made every worker
+        idle, so nobody called take, so no lease was ever reclaimed; and no
+        turn ended again, so no stall was ever detected. Both leases expired
+        ~50 minutes earlier and NOTHING noticed. The queue sat at 18/20
+        indefinitely with no error, no dead letter, and no notice — the worst
+        shape a failure can take.
+
+        A queue whose recovery only fires on activity cannot recover from
+        having none. So this runs on a clock instead, and is the ONE place
+        that assumes nothing is happening.
+
+        It is a PURE REPORT — it mutates nothing except reclaiming genuinely
+        expired leases, which is the one repair that needs no I/O and no
+        judgement. Driving agents is the caller's job.
+        """
+        ts = _time.time() if now_ts is None else float(now_ts)
+        out: list[dict[str, Any]] = []
+        for qid, q in cast("dict[str, dict[str, Any]]",
+                           self.d.get("queues") or {}).items():
+            if q.get("closed") or q.get("phase") != "draining":
+                continue
+            claimed = cast("dict[str, dict[str, Any]]", q.get("claimed") or {})
+            # 1. expired leases — reclaim here, because on a dead queue there
+            #    is no `take` coming to do it
+            for worker, claim in list(claimed.items()):
+                if float(claim.get("lease_until") or 0) >= ts:
+                    continue
+                r = self._queue_reclaim(q, qid, worker, "lease expired "
+                                        "(swept: no worker was taking)")
+                out.append({"qid": qid, "kind": "lease_reclaimed",
+                            "worker": worker, **r})
+            # 2. work outstanding but nobody holding anything: every worker
+            #    went idle believing the queue was drained, while items sat
+            #    pending. Somebody has to be told to take again.
+            pending = len(cast("list[Any]", q["pending"]))
+            spawn = cast("dict[str, Any]", q.get("spawn") or {})
+            workers = [str(w) for w in (spawn.get("workers") or [])
+                       if w in self.nodes
+                       and self.nodes[w].get("state") == "live"]
+            if pending and workers and not cast("dict[str, Any]",
+                                                q.get("claimed") or {}):
+                out.append({"qid": qid, "kind": "idle_with_work",
+                            "workers": workers, "pending": pending})
+        return out
+
+    def _queue_reclaim(self, q: dict[str, Any], qid: str, worker: str,
+                       reason: str) -> dict[str, Any]:
+        """Return a stuck claim to the queue (or dead-letter it past
+        retry_max). Mirrors the reclaim inside `_queue_take_next` so the two
+        paths cannot drift on what a reclaim means."""
+        claimed = cast("dict[str, dict[str, Any]]", q["claimed"])
+        items = cast("dict[str, dict[str, Any]]",
+                     q.setdefault("_claimed_items", {}))
+        claim = claimed.pop(worker, None) or {}
+        item = items.pop(worker, None)
+        item_id = str(claim.get("item_id") or "")
+        if item is None:            # claim with no stored item: drop it
+            return {"item_id": item_id, "outcome": "orphan_claim_dropped"}
+        attempts = int(item["attempts"]) + 1
+        item["attempts"] = attempts
+        if attempts > int(cast("dict[str, Any]", q["config"])["retry_max"]):
+            cast("list[dict[str, Any]]", q["failed"]).append(
+                {"id": item_id, "payload": item["payload"], "reason": reason,
+                 "attempts": attempts, "cost_usd": 0.0, "turns": 0})
+            outcome = "dead_letter"
+        else:
+            cast("list[dict[str, Any]]", q["pending"]).insert(0, item)
+            outcome = "requeued"
+        # the worker is free to be handed work again
+        cast("dict[str, dict[str, Any]]", q.setdefault("per_worker", {})
+             ).setdefault(worker, {"done": 0})["stream"] = 0
+        self._log("queue_swept", worker,
+                  {"qid": qid, "item_id": item_id, "outcome": outcome,
+                   "attempts": attempts, "reason": reason}, [])
+        return {"item_id": item_id, "outcome": outcome, "attempts": attempts}
+
     def queue_stamp_usage(self, qid: str, when: str,
                           reading: dict[str, Any]) -> None:
         """Record a QUOTA snapshot against this queue.
@@ -2722,12 +2811,39 @@ class Org:
             b = cast("dict[str, Any]", end.get(pool) or {})
             kinds: dict[str, Any] = {}
             for kind in sorted(set(a) | set(b)):
-                s, e = a.get(kind), b.get(kind)
-                kinds[kind] = {
-                    "start": s, "end": e,
-                    "delta": (int(e) - int(s)
-                              if isinstance(s, int) and isinstance(e, int)
-                              else None)}
+                sv, ev = a.get(kind), b.get(kind)
+
+                def _pct(v: Any) -> int | None:
+                    # readings stamped before 2026-09-01 are a bare int
+                    if isinstance(v, int):
+                        return v
+                    if isinstance(v, dict):
+                        p = cast("dict[str, Any]", v).get("pct")
+                        return p if isinstance(p, int) else None
+                    return None
+
+                def _win(v: Any) -> Any:
+                    return (cast("dict[str, Any]", v).get("resets_at")
+                            if isinstance(v, dict) else None)
+
+                sp, ep = _pct(sv), _pct(ev)
+                # ⚠ A PERCENTAGE IS ONLY COMPARABLE WITHIN ONE WINDOW. The
+                # 20-file run crossed a session reset and read 65 -> 29,
+                # computing a delta of -36 — worse than no number, because it
+                # looks like an answer. If the window rolled, say so and
+                # refuse the subtraction.
+                rolled = (_win(sv) is not None and _win(ev) is not None
+                          and _win(sv) != _win(ev))
+                row: dict[str, Any] = {
+                    "start": sp, "end": ep,
+                    "delta": (None if rolled or sp is None or ep is None
+                              else ep - sp)}
+                if rolled:
+                    row["window_reset"] = True
+                    row["note"] = ("the quota window reset mid-run — these "
+                                   "two readings are of different windows "
+                                   "and cannot be subtracted")
+                kinds[kind] = row
             out[pool] = kinds
         return {"pools": out,
                 "at": {k: cast("dict[str, Any]", v).get("at")

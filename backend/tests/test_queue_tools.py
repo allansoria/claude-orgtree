@@ -278,6 +278,68 @@ def main():
     check("a closed queue is never a stall, however much is pending",
           lambda: eq(closed.queue_worker_stalled("w", "q")["stalled"], False))
 
+    print("§6d THE SWEEPER — recovery that does not need an edge")
+    # ⚠ THE DEADLOCK THIS EXISTS FOR (measured 2026-09-01, 18/20 items).
+    # Lease reclaim lives inside _queue_take_next, so it only runs when a
+    # worker CALLS TAKE. The stall detector runs from _after_turn, so it only
+    # fires when a turn ENDS. Two workers ended their turns holding items —
+    # which made every worker idle, so nobody called take and no turn ended.
+    # Both leases expired ~50 minutes earlier and NOTHING noticed: no error,
+    # no dead letter, no notice. Recovery that only fires on activity cannot
+    # recover from having none.
+    def swq(name, **cfg):
+        o = Org.create(name)
+        o.queue_create(USER, "q", mk(("a", []), ("b", []), ("c", [])), cfg)
+        o.d["queues"]["q"]["spawn"] = {"workers": ["w1", "w2"]}
+        for w in ("w1", "w2"):
+            o.hire(USER, None, "haiku", 0, w, [], tools={"bash": True,
+                   "mcp": []}, org_visibility="team", charter="x")
+        return o
+
+    sw = swq("sweeper", lease_seconds=10, retry_max=1)
+    sw.queue_take("w1", "q", now_ts=100.0)
+    sw.queue_take("w2", "q", now_ts=100.0)
+    acts = sw.queue_sweep(now_ts=200.0)          # both leases long expired
+    q = sw.d["queues"]["q"]
+    check("a dead queue's expired claims are reclaimed WITHOUT any worker "
+          "calling take",
+          lambda: eq([(a["worker"], a["item_id"], a["outcome"])
+                      for a in acts if a["kind"] == "lease_reclaimed"],
+                     [("w1", "a", "requeued"), ("w2", "b", "requeued")]))
+    check("…the items really are back in the queue and nothing is claimed",
+          lambda: eq((sorted(i["id"] for i in q["pending"]), q["claimed"]),
+                     (["a", "b", "c"], {})))
+    check("…and the workers are freed to be handed work again (stream reset)",
+          lambda: eq([q["per_worker"][w]["stream"] for w in ("w1", "w2")],
+                     [0, 0]))
+    check("it also reports the OTHER half of the deadlock: work pending and "
+          "nobody holding any of it",
+          lambda: eq([a for a in acts if a["kind"] == "idle_with_work"],
+                     [{"qid": "q", "kind": "idle_with_work",
+                       "workers": ["w1", "w2"], "pending": 3}]))
+
+    live = swq("sweeper-live", lease_seconds=9999)
+    live.queue_take("w1", "q", now_ts=1.0)
+    check("a LIVE lease is never touched",
+          lambda: eq([a for a in live.queue_sweep(now_ts=2.0)
+                      if a["kind"] == "lease_reclaimed"], []))
+    dead = swq("sweeper-dead", lease_seconds=1, retry_max=0)
+    dead.queue_take("w1", "q", now_ts=1.0)
+    check("past retry_max a swept item is DEAD-LETTERED, not requeued "
+          "forever",
+          lambda: eq([a["outcome"] for a in dead.queue_sweep(now_ts=999.0)
+                      if a["kind"] == "lease_reclaimed"], ["dead_letter"]))
+    shut = swq("sweeper-closed")
+    shut.queue_close(USER, "q")
+    check("a closed queue is never swept",
+          lambda: eq(shut.queue_sweep(now_ts=999999.0), []))
+    ghost = Org.create("sweeper-ghost")
+    ghost.queue_create(USER, "q", mk(("a", [])))
+    ghost.d["queues"]["q"]["spawn"] = {"workers": ["gone"]}
+    check("no LIVE worker ⇒ nothing to re-drive (a dead crew is the user's "
+          "problem, not a message loop)",
+          lambda: eq(ghost.queue_sweep(now_ts=1.0), []))
+
     print("§7 ordered:true — global concurrency 1")
     ordered = Org.create("ordered")
     ordered.queue_create(USER, "q", mk(("head", ["a"]), ("tail", ["b"])),

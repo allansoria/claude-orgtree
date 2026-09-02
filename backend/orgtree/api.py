@@ -561,6 +561,11 @@ async def _wire_notify() -> None:  # type: ignore[unused-function]  # registered
     # children, which is also their restart-recovery (the doc is the registry)
     supervisor.start_watchdog_engine()
     supervisor.start_extern_sweeper()          # D-166
+    # the work-queue sweeper: the ONE recovery path that does not wait for a
+    # turn to end or a `take` to be called. Without it a queue whose workers
+    # all went idle holding stale claims sits forever (measured 2026-09-01,
+    # 18/20 items, both leases expired an hour earlier, no error anywhere).
+    supervisor.start_queue_sweeper()
     # FR-27: the primed-restart engine. Same shape and same reason as the
     # watchdog scanner above — the durable record is the registry and this is
     # only its runtime attachment, which is exactly what makes an armed prime
@@ -2835,7 +2840,13 @@ def _usage_reading() -> dict[str, Any]:
             continue
         if not p.get("available"):
             continue
-        rows = {str(x.get("kind")): x.get("percent")
+        # ⚠ the percent alone is not enough: a percentage is only comparable
+        # WITHIN one window. A run that spans a reset reads 65 -> 29 and
+        # computes a delta of -36, which is worse than no number at all
+        # (measured 2026-09-01 — the 20-file run crossed the 23:20 reset).
+        # `resets_at` is what makes the two readings comparable or not.
+        rows = {str(x.get("kind")): {"pct": x.get("percent"),
+                                     "resets_at": x.get("resets_at")}
                 for x in (p.get("limits") or [])
                 if isinstance(x.get("percent"), int)}
         if rows:
