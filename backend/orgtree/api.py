@@ -2820,6 +2820,24 @@ async def queue_close(slug: str, qid: str, request: Request) -> dict[str, Any]:
     return r
 
 
+@app.post("/api/orgs/{slug}/queues/{qid}/items/{item_id}/requeue")
+async def queue_requeue(slug: str, qid: str, item_id: str,
+                        request: Request) -> dict[str, Any]:
+    """Put one dead letter back behind live work with a fresh retry budget."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+            r = org.queue_requeue(USER, qid, item_id)
+        except LedgerError as e:
+            raise HTTPException(404 if "no such queue" in str(e) else 422,
+                                str(e))
+        store.save_org(org)
+    await hub.changed(slug)
+    return r
+
+
 def _usage_reading() -> dict[str, Any]:
     """Quota standing across the pools we can read, as
     `{pool: {kind: percent}}` — for `Org.queue_stamp_usage`.

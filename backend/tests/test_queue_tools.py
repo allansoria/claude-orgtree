@@ -62,6 +62,132 @@ def mk(*specs):
             for i, w in specs]
 
 
+def test_queue_requeue():
+    print("§5b dead-letter requeue — fresh work, guarded at both layers")
+    retry = Org.create("retry")
+    retry.queue_create(USER, "q", mk(("bad", ["bad.py"])), {"retry_max": 0})
+    retry.queue_take("worker", "q", 30.0)
+    retry.queue_fail("worker", "q", "bad", "still broken")
+    moved = retry.queue_requeue(USER, "q", "bad")
+    pending = retry.d["queues"]["q"]["pending"]
+    check("requeue removes the dead letter and appends fresh pending work",
+          lambda: eq((moved, retry.d["queues"]["q"]["failed"], pending),
+                     ({"qid": "q", "item_id": "bad", "pending": 1,
+                       "failed": 0}, [], [{"id": "bad",
+                                            "payload": {"n": "bad"},
+                                            "writes": ["bad.py"],
+                                            "attempts": 0}])))
+    check("a naturally drained queue becomes runnable again",
+          lambda: eq(retry.d["queues"]["q"]["phase"], "draining"))
+    retaken = retry.queue_take("next-worker", "q", 31.0)
+    check("a worker can take the requeued item with attempts reset",
+          lambda: eq((retaken["item"]["id"], retaken["item"]["attempts"]),
+                     ("bad", 0)))
+    raises("is not in the dead-letter list",
+           lambda: retry.queue_requeue(USER, "q", "not-failed"))
+
+    guarded = Org.create("retry-writes")
+    guarded.queue_create(
+        USER, "q", mk(("bad", ["x.json"]),
+                      ("sibling", ["x.json", "y.json"]),
+                      ("blocker", ["y.json"])),
+        {"retry_max": 0, "workers": 4, "workspace": "per-worker"})
+    guarded.queue_take("failing", "q", 1.0)
+    blocker = guarded.queue_take("blocker-worker", "q", 1.0)
+    guarded.queue_fail("failing", "q", "bad", "broken")
+    guarded.queue_requeue(USER, "q", "bad")
+    retaken = guarded.queue_take("retry-worker", "q", 2.0)
+    blocked = guarded.queue_take("other-worker", "q", 2.0)
+    check("requeue preserves writes and the concurrency gate still blocks a "
+          "second writer",
+          lambda: eq((blocker["item"]["id"], retaken["item"]["id"],
+                      retaken["item"]["writes"], blocked,
+                      [item["id"] for item in
+                       guarded.d["queues"]["q"]["pending"]]),
+                     ("blocker", "bad", ["x.json"], {"empty": True},
+                      ["sibling"])))
+
+    reducing = Org.create("retry-reducing")
+    reducing.queue_create(USER, "q", mk(("bad", ["x.json"])),
+                          {"retry_max": 0,
+                           "reducer": {"tier": "haiku"}})
+    reducing.queue_take("worker", "q", 1.0)
+    reducing.queue_fail("worker", "q", "bad", "broken")
+    raises("is reducing — wait for the reducer to finish, then requeue",
+           lambda: reducing.queue_requeue(USER, "q", "bad"))
+    check("a reducing refusal leaves the dead letter untouched",
+          lambda: eq((reducing.d["queues"]["q"]["phase"],
+                      [item["id"] for item in
+                       reducing.d["queues"]["q"]["failed"]],
+                      reducing.d["queues"]["q"]["pending"]),
+                     ("reducing", ["bad"], [])))
+
+    closed = Org.create("retry-closed")
+    closed.queue_create(USER, "q", mk(("bad", [])), {"retry_max": 0})
+    closed.queue_take("worker", "q", 1.0)
+    closed.queue_fail("worker", "q", "bad", "broken")
+    closed.queue_close(USER, "q")
+    raises("queue 'q' is closed",
+           lambda: closed.queue_requeue(USER, "q", "bad"))
+    raises("no such queue: 'missing'",
+           lambda: retry.queue_requeue(USER, "missing", "bad"))
+
+    from fastapi.testclient import TestClient
+    from orgtree import api
+
+    slug = "retry-http"
+    try:
+        store.delete_org(slug)
+    except LedgerError:
+        pass
+    routed = store.create_org(slug)
+    with store.DOC_LOCK:
+        routed.queue_create(USER, "q", mk(("bad", [])), {"retry_max": 0})
+        routed.queue_take("worker", "q", 1.0)
+        routed.queue_fail("worker", "q", "bad", "broken")
+        routed.queue_create(USER, "reducing", mk(("bad", ["x.json"])),
+                            {"retry_max": 0,
+                             "reducer": {"tier": "haiku"}})
+        routed.queue_take("reducer-worker", "reducing", 1.0)
+        routed.queue_fail("reducer-worker", "reducing", "bad", "broken")
+        store.save_org(routed)
+    client = TestClient(api.app)
+    response = client.post(
+        f"/api/orgs/{slug}/queues/q/items/bad/requeue")
+    check("the HTTP endpoint persists a successful requeue",
+          lambda: eq((response.status_code, response.json(),
+                      store.load_org(slug).queue_status("q")["pending"]),
+                     (200, {"qid": "q", "item_id": "bad", "pending": 1,
+                            "failed": 0}, ["bad"])))
+    response = client.post(
+        f"/api/orgs/{slug}/queues/q/items/not-failed/requeue")
+    check("the HTTP endpoint maps a non-dead-letter item to 422",
+          lambda: eq(response.status_code, 422))
+    response = client.post(
+        f"/api/orgs/{slug}/queues/reducing/items/bad/requeue")
+    check("the HTTP endpoint maps reducing to 422 without moving the item",
+          lambda: eq((response.status_code,
+                      store.load_org(slug).queue_status("reducing")["failed"]),
+                     (422, [{"id": "bad", "reason": "broken",
+                             "attempts": 1}])))
+    with store.DOC_LOCK:
+        routed = store.load_org(slug)
+        routed.queue_close(USER, "q")
+        store.save_org(routed)
+    response = client.post(
+        f"/api/orgs/{slug}/queues/q/items/bad/requeue")
+    check("the HTTP endpoint maps a closed queue to 422",
+          lambda: eq(response.status_code, 422))
+    response = client.post(
+        f"/api/orgs/{slug}/queues/missing/items/bad/requeue")
+    check("the HTTP endpoint maps an unknown queue to 404",
+          lambda: eq(response.status_code, 404))
+    try:
+        store.delete_org(slug)
+    except LedgerError:
+        pass
+
+
 def main():
     print("§1 MCP cards + /api/agent dispatch")
     cards = {c["name"]: c for c in mcptool.TOOLS}
@@ -165,6 +291,7 @@ def main():
                              for f in fail.d["queues"]["q"]["failed"]]),
                      ({"dead_letter": True, "queue_drained": True}, [{
                          "id": "bad", "payload": {"n": "bad"},
+                         "writes": ["bad.py"],
                          "reason": "still broken", "attempts": 2,
                          "cost_usd": 0.0, "turns": 0}])))
     check("a worker-path dead-letter is _final_pending too (its turn is "
@@ -174,6 +301,8 @@ def main():
     check("dead-letter drops the claim and does not auto-take",
           lambda: eq((fail.d["queues"]["q"]["claimed"],
                       fail.d["queues"]["q"]["pending"]), ({}, [])))
+
+    test_queue_requeue()
 
     print("§6 lease expiry — reclaim without sleeping")
     lease = Org.create("lease")

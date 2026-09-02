@@ -2620,6 +2620,7 @@ class Org:
             item["attempts"] = attempts
             if attempts > retry_max:
                 failed.append({"id": item["id"], "payload": item["payload"],
+                               "writes": item["writes"],
                                "reason": "lease expired",
                                "attempts": attempts})
             else:
@@ -2755,7 +2756,8 @@ class Org:
         item["attempts"] = attempts
         if attempts > int(cast("dict[str, Any]", q["config"])["retry_max"]):
             cast("list[dict[str, Any]]", q["failed"]).append(
-                {"id": item_id, "payload": item["payload"], "reason": reason,
+                {"id": item_id, "payload": item["payload"],
+                 "writes": item["writes"], "reason": reason,
                  "attempts": attempts, "cost_usd": 0.0, "turns": 0})
             outcome = "dead_letter"
         else:
@@ -3047,6 +3049,7 @@ class Org:
         else:
             entry: dict[str, Any] = {
                 "id": item_id, "payload": item["payload"],
+                "writes": item["writes"],
                 "reason": reason, "attempts": attempts,
                 "cost_usd": acc_cost, "turns": acc_turns,
             }
@@ -3061,6 +3064,36 @@ class Org:
         if self._queue_check_drained(q, qid):
             out["queue_drained"] = True
         return out
+
+    def queue_requeue(self, actor: str, qid: str,
+                      item_id: str) -> dict[str, Any]:
+        """Re-offer one dead letter as fresh work. Re-normalising is what
+        keeps failure bookkeeping out of the pending contract, including on
+        older queue docs whose dead letters carry a different field set."""
+        q = self._queue(qid)
+        if q.get("closed"):
+            raise LedgerError(f"queue {qid!r} is closed")
+        if q.get("phase") == "reducing":
+            raise LedgerError(
+                f"queue {qid!r} is reducing — wait for the reducer to finish, "
+                "then requeue")
+        failed = cast("list[dict[str, Any]]", q["failed"])
+        found = next((i for i, entry in enumerate(failed)
+                      if entry.get("id") == item_id), None)
+        if found is None:
+            raise LedgerError(
+                f"item {item_id!r} is not in the dead-letter list of {qid!r}")
+        entry = failed[found]
+        fresh = self._norm_queue_items([{**entry, "attempts": 0}])[0]
+        del failed[found]
+        pending = cast("list[dict[str, Any]]", q["pending"])
+        pending.append(fresh)
+        if q.get("phase") == "done":
+            q["phase"] = "draining"
+        self._log("queue_requeue", actor,
+                  {"qid": qid, "item_id": item_id}, [])
+        return {"qid": qid, "item_id": item_id,
+                "pending": len(pending), "failed": len(failed)}
 
     def _queue_check_drained(self, q: dict[str, Any], qid: str) -> bool:
         """Tail of queue_done / queue_fail: if the queue just emptied — no

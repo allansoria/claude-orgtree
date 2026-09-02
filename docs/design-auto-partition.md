@@ -164,26 +164,36 @@ the user (or an explicit second call) accepts.
 ### Inc C — surface (SHIPPED)
 - The `QueuePanel` renders a plan (items, overlaps, refusals) with an accept
   action; `queue_create` from an accepted plan.
+- Inc D (below) extends the same panel to the run controls.
 
-### Inc D — the full queue surface (the UI is NOT complete without this)
+### Inc D — the full queue surface (LANDED — pending live-test)
 
-Inc C shipped only *plan → create → read-only status*. The panel can propose
-a partition and write a `pending` queue — and then there is no control for
-anything that actually runs it. Every backend capability past `queue_create`
-is unreachable from the browser:
+Inc C shipped only *plan → create → read-only status*. The panel could propose
+a partition and write a `pending` queue — and then there was no control for
+anything that actually runs it. Inc D closes that: the create form grew a
+`config` block (scalar knobs + a worker-templates editor + a reducer block),
+each `queue-status` section gained spawn/close controls, and the dead-letter
+list gained a per-item requeue. One new backend endpoint
+(`POST …/queues/{qid}/items/{item_id}/requeue`) plus an additive `writes` key
+on every dead-letter record; everything else was fields and endpoints that
+already existed.
 
-| Backend capability | endpoint / field | UI control today |
-|---|---|---|
-| queue `config` on create | `POST …/queues` `config{}` — `workers`, `retry_max`, `per_item_budget_usd`, `per_item_turn_cap`, `lease_seconds`, `items_per_session`, `workspace`, `ordered` | none — pure `QUEUE_DEFAULTS` (`ledger.py` `QUEUE_DEFAULTS`) |
-| worker crew | `config.worker_template` / `config.worker_templates[]` — per-worker `{tier, model, charter}`, the mixed-crew feature (`e1414f3`) | none |
-| reducer | `config.reducer` — `{tier, add_dirs[], charter}` | none |
-| **start the queue** | `POST …/queues/{qid}/spawn` `{repo_root, base_ref}` | **none — a created queue can never be spawned from the UI** |
-| stop the queue | `POST …/queues/{qid}/close` | none |
-| dead-letter / retry visibility | `queue_status.failed[]` (`{id, reason, attempts}`) | counts + cost only; `failed[]` is fetched and dropped |
-| explicit `items` (non-partition) | `POST …/queues` `items[]` | plan-only |
+The gap Inc D was commissioned to close:
 
-**Scope.** Bring the panel up to the backend it already talks to. No new
-backend — every endpoint and field above exists.
+| Backend capability | endpoint / field | before Inc D | after |
+|---|---|---|---|
+| queue `config` on create | `POST …/queues` `config{}` — `workers`, `retry_max`, `per_item_budget_usd`, `per_item_turn_cap`, `lease_seconds`, `items_per_session`, `workspace`, `ordered` | none — pure `QUEUE_DEFAULTS` | ✅ `config` block |
+| worker crew | `config.worker_template` / `config.worker_templates[]` — per-worker `{tier, model, charter}`, the mixed-crew feature (`e1414f3`) | none | ✅ repeatable rows + model picker |
+| reducer | `config.reducer` — `{tier, add_dirs[], charter}` | none | ✅ reducer block |
+| **start the queue** | `POST …/queues/{qid}/spawn` `{repo_root, base_ref}` | **none — a created queue could never be spawned from the UI** | ✅ spawn button |
+| stop the queue | `POST …/queues/{qid}/close` | none | ✅ close button |
+| dead-letter requeue | `queue_status.failed[]` + `POST …/queues/{qid}/items/{id}/requeue` (new) | list rendered, no action | ✅ per-item `↻` |
+| explicit `items` (non-partition) | `POST …/queues` `items[]` | plan-only | plan-only (still deferred) |
+
+**Scope.** Bring the panel up to the backend it already talks to. The only
+new backend is one endpoint — the per-item `requeue` — plus an additive
+`writes` key on dead-letter records; everything else is fields and endpoints
+that already existed.
 
 - **Create form gains a `config` block.** One collapsible group with the
   eight scalar knobs, each defaulting to and placeholder-showing its
@@ -194,34 +204,59 @@ backend — every endpoint and field above exists.
   Zero rows ⇒ send neither key (backend hires `workers` copies of the
   built-in `WORKER_CHARTER`). One row ⇒ `worker_template`. Two or more ⇒
   `worker_templates[]`. Show the effective worker count
-  (`max(workers, len(templates))`, per `queue_spawn_plan`).
+  (`max(workers, len(templates))`, per `queue_spawn_plan`). `tier` is a
+  dropdown built from `ALL_TIERS`, `<optgroup>`-grouped by provider
+  (`providerOf` / `PROVIDER_LABEL`), blank until chosen. Each row's `model`
+  field carries a **browse** button that opens the reusable
+  `OpenRouterModelPicker` (the same catalogue the hire flow uses); choosing
+  a model fills `model` with its id and, when the row's `tier` is still
+  blank, adopts the model's price band as the tier. The reducer's `tier` is
+  the same dropdown, with a "(backend default)" blank option.
 - **Reducer block.** `tier` select, `add_dirs[]` (`{path, mode}` rows),
   `charter` textarea. Pre-fill the charter from `REDUCER_CHARTER` with
   `{qid}` substituted so a reviewer edits rather than writes from scratch.
-- **Spawn control on each `pending` queue.** A "spawn N workers" button in
+- **Spawn control on each un-spawned queue.** A "spawn N workers" button in
   the `queue-status` section. When `config.workspace == "per-worker"` it
-  must collect `repo_root` (required — the 422 says so) and `base_ref`
-  (default `HEAD`). Disable once `spawn.workers` is set; surface the 409
-  ("already spawned") inline.
-- **Close control.** A "close queue" button on any non-`done` queue, behind
+  collects `repo_root` (required — the 422 says so) and `base_ref` (default
+  `HEAD`). The whole control drops out once `spawn.workers` is set or the
+  queue is stopped; the 409 ("already spawned") surfaces inline and the next
+  status poll redraws without the button.
+- **Close control.** A "close queue" button on any non-stopped queue, behind
   a confirm; it is idempotent so a double-click is harmless.
-- **Dead-letter view.** Render `failed[]` as a small table (`id`, `attempts`,
-  `reason`) inside `queue-status` whenever it is non-empty — this is the
-  §7 "refusals/failures read as failure" surface and it is currently
-  invisible.
-- **No new safety story.** `queue_create` already re-plans under the doc
-  lock (§7 listing drift) and gates overlap on `shared`; `spawn` is already
-  one-shot and loopback-only. The UI additions carry none of the
-  enforcement — same as Inc C, the browser form is a convenience over
-  endpoints that defend themselves.
-- Tests: the create request omits unset `config` keys; a single template
-  row serialises to `worker_template` and two to `worker_templates`; the
-  spawn button is absent on a `shared` queue's `repo_root` field and
-  present-and-required on a `per-worker` one; `failed[]` renders iff
-  non-empty.
-
-Until Inc D lands, the honest description of the queue UI is "propose and
-stage a partition"; running one is still an API/tool exercise.
+- **Dead-letter requeue.** The "dead letters" list was already rendered;
+  Inc D adds a per-item `↻` calling
+  `POST …/queues/{qid}/items/{item_id}/requeue`. The endpoint re-normalises
+  the failed entry back into the pending contract (so failure bookkeeping —
+  `reason`, `cost_usd`, `turns` — never leaks into a pending item) and
+  resets `attempts` to 0. Two guards, both mirrored in the button's
+  visibility (`phase ∈ {draining, done} && !closed`):
+    - a `closed` queue is refused;
+    - a `reducing` queue is refused — a requeued item there would sit past
+      the `phase == "draining"` gate that `_queue_take_next`, `queue_sweep`
+      and `_queue_check_drained` all key on, and strand permanently once the
+      reducer closes the queue.
+  A requeue from `phase == "done"` restores `"draining"` so `queue_sweep`'s
+  `idle_with_work` re-drives the still-live crew. For this to carry the
+  right write-set, **all three dead-letter creation paths now persist
+  `writes`** (`_queue_take_next` reclaim, `_queue_reclaim`, `queue_fail`) —
+  an additive key; pre-existing dead letters without it normalise to `[]`.
+- **No new safety story for the UI.** `queue_create` already re-plans under
+  the doc lock (§7 listing drift) and gates overlap on `shared`; `spawn` is
+  already one-shot and loopback-only. The browser form is a convenience
+  over endpoints that defend themselves.
+- Tests: **frontend** `queuepanel.test.tsx` — create omits unset `config`
+  keys; 1 template row ⇒ `worker_template`, 2 ⇒ `worker_templates[]`; a
+  tier-less template row blocks create; the spawn button's `repo_root`
+  field is present-and-required for `per-worker` and absent for `shared`,
+  and the whole control is gone once spawned or done; the model catalogue
+  fills a row and only adopts the band when the tier is blank; the tier
+  field is a provider-grouped `<select>` carrying every `ALL_TIERS` entry.
+  **backend**
+  `test_queue_tools.py::test_queue_requeue` — requeue moves an item back and
+  a worker retakes it with `attempts == 0`; `writes` survives and the
+  concurrency gate still blocks a second writer; `reducing` / `closed` /
+  unknown-queue all refuse at both the model and HTTP layers without
+  mutating the dead-letter list.
 
 ## 6. Deferred (explicit non-goals)
 
