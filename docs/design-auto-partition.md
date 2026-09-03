@@ -321,3 +321,58 @@ an explicit-`items` create path that keeps a plan-style dry run, and a
 - **Refusals read as failure.** A refusal is the feature working; the message
   must name the rule and the fix ("items 0003 and 0007 both write
   simic.json — use group-by-field on `file`, or workspace: per-worker").
+
+## 8. Future direction — the backlog-shaped job (note, not scoped)
+
+`ENGINE_BACKLOG.md` (mtg-gm) was the case that exposed the ceiling. It is a
+list of ~90 engine gaps, but running it is nothing like the card review:
+
+- the write-sets are **not disjoint** — almost every entry lands in one of
+  four shared files (`effects.py`, `targeting.py`, `triggers.py`,
+  `registry.py`), so `by-file` reproduces the mtg bug;
+- the entries are **heterogeneous** — some become a new `cards/hooks/<name>.py`
+  (disjoint, parallel-safe), some a shared primitive (entangled,
+  judgement-heavy), some are duplicates or won't-fix;
+- deciding which is which is itself the work, and per `add-cards` it is a
+  **human call**;
+- so the real shape is a **pipeline**: triage (read-only, fan out wide) →
+  operator review → hooks queue (disjoint, fan out) → primitives (one strong
+  agent, mostly serial). Today the operator wires each stage by hand, reads
+  the output, hand-builds the next queue's item list from a subset, and
+  re-spawns.
+
+What orgtree would need to run that natively, roughly in value order:
+
+1. **Queue chaining.** A queue's reducer (or a dedicated `route` phase) can
+   emit one or more child queue specs `{strategy, units, config}` built from
+   the results — "the triage classification becomes the hooks queue's item
+   list". Either declared up front as a pipeline or produced dynamically.
+   Subsumes the "re-partitioning mid-run / dynamic refill" already deferred
+   in §6 and design-work-queue.md §4.
+
+2. **Heterogeneous items + lane routing.** An item carries a `class`; a
+   worker template carries `handles: [class]`; `_queue_take_next` only offers
+   a worker items it handles. Turns "mixed crew" from *same work, different
+   providers* into *different work, right tool* — a spark lane confirming
+   won't-fixes, a sonnet lane writing hooks, an opus lane on primitives, all
+   draining one queue.
+
+3. **A serialized write lane.** For non-disjoint writes, instead of dumping
+   everything on a single reducer: N proposer workers (`writes: []`) plus a
+   small applier pool (1–2) that takes a per-file advisory lock and applies
+   proposals incrementally. The reducer, pooled — so the apply step is not
+   one agent doing 90 edits in one turn.
+
+4. **Stage gates.** A queue phase can declare `pause_after` — surface a
+   summary to the operator and wait for `resume` before spawning the next
+   stage. Reuses the existing decision/notify machinery; makes the
+   triage→review→act pipeline a single artifact instead of three.
+
+5. **Item dependencies.** An item names `after: [item_id…]`; it is not
+   offered until those are `done`. A DAG, versus today's `ordered: true`
+   which serialises everything or nothing — needed when "add predicate X"
+   must land before "the op that uses X".
+
+None of this is scoped. The note exists so the next person sizing a
+backlog-style job sees the pipeline pattern and knows which primitives would
+collapse it into one run.
