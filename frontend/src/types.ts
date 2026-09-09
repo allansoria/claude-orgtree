@@ -706,6 +706,9 @@ export interface SweepResult {
 }
 
 export interface TreePayload {
+  /** work-queue ids only (ported 2026-09-09) - the panel polls each one's
+   *  status endpoint separately; full payloads stay out of the heartbeat */
+  queues?: string[]
   slug: string
   name: string
   workspace: string | null

@@ -10652,6 +10652,12 @@ class Org:
                          + sum(1 for r in self.d.get("scope_requests", [])
                                if r["status"] == "pending"),
             "tiers": self.d["tiers"],
+            # Queue ids only (ported 2026-09-09): the work-queue panel uses
+            # this cheap discovery list, then polls each computed queue_status
+            # endpoint. Full queue payloads (including opaque item payload and
+            # result data) stay OUT of the always-on tree heartbeat.
+            "queues": list(cast("dict[str, Any]",
+                                self.d.get("queues") or {}).keys()),
             # tier → model id, the org's own add-only table (2026-09-03): the
             # UI names an OpenRouter tier by its model, and a node running on
             # a favorite that was since DESELECTED has no other source for it

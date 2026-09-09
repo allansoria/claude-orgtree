@@ -19,6 +19,7 @@ import { bumpLive } from './livebus'
 import { AudienceFold, ConfirmModal, MailFolders, MailList, OrgCanvas, OrgRecord, RetiredFold } from './Canvas'
 import { KillSwitch } from './KillSwitch'
 import { DiskBrowser, DiskFullAlert } from './DiskBrowser'
+import { QueuePanel } from './QueuePanel'
 import { GitPanels, useGitPanels } from './git/panels'
 import type { GitContext } from './git/types'
 import {
@@ -1025,6 +1026,13 @@ export default function App() {
                   target="_blank" rel="noreferrer" title="orgtree on GitHub">
                   <GitHubIcon fontSize="inherit" /></a>
               </header>
+              {/* work queues (ported 2026-09-09). `workerModels` maps node id ->
+                  TIER, which is the whole model identity here - the panel splits
+                  spend by provider from it. */}
+              <QueuePanel slug={slug} qids={tree.queues ?? []}
+                workerModels={Object.fromEntries(
+                  [...flatNodes(tree)].map(([id, node]) => [id, node.tier]))}
+                onPlanned={() => refreshTree(slug)} />
               <OrgCanvas tree={tree} op={op} slug={slug} toast={toast}
                 mailEvt={mailEvt}
                 focusAgent={focusAgent}
