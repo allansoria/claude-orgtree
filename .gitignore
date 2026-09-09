@@ -4,6 +4,10 @@ docs/todos.md
 __pycache__/
 node_modules/
 dist/
+# hidden production source maps: emitted for server-side crash-report
+# resolution (crashreports.resolve_stack) and moved here, OUT of dist/, by
+# frontend/scripts/postbuild-sourcemaps.mjs. Build output, never committed.
+sourcemaps/
 .venv/
 shots*/
 

@@ -70,7 +70,9 @@ test('§3 Esc and the backdrop close; a click inside the panel does not', async 
   const { act } = await import('react')
   let closed = 0
   const v = await mountFrame({ close: () => { closed += 1 } })
-  const w = (globalThis as unknown as { window: Window }).window
+  const w = (globalThis as unknown as {
+    window: Window & { KeyboardEvent: typeof KeyboardEvent }
+  }).window
 
   await act(async () => {
     ; (v.el.querySelector('.git-workspace') as HTMLElement).click(); await flush()
@@ -95,7 +97,9 @@ test('§3b onEsc wins over close, so an open popover is dismissed first', async 
   const { act } = await import('react')
   let closed = 0, esc = 0
   const v = await mountFrame({ close: () => { closed += 1 }, onEsc: () => { esc += 1 } })
-  const w = (globalThis as unknown as { window: Window }).window
+  const w = (globalThis as unknown as {
+    window: Window & { KeyboardEvent: typeof KeyboardEvent }
+  }).window
   await act(async () => {
     w.document.dispatchEvent(
       new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
