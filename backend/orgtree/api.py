@@ -40,8 +40,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, model_validator
 
 from . import ledger as ledger_mod
-from . import (accounts, autopartition, codex_limits, limits, net, providers,
-               queueworker, sandbox, store, subproxy, supervisor)
+from . import (accounts, appsettings, autopartition, codex_limits, limits,
+               net, providers, queueworker, sandbox, store, subproxy,
+               supervisor)
 from .ledger import LedgerError, Org, USER, VIS_LEVELS, norm_dirs, norm_tools
 
 if TYPE_CHECKING:
@@ -239,6 +240,12 @@ def _public_denied(method: str, rest: str, slug: str) -> tuple[int, str] | None:
         # pending mid-task mail — reading it AND destroying the delivery.
         or rest.endswith("/steer")
         or rest == "/api/fs"                                 # filesystem browse
+        # the Git workspace is an operator surface end to end: it browses the
+        # machine's filesystem to discover repositories and can push/pull.
+        # `gitapi.operator` refuses public and bridge callers at the router,
+        # so this is the kiosk half of the same rule, stated where every
+        # other admin prefix is stated.
+        or re.match(r"^/api/orgs/[^/]+/git(?:/|$)", rest) is not None
         or (method == "PUT" and rest.endswith("/orgmd"))     # org.md edits
         or rest == "/api/agent"                              # node MCP gateway
         or rest == "/api/mcp-servers"
@@ -1943,6 +1950,47 @@ def charters_list() -> dict[str, Any]:
                         # shown on hover of a picked preset card (user spec)
                         "path": os.path.abspath(os.path.join(CHARTERS_DIR, f))})
     return {"charters": out}
+
+
+# ---------------------------------------------------- machine-wide settings
+# Ported from upstream (2026-09-08) alongside the Git workspace, TRIMMED to
+# the one key that workspace reads. Upstream's record carries four more
+# runtime choices (process warming, stale-working checkups, the MCP-readiness
+# admission gate, idle docket reminders); each belongs to a subsystem this
+# tree does not have. The route, the payload shape and the key name are kept
+# identical so porting the rest later is purely additive — and so a client
+# written against upstream needs no change.
+class RuntimePreference(Body):
+    git_periodic_fetch_enabled: bool | None = None
+
+
+def _runtime_preferences() -> dict[str, bool]:
+    return {"git_periodic_fetch_enabled": appsettings.git_periodic_fetch_enabled()}
+
+
+@app.get("/api/app-settings/runtime")
+async def runtime_preference_info() -> dict[str, bool]:
+    """Machine-wide runtime choices: they apply to every org under this
+    ORGTREE_DATA root, so they are not org document fields."""
+    from fastapi.concurrency import run_in_threadpool
+
+    return await run_in_threadpool(_runtime_preferences)
+
+
+@app.put("/api/app-settings/runtime")
+async def runtime_preference(body: RuntimePreference) -> dict[str, bool]:
+    """Update one runtime choice without disturbing the others."""
+    from fastapi.concurrency import run_in_threadpool
+
+    if body.git_periodic_fetch_enabled is None:
+        raise HTTPException(422, "one runtime setting is required")
+    try:
+        await run_in_threadpool(appsettings.set_git_periodic_fetch_enabled,
+                                body.git_periodic_fetch_enabled)
+        result = await run_in_threadpool(_runtime_preferences)
+    except (appsettings.AppSettingsUnreadable, OSError) as e:
+        raise HTTPException(500, str(e)) from e
+    return result
 
 
 @app.get("/api/mcp-servers")
@@ -6044,6 +6092,17 @@ async def org_ws(ws: WebSocket, slug: str) -> None:
         hub.leave(slug, ws)
 
 
+# Ported from upstream (2026-09-08). The Git workspace owns its own router
+# and its own background scheduler, so it mounts as a unit rather than
+# threading routes through this module. It MUST be included above the SPA
+# catch-all below: under FastAPI 0.141 an included router is appended to
+# `app.routes` as a whole, so a `/{path:path}` registered first would match
+# every git request and serve index.html with a 200.
+from . import gitapi, gitworkspace  # noqa: E402
+app.include_router(gitapi.router)
+app.router.add_event_handler("shutdown", gitworkspace.scheduler.stop)
+
+
 # ------------------------------------------------------------------- static
 if os.path.isdir(FRONTEND_DIST):
     app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")),
@@ -6113,6 +6172,7 @@ def _ws_impl() -> str | None:
         if importlib.util.find_spec(mod) is not None:
             return mod
     return None
+
 
 
 def main() -> None:

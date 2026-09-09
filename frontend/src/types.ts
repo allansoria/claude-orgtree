@@ -1229,3 +1229,13 @@ export interface UploadResult {
   path: string
   bytes: number
 }
+
+/** Machine-wide runtime preferences: they apply to every org under this
+ *  ORGTREE_DATA root, so they are not org fields. Ported with the Git
+ *  workspace (2026-09-08) and TRIMMED to the one key this tree's backend
+ *  serves — upstream carries four more (process warming, stale-working
+ *  checkups, the MCP-readiness gate, idle docket reminders), each owned by a
+ *  subsystem not ported here. See api.py's `_runtime_preferences`. */
+export interface RuntimeSettingsPayload {
+  git_periodic_fetch_enabled: boolean
+}

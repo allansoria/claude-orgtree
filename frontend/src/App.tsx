@@ -14,6 +14,9 @@ import { bumpLive } from './livebus'
 import { ConfirmModal, MailFolders, MailList, OrgCanvas, OrgRecord, RetiredFold, useEsc } from './Canvas'
 import { DiskBrowser, DiskFullAlert } from './DiskBrowser'
 import { QueuePanel } from './QueuePanel'
+import { GitWorkspace } from './GitWorkspace'
+import type { GitContext } from './git/types'
+import type { RefRoutes } from './git/refs'
 import {
   AutorenewIcon, BlockIcon, CheckIcon, ChevronRightIcon, CloseIcon, CopyIcon, EyeIcon, LanIcon,
   DataUsageIcon, DeleteIcon, ExpandMoreIcon, GitHubIcon, HearingIcon, HomeIcon, LockIcon,
@@ -128,6 +131,11 @@ export default function App() {
   const [showDefaults, setShowDefaults] = useState(false)   // global new-org defaults
   const [showAccounts, setShowAccounts] = useState(false)   // D-144 account registry
   const [showUsage, setShowUsage] = useState(false)         // host subscription usage bars
+  // the Git workspace, ported from upstream 2026-09-08. Upstream hosts it in
+  // a pinnable, poppable panel stack (git/panels.tsx) and can open several
+  // at once; here it is one modal at a time, opened either from the ⑂ button
+  // or by the `orgtree:git-open` event GitContextButton dispatches.
+  const [gitOpen, setGitOpen] = useState<GitContext | null>(null)
   const [killArmed, setKillArmed] = useState(false)  // the killswitch latch
   // the usage button GLOWS once a lane nears its wall (user feature
   // 2026-08-19), so a freeze stops being the first notice. It rides
@@ -150,6 +158,19 @@ export default function App() {
   // supervisor.build_info)
   const [build, setBuild] = useState<HostPayload['build'] | null>(null)
   useEffect(() => { getHost().then((h) => setBuild(h.build)).catch(() => {}) }, [])
+
+  // GitContextButton (git/GitContextButton.tsx) is rendered from cards that do
+  // not hold this state, so it asks through a window event rather than a prop
+  // chain — upstream's arrangement, kept so that component ports unchanged.
+  // The org check matters: a stale button from another org must not open here.
+  useEffect(() => {
+    const open = (event: Event) => {
+      const detail = (event as CustomEvent<GitContext>).detail
+      if (!BASE && detail?.slug === slug) setGitOpen(detail)
+    }
+    window.addEventListener('orgtree:git-open', open)
+    return () => window.removeEventListener('orgtree:git-open', open)
+  }, [slug])
   const wsRef = useRef<WebSocket | null>(null)
   useEffect(() => {
     const t = setInterval(() => setNowTick(Date.now()), 15000)
@@ -687,6 +708,9 @@ export default function App() {
                     onClick={() => setShowUsage(true)}>
                     <DataUsageIcon fontSize="inherit" /></button>}
                 {!tree.public &&
+                  <button className="iconbtn" title="Git repositories"
+                    onClick={() => setGitOpen({ slug })}>⑂</button>}
+                {!tree.public &&
                   <button onClick={() => setShowSettings(true)}><SettingsIcon fontSize="inherit" /> settings</button>}
                 <a className="gh-link" href="https://github.com/Maurdekye/claude-orgtree"
                   target="_blank" rel="noreferrer" title="orgtree on GitHub">
@@ -742,6 +766,22 @@ export default function App() {
       )}
       {showUsage && (
         <UsageModal close={() => setShowUsage(false)} />
+      )}
+      {gitOpen && slug && tree && (
+        <GitWorkspace slug={slug} context={gitOpen} toast={toast}
+          close={() => setGitOpen(null)}
+          routes={{
+            // the agent index the resolver judges against: `null` would mean
+            // "still loading", and by here the tree has landed, so an id that
+            // is not in this map really is absent
+            world: { org: slug, agents: new Map(
+              [...flatNodes(tree)].map(([id]) => [id, id])) },
+            // upstream focuses the referenced agent on its canvas; this tree
+            // has no imperative focus channel into OrgCanvas, so a click names
+            // the owner rather than pretending to navigate. Wiring a real
+            // focus prop is the follow-on if this proves worth it.
+            onOpen: (r) => toast([`branch owner: ${r.label}`]),
+          } satisfies RefRoutes} />
       )}
       {showAccounts && (
         <AccountsPanel toast={toast} close={() => setShowAccounts(false)} />

@@ -106,6 +106,17 @@ export const PROVIDER_LABEL: Record<string, string> = {
   openai: 'Codex', google: 'Gemini', openrouter: 'OpenRouter',
   antigravity: 'Antigravity', claude: 'Claude' }
 
+/** How a TIER is named to the user in prose. Added 2026-09-08 with the Git
+ *  workspace port, whose `TierChip` needs a tooltip for the tier letter.
+ *
+ *  In THIS tree every tier is a fixed vocabulary word — the five OpenRouter
+ *  bands included — so a tier is already its own label and this is identity.
+ *  It exists as the one door anyway: upstream, where an OpenRouter favorite
+ *  is a dynamic `or:<model id>` tier, this is where the model's label comes
+ *  from. Any surface printing a tier name should come through here so that
+ *  adding a dynamic tier later is a change in one place. */
+export const tierLabel = (tier: string): string => tier
+
 // ---------------------------------------------------------------- view types
 // The canvas overlays the payload's TreeNode with synthetic cards — the eye
 // root, the draft card, live lineage bearers — plus flatten()'s plumbing.

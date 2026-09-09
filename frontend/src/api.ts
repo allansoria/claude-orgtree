@@ -13,6 +13,7 @@ import type {
   SendMessageResult,
   SettingsRequest, SettingsResult, SweepPreview, SweepResult, TreePayload,
   AccountsPayload, AccountUsage, UsageAllPayload,
+  RuntimeSettingsPayload,
   UploadResult, UsagePayload, UsagePeek,
 } from './types'
 
@@ -78,7 +79,7 @@ const timeoutSignal = (ms: number): AbortSignal | undefined => {
 // the one wire-boundary cast in the app: runtime JSON is untyped, and each
 // endpoint's declared Promise<T> return type is the contract that types it.
 // T infers from that declared return at every call site - no `any` escapes.
-const req = <T,>(path: string, init?: RequestInit,
+export const req = <T,>(path: string, init?: RequestInit,
                  timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<T> =>
   fetch(u(path), init?.signal || !timeoutMs
     ? init
@@ -450,3 +451,13 @@ export function openWs(
   ws.onclose = () => { clearInterval(ping); onClose?.() }
   return ws
 }
+
+export const getRuntimeSettings = (): Promise<RuntimeSettingsPayload> =>
+  req('/api/app-settings/runtime')
+export const setGitPeriodicFetchEnabled = (
+  enabled: boolean,
+): Promise<RuntimeSettingsPayload> =>
+  req('/api/app-settings/runtime', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ git_periodic_fetch_enabled: enabled }),
+  })
