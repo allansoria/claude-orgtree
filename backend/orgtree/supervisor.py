@@ -14435,6 +14435,48 @@ def _run_one_turn_recorded(slug: str, nid: str,
                         # Persist the generation-owned decision before drain;
                         # a backend restart cannot resurrect stale evidence.
                         store.save_org(org)
+                # Work-queue items-per-session guard (ported 2026-09-09,
+                # design-work-queue.md §5). A v1 worker never dies mid-queue, so
+                # without this its context piles up across its whole stream (the
+                # measured 178k-bloat). Same in-place swap as the cache-protective
+                # compaction above, but fired on a COMPLETION boundary rather than
+                # an occupancy/forecast bar - the two are independent triggers and
+                # either may fire first.
+                #
+                # NOT a paste of the fork's version. Upstream treats a
+                # cheap-compact successor as a NEW EVIDENCE GENERATION, so a
+                # compaction that does not also retire the predecessor's cache
+                # evidence leaves this turn carrying a receipt for a session that
+                # no longer exists. This mirrors what the block above does after
+                # ITS swap: drop `cache_continuity`, and stand the cache decision
+                # down.
+                #
+                # It stands the decision DOWN rather than recomputing the
+                # forecast, which is the conservative half of upstream's own
+                # behaviour - see the `except Exception` arm above, which sets
+                # exactly these two to None. Claiming no cache evidence costs at
+                # most one unprimed turn; claiming STALE evidence mis-reports it.
+                # Recomputing via `_cache_forecast_now` here is a possible
+                # refinement, deliberately not taken blind.
+                if not is_cmd:
+                    _wq = org.queue_of_worker(nid)
+                    if _wq and org.queue_should_compact(nid, _wq):
+                        try:
+                            _rq = org.cheap_compact(SYSTEM, nid)
+                            export_predecessor_transcript(
+                                org, nid,
+                                old_sid=str(_rq.get("old_session") or ""),
+                                reason="cheap_compact")
+                            org.node(nid).pop("cache_continuity", None)
+                            cache_forecast_event = None
+                            cache_attempt = None
+                            org.queue_note_compacted(nid, _wq)
+                            store.save_org(org)
+                            print(f"[orgtree] {slug}/{nid}: queue "
+                                  f"cheap-compact (items-per-session "
+                                  f"boundary on '{_wq}')")
+                        except LedgerError:
+                            pass
                 pending = None if is_cmd \
                     else (org.d.get("notices") or {}).pop(nid, None)
                 mail = [] if is_cmd else org.take_mail(nid)
@@ -18739,6 +18781,19 @@ def _after_turn(slug: str, nid: str, org: Org, res: dict[str, Any],
         # Preserve every other provider's established parsing contract. The
         # strict validation above belongs only to OpenRouter precedence.
         cost = float(res.get("total_cost_usd") or 0.0)
+    # Work-queue per-item breaker (ported 2026-09-09). Own lock/save, no-op for
+    # non-workers.
+    #
+    # ⚠ PLACEMENT IS LOAD-BEARING, and is NOT where the fork had it. The fork
+    # called this at the TOP of `_after_turn` and let the breaker read
+    # `res["total_cost_usd"]` itself. Upstream does not establish authoritative
+    # cost until the OpenRouter branch above rebuilds `res` with a normalized
+    # total; calling at the top would book the CLI's pre-normalization number
+    # against the item and silently mis-charge every OpenRouter-lane worker.
+    # Here both branches have settled — the OR branch rebuilt `res`, the `else`
+    # kept the provider's own contract — so the breaker sees the same figure
+    # the ledger is about to bank.
+    _queue_breaker_tick(slug, nid, res)
     mcp_success = _turn_observed_success(res, st)
     mcp_value = res.get("_mcp_tool_count")
     mcp_snapshot = (int(mcp_value)
@@ -19253,6 +19308,272 @@ def _after_turn(slug: str, nid: str, org: Org, res: dict[str, Any],
 # A real preTokens is a small non-negative integer. The ceiling is exact in a
 # float and ~9e15 times any true count, so nothing legitimate is near it.
 _PRE_TOKENS_MAX = 2 ** 53
+
+
+# ========================================================== work queues
+#
+# Module-level knobs the slab below reads.
+#: how many times a stalled queue worker is nudged back to `take` before it
+#: is left alone and the user is told once. Small on purpose: a worker that
+#: will restart does so on the first prod; one that will not is a model or
+#: lane fault (measured: an OpenRouter worker writing its tool call as prose),
+#: and prodding it forever burns quota to no effect while the other workers
+#: are already draining the queue.
+_QUEUE_NUDGE_MAX = 2
+
+#: how often the queue sweeper looks. A stuck queue is not urgent — the
+#: lease it is waiting on is measured in minutes — but it must be bounded,
+#: because before this the wait was FOREVER.
+_QUEUE_SWEEP_S = 60.0
+_queue_sweep_started = False
+
+# Ported from the fork 2026-09-09 (docs/design-work-queue.md,
+# design-auto-partition.md). These five functions have NO upstream
+# equivalent, so they arrive whole rather than being reconciled against
+# anything. They are placed here, after `_after_turn`, because that is the
+# function that drives `_queue_breaker_tick` — see the call site inside it.
+#
+# `_queue_breaker_tick` reaches `api._usage_reading()` through a deferred
+# in-function import to avoid the api<->supervisor cycle, exactly as it did
+# in the fork.
+
+
+def _turn_sig(res: dict[str, Any]) -> str:
+    """A cheap fingerprint of a turn's OUTPUT for the work-queue loop
+    detector (Inc 5): the final assistant text, clipped. Three turns running
+    that produce the identical fingerprint are a stuck item. Falls back to ''
+    (loop detection off, budget/turn caps still apply) when the leg reports
+    no final text."""
+    for k in ("result", "response", "text"):
+        v = res.get(k)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())[:240]
+    return ""
+
+
+def _queue_breaker_tick(slug: str, nid: str, res: dict[str, Any]) -> None:
+    """Inc 5 per-item circuit breaker — runs after EVERY worker turn (all
+    provider legs land in `_after_turn`). Books the turn against the node's
+    live queue claim; if it crossed the per-item budget / turn cap /
+    identical-turn-loop guard, dead-letters the ITEM (never the worker) and
+    re-drives the worker onto the next one. A queue drained by that fail
+    fires its reducer. No-op — one cheap `queue_of_worker` scan — for every
+    node that is not a live queue worker.
+
+    Own lock/load/save (DOC_LOCK is reentrant): it touches only
+    `queues[qid]`, which nothing else in `_after_turn` does, and the drive
+    sends happen after the save like everywhere else."""
+    redrive: tuple[str, str] | None = None
+    wake_reducer: str | None = None
+    try:
+        with store.DOC_LOCK:
+            org = store.load_org(slug)
+            if nid not in org.nodes:
+                return
+            qid = org.queue_of_worker(nid)
+            if not qid:
+                return
+            turn_cost = float(res.get("total_cost_usd") or 0.0)
+            # THE TURN BOUNDARY IS THE POINT (2026-09-01). `_queue_take_next`
+            # pauses a worker after `items_per_session` items precisely so
+            # this runs; clearing the stream counter here is what lets it be
+            # handed work again, and `paused` tells us it stopped because we
+            # told it to, not because the queue is empty — so it must be
+            # re-driven or it idles forever with items still pending.
+            paused = org.queue_end_stream(nid, qid)
+            if paused:
+                redrive = (nid, f"(orgtree) Stream boundary — you paused after "
+                                f"a batch of items so the org could book your "
+                                f"cost. Continue: call orgtree_queue_take for "
+                                f"'{qid}'. Stop only when it returns empty "
+                                f"WITHOUT a pause reason.")
+            # ⚠ ONE EXIT from here down, so the sends at the tail always run:
+            # every early `return` inside this lock used to drop a pending
+            # `redrive` on the floor, which for a paused worker means it idles
+            # forever with items still pending.
+            #
+            # This turn is the one during which the worker called queue_done /
+            # queue_fail for an item it just finished — book its cost to THAT
+            # item, not to whatever it claimed next.
+            booked = org.queue_book_final_turn(nid, qid, cost_usd=turn_cost)
+            claim = None if booked else cast(
+                "dict[str, Any]",
+                (org.d["queues"][qid].get("claimed") or {})).get(nid)
+            if claim:
+                # the worker's turn ended holding an item — book the turn
+                # against THAT item and check the per-item caps
+                item_id = str(claim.get("item_id") or "")
+                d = org.queue_tick_item(
+                    nid, qid, cost_usd=turn_cost, turn_sig=_turn_sig(res))
+                if d["trip"]:
+                    fail = org.queue_fail(nid, qid, item_id, str(d["reason"]),
+                                          _breaker=True)
+                    # a trip supersedes everything else: the item died, so
+                    # the worker is told THAT, not "finish it" or "continue"
+                    redrive = (nid,
+                               f"(orgtree) Queue item '{item_id}' was "
+                               f"auto-failed by the circuit breaker "
+                               f"({d['reason']}). Call orgtree_queue_take for "
+                               f"'{qid}' to pick up the next item.")
+                    if fail.get("queue_drained"):
+                        # the breaker can be a queue's LAST event, so it owes
+                        # the closing quota reading too
+                        from . import api as _api   # noqa: PLC0415 — cycle
+                        org.queue_stamp_usage(qid, "drained",
+                                              _api._usage_reading())
+                        fr = org.queue_fire_reducer(qid)
+                        if fr.get("reducer"):
+                            wake_reducer = str(fr["reducer"])
+            # ⚠ THE STALL CHECK RUNS ON BOTH PATHS, and that is the whole
+            # point. A worker stops legitimately for exactly one reason: a
+            # plain empty `take`. It can also stop holding NOTHING (a garbled
+            # tool call) or holding an UNFINISHED ITEM (measured: 21 real
+            # tool calls, then the turn just ended) — and the first cut of
+            # this checked only the claimless case, because it lived inside
+            # the `not claim` branch. The held-claim worker fell through to
+            # the breaker and was never nudged; only the 30-minute lease
+            # would have freed it.
+            if not paused and not redrive:
+                stall = org.queue_worker_stalled(nid, qid)
+                if stall["stalled"] and stall["nudges"] <= _QUEUE_NUDGE_MAX:
+                    held = stall.get("item_id")
+                    redrive = (nid, (
+                        f"(orgtree) Your turn ended while you still held "
+                        f"queue item '{held}' in '{qid}', unfinished. Finish "
+                        f"it now and call orgtree_queue_done (or "
+                        f"orgtree_queue_fail if you cannot) — as a REAL tool "
+                        f"call, not text. Do not take a new item until this "
+                        f"one is closed."
+                        if held else
+                        f"(orgtree) You are idle but queue '{qid}' still has "
+                        f"{stall['pending']} item(s) and you hold none. Call "
+                        f"orgtree_queue_take for '{qid}' now — as a REAL tool "
+                        f"call, not text. Stop only when it returns empty "
+                        f"without a pause."))
+                elif stall["stalled"] and stall["nudges"] == _QUEUE_NUDGE_MAX + 1:
+                    # say it once, to the user, and leave it alone
+                    org.to_user_inbox({
+                        "from": SYSTEM, "kind": "notice", "at": now_iso(),
+                        "body": (
+                            f"Queue '{qid}': worker '{nid}' stopped "
+                            + (f"holding item '{stall.get('item_id')}' "
+                               f"unfinished"
+                               if stall.get("item_id") else
+                               f"idle with {stall['pending']} item(s) left")
+                            + f" and did not restart after "
+                              f"{_QUEUE_NUDGE_MAX} nudges. Its model may not "
+                              f"be forming tool calls correctly. The other "
+                              f"workers carry on; nothing is lost — a held "
+                              f"item returns to the queue when its lease "
+                              f"expires.")})
+            store.save_org(org)      # telemetry and the stall counter are state
+    except Exception:                                           # noqa: BLE001
+        return
+    if redrive:
+        send_message(slug, redrive[0], redrive[1])
+    if wake_reducer:
+        send_message(slug, wake_reducer,
+                     "(orgtree) The work queue drained — the results are in "
+                     "your mail above. Reduce and report.")
+
+
+def _worker_busy(slug: str, nid: str) -> bool:
+    """Is this node mid-turn (or with a turn queued behind it)? The sweeper
+    must not nudge a worker that is already working — that is the difference
+    between rescuing a dead queue and interrupting a live one."""
+    st = state(slug, nid)
+    with _state_lock:
+        return bool(st.get("busy") or st.get("responding")
+                    or st.get("queue"))
+
+
+def _queue_sweep_tick() -> None:
+    """One pass over every org's draining queues (see `Org.queue_sweep`).
+
+    ⚠ THIS IS THE ONLY RECOVERY PATH THAT DOES NOT NEED SOMETHING TO HAPPEN
+    FIRST. Every other one hangs off a turn ending or a `take` being called,
+    and on 2026-09-01 that turned out to be a deadlock: two workers ended
+    their turns holding items, every worker went idle, so nothing called
+    take (no lease reclaim) and no turn ended (no stall check). The queue
+    sat at 18/20 for over an hour with both leases long expired and no error
+    anywhere. Recovery that only fires on activity cannot recover from
+    having none."""
+    for row in store.list_orgs():
+        slug = str(row.get("slug") or "")
+        if not slug:
+            continue
+        drives: list[tuple[str, str]] = []
+        try:
+            with store.DOC_LOCK:
+                org = store.load_org(slug)
+                if not org.d.get("queues"):
+                    continue
+                actions = org.queue_sweep()
+                if not actions:
+                    continue
+                for a in actions:
+                    qid = str(a["qid"])
+                    if a["kind"] == "lease_reclaimed":
+                        print(f"[orgtree] {slug}/{qid}: swept a dead claim "
+                              f"from {a['worker']} — item {a['item_id']} "
+                              f"{a['outcome']}")
+                        # the worker that lost it may be idle and able to work
+                        drives.append((str(a["worker"]),
+                                       f"(orgtree) Queue item "
+                                       f"'{a['item_id']}' was taken back from "
+                                       f"you — its lease expired while your "
+                                       f"turn was over. Call "
+                                       f"orgtree_queue_take for '{qid}' to "
+                                       f"pick up work again."))
+                    elif a["kind"] == "idle_with_work":
+                        # ⚠ "holds no claim" is NOT "doing nothing". A worker
+                        # that is mid-turn has simply not called `take` yet —
+                        # true of every worker in the seconds after a spawn —
+                        # and nudging it would interrupt the very work we are
+                        # asking for, once a minute. Runtime state is the
+                        # ledger's blind spot, so the filter lives here.
+                        idle = [w for w in cast("list[str]", a["workers"])
+                                if not _worker_busy(slug, w)]
+                        if not idle:
+                            continue
+                        print(f"[orgtree] {slug}/{qid}: {a['pending']} item(s) "
+                              f"pending and no worker holds anything — "
+                              f"re-driving {idle}")
+                        for w in idle:
+                            drives.append((w, (
+                                f"(orgtree) Queue '{qid}' has {a['pending']} "
+                                f"item(s) waiting and nobody is working. Call "
+                                f"orgtree_queue_take for '{qid}' — as a REAL "
+                                f"tool call. Stop only when it returns empty "
+                                f"without a pause reason.")))
+                store.save_org(org)
+        except Exception:                                        # noqa: BLE001
+            continue
+        # drives OUTSIDE the lock, like every other path here
+        for nid, text in drives:
+            try:
+                send_message(slug, nid, text)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+
+def start_queue_sweeper() -> None:
+    """The clock behind `_queue_sweep_tick`. Started beside the watchdog
+    engine; idle orgs cost one `list_orgs` and a `queues` key check."""
+    global _queue_sweep_started
+    if _queue_sweep_started:
+        return
+    _queue_sweep_started = True
+
+    def run() -> None:
+        while True:
+            time.sleep(_QUEUE_SWEEP_S)
+            try:
+                _queue_sweep_tick()
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    threading.Thread(target=run, daemon=True, name="queue-sweeper").start()
 
 
 def _boundary_pre_tokens(v: object) -> int | None:

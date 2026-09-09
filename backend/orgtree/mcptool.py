@@ -1575,6 +1575,91 @@ TOOLS: list[dict[str, Any]] = [
                         "required": ["node", "delta"]},
     },
     {
+        "name": "orgtree_queue_plan",
+        "description": (
+            "PROPOSE a work-queue partition — a dry run that creates nothing "
+            "and spends nothing. You supply the UNITS (what one piece of work "
+            "is) and pick a strategy; the paths each item may write are "
+            "DERIVED from the strategy, never from you — any `writes` you put "
+            "on a unit is ignored and reported. Strategies: 'group-by-field' "
+            "(units sharing payload[group_by], which must name a FILE — merged "
+            "into one item per file, the safe default when several units touch "
+            "the same file), 'readonly-fanout' (units write nothing; a reducer "
+            "writes the shared output — use this whenever you are unsure), "
+            "'by-item-output' (each unit produces new files under "
+            "out_prefix/<key>/), 'by-file' (one item per path in `files`), "
+            "'by-dir' (one item per directory in `dirs`). Returns {items, "
+            "stats, refusals}: a non-empty `refusals` means the plan is NOT "
+            "usable — each names the rule it broke and the fix. Report the "
+            "proposal to whoever asked; you cannot create the queue."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string"},
+                "strategy": {"type": "string",
+                             "enum": ["by-file", "by-dir", "group-by-field",
+                                      "readonly-fanout", "by-item-output"]},
+                "globs": {"type": "array", "items": {"type": "string"}},
+                "units": {"type": "array", "items": {"type": "object"}},
+                "group_by": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "dirs": {"type": "array", "items": {"type": "string"}},
+                "out_prefix": {"type": "string"},
+            },
+            "required": ["root", "strategy"],
+        },
+    },
+    {
+        "name": "orgtree_queue_take",
+        "description": (
+            "Claim the next eligible item from a work queue. You may hold "
+            "only one claim in a queue; finish it with orgtree_queue_done or "
+            "orgtree_queue_fail before taking again. Returns {item}, or "
+            "{empty: true} — and if that empty also carries `paused: true` "
+            "you have hit the queue's per-turn batch limit: END YOUR TURN, "
+            "you will be re-driven to continue. A plain empty means the queue "
+            "is drained; go idle."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"qid": {"type": "string"}},
+            "required": ["qid"],
+        },
+    },
+    {
+        "name": "orgtree_queue_done",
+        "description": (
+            "Record the result for your claimed queue item and atomically "
+            "claim the next eligible item. Returns {item}, or {empty: true} "
+            "— with `paused: true` meaning END YOUR TURN (batch limit, you "
+            "will be re-driven), without it meaning the queue is drained."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qid": {"type": "string"},
+                "item_id": {"type": "string"},
+                "result": {},
+                "cost_usd": {"type": "number"},
+                "turns": {"type": "integer"},
+            },
+            "required": ["qid", "item_id", "result"],
+        },
+    },
+    {
+        "name": "orgtree_queue_fail",
+        "description": (
+            "Fail your claimed queue item with a reason. It is requeued up "
+            "to retry_max, then moved to the dead-letter list."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qid": {"type": "string"},
+                "item_id": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["qid", "item_id", "reason"],
+        },
+    },
+    {
         "name": "orgtree_status",
         "description": ("Report your working status. REQUIRED when you finish or get "
                         "stuck: 'done' and 'blocked' notify your superior with your "

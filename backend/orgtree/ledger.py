@@ -118,6 +118,42 @@ def _q(x: float) -> float:
 MAX_DEPTH: Final = 1024
 MAX_CHILDREN: Final = 1024
 
+# Work-queue crew charters, ported from the fork 2026-09-09
+# (design-work-queue.md). `queue_spawn_plan` seeds a worker with the first
+# and `queue_reducer_plan` the second; both are overridable per queue.
+WORKER_CHARTER: Final[str] = (
+    "Loop: `orgtree_queue_take`. Do the work on the item. If you edit files "
+    "and are working in a git worktree, `git add -A && git commit` your "
+    "changes on your branch BEFORE finishing the item — the reducer merges "
+    "committed branches, not a dirty tree. Then `orgtree_queue_done` with "
+    "your result (pass `turns` = how many turns this item took, and "
+    "`cost_usd` if you know it) — it hands you the next item.\n"
+    "TWO KINDS OF EMPTY. `{empty: true, paused: true}` means you have hit "
+    "this queue's per-turn batch limit: END YOUR TURN immediately and say so "
+    "— you will be re-driven to continue, and the items are still there. "
+    "A plain `{empty: true}` with NO pause means the queue is genuinely "
+    "drained: stop and go idle. Never keep calling take against a pause.\n"
+    "Work ONE item at a time; do not carry "
+    "a finished item's detail into the next; if your context passes 60k, "
+    "compact. If a tool call returns \"unknown tool\" or you cannot read a "
+    "file, `orgtree_queue_fail` the item with that reason and continue — "
+    "never loop on it."
+)
+
+REDUCER_CHARTER: Final[str] = (
+    "You are the REDUCER for work queue '{qid}'. Every worker result is in "
+    "your mailbox below as one batch. Do this once, then stop:\n"
+    "1. Synthesise the results into the shared output(s) your task names — "
+    "YOU write those files; the workers only returned data.\n"
+    "2. If the workers used per-worker git worktrees, merge each branch "
+    "`wq/{qid}/w*` into the base branch one at a time, resolving conflicts; "
+    "report any branch that will not merge cleanly.\n"
+    "3. Send the user ONE report: every result accounted for, what you "
+    "wrote, which branches merged, and what is in the dead-letter list.\n"
+    "4. Call `orgtree_status` with status `done` — that closes the queue.\n"
+    "Do not call `orgtree_queue_take` — you are not a worker."
+)
+
 #: An ask that is still waiting on the user. Named once because three places
 #: ask the question and a fourth spelling would be a silent disagreement.
 OPEN_ASK_STATUS: Final = frozenset({"open", "pending"})
@@ -754,6 +790,10 @@ class Org:
             cur = cast("dict[str, Any]", _doc.setdefault(key, {}))
             for k, v in table.items():
                 cur.setdefault(k, v)
+        # work-queue state, ported from the fork 2026-09-09 (Inc 1): existing
+        # orgs reach the feature with an empty map, exactly like a fresh one.
+        # ADD ONLY - never rebuild a populated queue set on load.
+        _doc.setdefault("queues", {})
         # ☞ a price CHANGE (not an addition) needs its own migration under
         # the add-only rule: sonnet 3 → 2 (user ruling 2026-08-12, $2/M input
         # locked in). Only the OLD SHIPPED DEFAULT migrates — any other value
@@ -2987,6 +3027,1173 @@ class Org:
             "op": op, "actor": actor, "at": now(), "detail": detail,
             "warnings": warnings,
         })
+
+    # =========================================================== work queues
+    # A work queue (design-work-queue.md) is a pre-filled bag of disjoint items
+    # that N workers drain with orgtree_queue_take/done/fail (Inc 2) and one
+    # reducer closes (Inc 4). Inc 1 is state + lifecycle only: create, read
+    # status, close. No workers spawn, no reducer fires here.
+    #
+    # State lives at self.d["queues"][qid]; every mutation runs under
+    # store.DOC_LOCK at the caller, like every other op. An item is the LOCKED
+    # CONTRACT shape {id, payload, writes:[path], attempts}.
+    QUEUE_DEFAULTS: Final[dict[str, Any]] = {
+        "workers": 1,
+        "retry_max": 2,
+        "per_item_budget_usd": 0.50,
+        "per_item_turn_cap": 12,
+        "lease_seconds": 600,
+        "workspace": "per-worker",   # "shared" | "per-worker"
+        "items_per_session": 4,
+        "ordered": False,
+    }
+    _QID_RE: Final = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+    def _queue(self, qid: str) -> dict[str, Any]:
+        q = cast("dict[str, Any]", self.d.get("queues") or {}).get(qid)
+        if q is None:
+            raise LedgerError(f"no such queue: {qid!r}")
+        return cast("dict[str, Any]", q)
+
+    @staticmethod
+    def _norm_queue_items(items: Any) -> list[dict[str, Any]]:
+        """Validate + copy the item list into the LOCKED CONTRACT shape.
+        Rejects a missing payload, a non-string in `writes`, a bad `attempts`,
+        or a duplicate id. Order and ids are preserved as given (the partition
+        utility already assigned `f"{i:04d}"`)."""
+        if not isinstance(items, list) or not items:
+            raise LedgerError("a queue needs a non-empty list of items")
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for i, raw in enumerate(cast("list[Any]", items)):
+            if not isinstance(raw, dict):
+                raise LedgerError(f"queue item {i} is not an object")
+            it = cast("dict[str, Any]", raw)
+            if "payload" not in it:
+                raise LedgerError(f"queue item {i} has no 'payload'")
+            iid = str(it.get("id") or f"{i:04d}")
+            if iid in seen:
+                raise LedgerError(f"duplicate queue item id {iid!r}")
+            seen.add(iid)
+            writes = it.get("writes") or []
+            if (not isinstance(writes, list)
+                    or not all(isinstance(p, str) for p in cast("list[Any]", writes))):
+                raise LedgerError(
+                    f"queue item {iid} 'writes' must be a list of path strings")
+            attempts = it.get("attempts", 0)
+            if not isinstance(attempts, int) or isinstance(attempts, bool) \
+                    or attempts < 0:
+                raise LedgerError(
+                    f"queue item {iid} 'attempts' must be a non-negative int")
+            out.append({"id": iid, "payload": it["payload"],
+                        "writes": list(cast("list[str]", writes)),
+                        "attempts": attempts})
+        return out
+
+    @classmethod
+    def _norm_queue_config(cls, config: Any) -> dict[str, Any]:
+        """Fill defaults, type-check every knob, keep worker_template / reducer
+        opaque (Inc 3/4 read them) but shape-checked."""
+        if config is not None and not isinstance(config, dict):
+            raise LedgerError("queue config must be an object")
+        src = cast("dict[str, Any]", config or {})
+        cfg = dict(cls.QUEUE_DEFAULTS)
+        for k in ("workers", "retry_max", "per_item_turn_cap",
+                  "lease_seconds", "items_per_session"):
+            if k in src:
+                v = src[k]
+                if not isinstance(v, int) or isinstance(v, bool):
+                    raise LedgerError(f"config.{k} must be an integer")
+                cfg[k] = v
+        if "per_item_budget_usd" in src:
+            v = src["per_item_budget_usd"]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
+                raise LedgerError(
+                    "config.per_item_budget_usd must be a positive number")
+            cfg["per_item_budget_usd"] = float(v)
+        if "workspace" in src:
+            if src["workspace"] not in ("shared", "per-worker"):
+                raise LedgerError(
+                    "config.workspace must be 'shared' or 'per-worker'")
+            cfg["workspace"] = src["workspace"]
+        if "ordered" in src:
+            cfg["ordered"] = bool(src["ordered"])
+        if int(cfg["workers"]) < 1:
+            raise LedgerError("config.workers must be >= 1")
+        if int(cfg["retry_max"]) < 0:
+            raise LedgerError("config.retry_max must be >= 0")
+        for k in ("per_item_turn_cap", "lease_seconds", "items_per_session"):
+            if int(cfg[k]) < 1:
+                raise LedgerError(f"config.{k} must be >= 1")
+        wt = src.get("worker_template")
+        if wt is not None and not isinstance(wt, dict):
+            raise LedgerError("config.worker_template must be an object")
+        cfg["worker_template"] = wt or {}
+        # a MIXED CREW: one template per worker, so the queue can span
+        # provider lanes (and therefore quota pools). `workers` follows the
+        # list rather than sitting beside it and disagreeing.
+        wts = src.get("worker_templates")
+        if wts is not None:
+            if not isinstance(wts, list) or not wts:
+                raise LedgerError(
+                    "config.worker_templates must be a non-empty list of "
+                    "objects, one per worker")
+            for i, t in enumerate(cast("list[Any]", wts), start=1):
+                if not isinstance(t, dict):
+                    raise LedgerError(
+                        f"config.worker_templates[{i - 1}] is not an object")
+            cfg["worker_templates"] = list(cast("list[Any]", wts))
+            cfg["workers"] = len(cast("list[Any]", wts))
+        rd = src.get("reducer")
+        if rd is not None and not isinstance(rd, dict):
+            raise LedgerError("config.reducer must be an object or null")
+        cfg["reducer"] = rd
+        return cfg
+
+    @staticmethod
+    def _queue_overlaps(items: list[dict[str, Any]]) -> list[list[Any]]:
+        """Every path shared by two items, as [id_a, id_b, [shared...]] — the
+        same report shape partition.partition() produces. A read-only item
+        (writes == []) never collides."""
+        overlaps: list[list[Any]] = []
+        for a in range(len(items)):
+            wa = set(cast("list[str]", items[a]["writes"]))
+            if not wa:
+                continue
+            for b in range(a + 1, len(items)):
+                shared = wa & set(cast("list[str]", items[b]["writes"]))
+                if shared:
+                    overlaps.append([items[a]["id"], items[b]["id"],
+                                     sorted(shared)])
+        return overlaps
+
+    def queue_create(self, actor: str, qid: str, items: Any,
+                     config: Any = None) -> dict[str, Any]:
+        """Register a pre-filled work queue. `items` is the disjoint list from
+        partition.partition()["items"] (or an equivalent); each is
+        {id, payload, writes, attempts}. Inc 1: state only — nothing spawns.
+
+        Refuses an overlapping write-set on a SHARED workspace with no
+        serialisation escape (that is the mtg two-writers-one-file bug): the
+        fix is workspace:'per-worker', ordered:true, or a tighter partition.
+        On a per-worker workspace an overlap is recorded (`overlaps`) and
+        left for the reducer's serial merge."""
+        if actor != USER:
+            raise LedgerError("only the user can create a work queue")
+        qid = str(qid or "").strip()
+        if not self._QID_RE.match(qid):
+            raise LedgerError(
+                "queue id must be 1-64 chars of [a-z0-9-] and not start with '-'")
+        queues = cast("dict[str, Any]",
+                      cast("dict[str, Any]", self.d).setdefault("queues", {}))
+        if qid in queues:
+            raise LedgerError(f"queue {qid!r} already exists")
+        norm_items = self._norm_queue_items(items)
+        cfg = self._norm_queue_config(config)
+        overlaps = self._queue_overlaps(norm_items)
+        if overlaps and cfg["workspace"] == "shared" and not cfg["ordered"]:
+            a, b, paths = overlaps[0]
+            raise LedgerError(
+                f"items {a} and {b} both write {paths} and workspace is "
+                f"'shared' — two workers could corrupt that file "
+                f"({len(overlaps)} overlapping pair(s)). Use "
+                f"workspace:'per-worker', set ordered:true, or partition so "
+                f"each path has one owner.")
+        queues[qid] = {
+            "phase": "draining",
+            "pending": norm_items,
+            "claimed": {},
+            "done": [],
+            "failed": [],
+            "closed": False,
+            "config": cfg,
+            "created": now(),
+            "created_by": actor,
+            "closed_at": None,
+            "overlaps": overlaps,
+        }
+        self._log("queue_create", actor,
+                  {"qid": qid, "items": len(norm_items),
+                   "workers": cfg["workers"], "workspace": cfg["workspace"],
+                   "overlaps": len(overlaps)}, [])
+        return self.queue_status(qid)
+
+    def queue_status(self, qid: str) -> dict[str, Any]:
+        """A computed snapshot — no turn, no mutation. Full items stay in the
+        doc; this returns pending ids, the live claim table, and per-item
+        summaries for done / dead-letter, plus the running cost total."""
+        q = self._queue(qid)
+        pending = cast("list[dict[str, Any]]", q["pending"])
+        claimed = cast("dict[str, Any]", q["claimed"])
+        done = cast("list[dict[str, Any]]", q["done"])
+        failed = cast("list[dict[str, Any]]", q["failed"])
+        done_summaries = [
+            {"id": d["id"], "by": d.get("by"),
+             "cost_usd": float(d.get("cost_usd") or 0.0),
+             "turns": int(d.get("turns") or 0)}
+            for d in done]
+        failed_summaries = [
+            {"id": f["id"], "reason": f.get("reason"),
+             "attempts": int(f.get("attempts") or 0)}
+            for f in failed]
+        by_worker: dict[str, float] = {}
+        for d in done:
+            worker = str(d.get("by") or "")
+            if worker:
+                by_worker[worker] = by_worker.get(worker, 0.0) + float(
+                    d.get("cost_usd") or 0.0)
+        by_worker = {worker: round(cost, 6)
+                     for worker, cost in by_worker.items()}
+        return {
+            "qid": qid,
+            "phase": q["phase"],
+            "closed": bool(q.get("closed")),
+            "config": q["config"],
+            "counts": {
+                "pending": len(pending), "claimed": len(claimed),
+                "done": len(done), "failed": len(failed),
+                "total": len(pending) + len(claimed) + len(done) + len(failed),
+            },
+            "pending": [it["id"] for it in pending],
+            "claimed": claimed,
+            "done": done_summaries,
+            "failed": failed_summaries,
+            "items": (
+                [{"id": it["id"]} for it in pending]
+                + [{"id": claim.get("item_id"), "worker": worker,
+                    "turns": int(claim.get("turns") or 0),
+                    "cost_usd": float(claim.get("cost_usd") or 0.0),
+                    "lease_until": claim.get("lease_until")}
+                   for worker, claim in claimed.items()]
+                + done_summaries + failed_summaries
+            ),
+            "cost": {"total_usd": round(
+                sum(float(d.get("cost_usd") or 0.0) for d in done), 6),
+                "by_worker": by_worker,
+                "claimed_usd": round(sum(
+                    float(claim.get("cost_usd") or 0.0)
+                    for claim in claimed.values()), 6)},
+            "overlaps": q.get("overlaps", []),
+            # quota, not dollars — see queue_stamp_usage
+            "usage": self._queue_usage_report(q),
+            "spawn": q.get("spawn"),
+            "reduce": q.get("reduce"),
+            "per_worker": q.get("per_worker", {}),
+            "created": q.get("created"),
+            "drained_at": q.get("drained_at"),
+            "closed_at": q.get("closed_at"),
+        }
+
+    def queue_close(self, actor: str, qid: str) -> dict[str, Any]:
+        """Stop a queue: phase -> done, no further take/done/fail. Manual
+        override; the Inc 4 completion trigger will also land here on a
+        natural drain. Idempotent — closing a closed queue just returns
+        status."""
+        if actor != USER:
+            raise LedgerError("only the user can close a work queue")
+        q = self._queue(qid)
+        if not q.get("closed"):
+            q["closed"] = True
+            q["phase"] = "done"
+            q["closed_at"] = now()
+            self._log("queue_close", actor, {
+                "qid": qid,
+                "pending_dropped": len(cast("list[Any]", q["pending"])),
+                "claimed_dropped": len(cast("dict[str, Any]", q["claimed"])),
+            }, [])
+        return self.queue_status(qid)
+
+    def queue_delete(self, actor: str, qid: str) -> dict[str, Any]:
+        """Remove a queue record from the org entirely. This is the escape
+        hatch for a queue that can never run — created with no crew, so
+        `spawn` has no tier and `close` only parks it. Refused while a worker
+        still holds a claim: a live crew mid-item must be stopped first.
+
+        The record goes; per-worker worktrees on disk, if any, are left for
+        `git worktree prune` — deleting the ledger entry does no filesystem
+        I/O, same as `close`."""
+        if actor != USER:
+            raise LedgerError("only the user can delete a work queue")
+        q = self._queue(qid)                       # 404s "no such queue: …"
+        claimed = cast("dict[str, Any]", q.get("claimed") or {})
+        if claimed:
+            raise LedgerError(
+                f"queue {qid!r} has {len(claimed)} live claim(s) — close it "
+                "and stop the workers before deleting")
+        cast("dict[str, Any]", self.d.get("queues") or {}).pop(qid, None)
+        self._log("queue_delete", actor, {"qid": qid}, [])
+        return {"deleted": qid}
+
+    @staticmethod
+    def _queue_iso(ts: float) -> str:
+        """Render a queue test-seam timestamp in the ledger's ISO format."""
+        d = datetime.fromtimestamp(ts, timezone.utc)
+        return d.strftime("%Y-%m-%dT%H:%M:%S.") + \
+            f"{d.microsecond // 1000:03d}Z"
+
+    def _queue_take_next(self, worker: str, qid: str,
+                         now_ts: float) -> dict[str, Any]:
+        """Reclaim expired leases, then claim the next eligible item.
+
+        The public claim table stays in the locked-contract shape (item id +
+        lease metadata). The full item lives in a private sibling map while
+        claimed so expiry and done/fail can recover its payload and writes.
+        Callers hold store.DOC_LOCK; this helper deliberately takes no lock.
+
+        ⚠ AND IT PAUSES THE STREAM EVERY `items_per_session` ITEMS.
+        `queue_done` hands the next item back in the same call, so a worker
+        drains item after item INSIDE ONE TURN — measured 2026-09-01, three
+        workers each did four card files in a single turn. Everything orgtree
+        does per turn therefore never ran: no cost or occupancy booked (the
+        org read $0.00 for 20 minutes while the real burn was ~48% of a
+        session window), no compaction, and — worst — no circuit breaker,
+        because `_queue_breaker_tick` fires from `_after_turn`. The
+        protections were all wired to a boundary the design's own efficiency
+        had removed.
+
+        Rather than duplicate that machinery mid-turn, this MAKES the
+        boundary happen: after `items_per_session` items the worker is handed
+        `{"empty": true, "paused": true}` instead of work, so its turn ends,
+        `_after_turn` books the turn and runs the breaker and the compaction
+        guard, and the supervisor re-drives it for the next stream. Costs one
+        turn boundary per K items; buys back every guarantee."""
+        q = self._queue(qid)
+        if q.get("closed") or q.get("phase") != "draining":
+            raise LedgerError(f"queue {qid!r} is not draining")
+        pending = cast("list[dict[str, Any]]", q["pending"])
+        claimed = cast("dict[str, dict[str, Any]]", q["claimed"])
+        claimed_items = cast(
+            "dict[str, dict[str, Any]]", q.setdefault("_claimed_items", {}))
+        failed = cast("list[dict[str, Any]]", q["failed"])
+        config = cast("dict[str, Any]", q["config"])
+        retry_max = int(config["retry_max"])
+
+        # Reclaim before checking whether this worker already owns a claim: an
+        # expired claim is no longer held, including when its owner returns.
+        reclaimed: list[dict[str, Any]] = []
+        for owner, claim in list(claimed.items()):
+            if float(claim["lease_until"]) >= now_ts:
+                continue
+            item = claimed_items.get(owner)
+            if item is None:
+                raise LedgerError(
+                    f"queue {qid!r} claim for {owner!r} has no stored item")
+            del claimed[owner]
+            del claimed_items[owner]
+            attempts = int(item["attempts"]) + 1
+            item["attempts"] = attempts
+            if attempts > retry_max:
+                failed.append({"id": item["id"], "payload": item["payload"],
+                               "writes": item["writes"],
+                               "reason": "lease expired",
+                               "attempts": attempts})
+            else:
+                reclaimed.append(item)
+        if reclaimed:
+            pending[0:0] = reclaimed
+
+        if worker in claimed:
+            raise LedgerError(
+                f"worker {worker!r} already holds a claim in queue {qid!r}; "
+                "it must done or fail it first")
+
+        pick: int | None = None
+        if pending:
+            if bool(config.get("ordered")):
+                # Ordered queues are globally serial even when adjacent items
+                # have disjoint (or empty) write sets.
+                if not claimed:
+                    pick = 0
+            else:
+                live_writes: set[str] = set()
+                for owner in claimed:
+                    item = claimed_items.get(owner)
+                    if item is None:
+                        raise LedgerError(
+                            f"queue {qid!r} claim for {owner!r} has no stored item")
+                    live_writes.update(cast("list[str]", item["writes"]))
+                for i, item in enumerate(pending):
+                    if not live_writes.intersection(
+                            cast("list[str]", item["writes"])):
+                        pick = i
+                        break
+        if pick is None:
+            return {"empty": True}
+
+        # the stream gate (see the docstring): count what this worker has been
+        # handed since its last turn boundary, and stop at the ceiling. The
+        # item stays PENDING — nothing is lost, another worker may take it, and
+        # this one gets it on its next stream if it is still there.
+        stats = cast("dict[str, dict[str, Any]]",
+                     q.setdefault("per_worker", {})).setdefault(
+                         worker, {"done": 0})
+        streamed = int(stats.get("stream") or 0)
+        step = int(config["items_per_session"])
+        if streamed >= step:
+            return {"empty": True, "paused": True,
+                    "reason": (f"stream limit: {streamed} item(s) this turn "
+                               f"(items_per_session={step}). END YOUR TURN "
+                               f"now — you will be re-driven to continue.")}
+
+        item = pending.pop(pick)
+        claimed[worker] = {
+            "item_id": item["id"],
+            "at": self._queue_iso(now_ts),
+            "lease_until": now_ts + int(config["lease_seconds"]),
+        }
+        claimed_items[worker] = item
+        stats["stream"] = streamed + 1
+        return {"item": item}
+
+    def queue_sweep(self, now_ts: float | None = None) -> list[dict[str, Any]]:
+        """Find every draining queue that has STOPPED MOVING, and say what to
+        do about it. Returns `[{qid, kind, worker?, item_id?, pending, …}]`.
+
+        ⚠ WHY A TIME-TRIGGERED SWEEP EXISTS AT ALL. Every other recovery path
+        in this design is EDGE-TRIGGERED and they deadlocked against each
+        other, live, on the first unattended run (2026-09-01, 18/20 items):
+
+          · lease reclaim lives inside `_queue_take_next` — it only runs when
+            some worker CALLS TAKE;
+          · the stall detector runs from `_after_turn` — it only fires when a
+            turn ENDS.
+
+        Two workers ended their turns holding items. That made every worker
+        idle, so nobody called take, so no lease was ever reclaimed; and no
+        turn ended again, so no stall was ever detected. Both leases expired
+        ~50 minutes earlier and NOTHING noticed. The queue sat at 18/20
+        indefinitely with no error, no dead letter, and no notice — the worst
+        shape a failure can take.
+
+        A queue whose recovery only fires on activity cannot recover from
+        having none. So this runs on a clock instead, and is the ONE place
+        that assumes nothing is happening.
+
+        It is a PURE REPORT — it mutates nothing except reclaiming genuinely
+        expired leases, which is the one repair that needs no I/O and no
+        judgement. Driving agents is the caller's job.
+        """
+        ts = _time.time() if now_ts is None else float(now_ts)
+        out: list[dict[str, Any]] = []
+        for qid, q in cast("dict[str, dict[str, Any]]",
+                           self.d.get("queues") or {}).items():
+            if q.get("closed") or q.get("phase") != "draining":
+                continue
+            claimed = cast("dict[str, dict[str, Any]]", q.get("claimed") or {})
+            # 1. expired leases — reclaim here, because on a dead queue there
+            #    is no `take` coming to do it
+            for worker, claim in list(claimed.items()):
+                if float(claim.get("lease_until") or 0) >= ts:
+                    continue
+                r = self._queue_reclaim(q, qid, worker, "lease expired "
+                                        "(swept: no worker was taking)")
+                out.append({"qid": qid, "kind": "lease_reclaimed",
+                            "worker": worker, **r})
+            # 2. work outstanding but nobody holding anything: every worker
+            #    went idle believing the queue was drained, while items sat
+            #    pending. Somebody has to be told to take again.
+            pending = len(cast("list[Any]", q["pending"]))
+            spawn = cast("dict[str, Any]", q.get("spawn") or {})
+            workers = [str(w) for w in (spawn.get("workers") or [])
+                       if w in self.nodes
+                       and self.nodes[w].get("state") == "live"]
+            if pending and workers and not cast("dict[str, Any]",
+                                                q.get("claimed") or {}):
+                out.append({"qid": qid, "kind": "idle_with_work",
+                            "workers": workers, "pending": pending})
+        return out
+
+    def _queue_reclaim(self, q: dict[str, Any], qid: str, worker: str,
+                       reason: str) -> dict[str, Any]:
+        """Return a stuck claim to the queue (or dead-letter it past
+        retry_max). Mirrors the reclaim inside `_queue_take_next` so the two
+        paths cannot drift on what a reclaim means."""
+        claimed = cast("dict[str, dict[str, Any]]", q["claimed"])
+        items = cast("dict[str, dict[str, Any]]",
+                     q.setdefault("_claimed_items", {}))
+        claim = claimed.pop(worker, None) or {}
+        item = items.pop(worker, None)
+        item_id = str(claim.get("item_id") or "")
+        if item is None:            # claim with no stored item: drop it
+            return {"item_id": item_id, "outcome": "orphan_claim_dropped"}
+        attempts = int(item["attempts"]) + 1
+        item["attempts"] = attempts
+        if attempts > int(cast("dict[str, Any]", q["config"])["retry_max"]):
+            cast("list[dict[str, Any]]", q["failed"]).append(
+                {"id": item_id, "payload": item["payload"],
+                 "writes": item["writes"], "reason": reason,
+                 "attempts": attempts, "cost_usd": 0.0, "turns": 0})
+            outcome = "dead_letter"
+        else:
+            cast("list[dict[str, Any]]", q["pending"]).insert(0, item)
+            outcome = "requeued"
+        # the worker is free to be handed work again
+        cast("dict[str, dict[str, Any]]", q.setdefault("per_worker", {})
+             ).setdefault(worker, {"done": 0})["stream"] = 0
+        self._log("queue_swept", worker,
+                  {"qid": qid, "item_id": item_id, "outcome": outcome,
+                   "attempts": attempts, "reason": reason}, [])
+        return {"item_id": item_id, "outcome": outcome, "attempts": attempts}
+
+    def queue_stamp_usage(self, qid: str, when: str,
+                          reading: dict[str, Any]) -> None:
+        """Record a QUOTA snapshot against this queue.
+
+        ⚠ DOLLARS ARE NOT THE BUDGET on a subscription lane. `cost_usd` is
+        notional there — a sonnet crew bills $0 real and still exhausts a
+        5-hour window, which is what actually stops work (measured
+        2026-09-01: 12 card files ≈ 48 points of a session; the run had to be
+        cut at 99%). Each provider draws on a DIFFERENT pool, so the honest
+        report is per-pool and the whole argument for a mixed crew is
+        legible only if the queue records it.
+
+        `reading` is `{pool: {kind: percent}}` supplied by the caller —
+        cache-only peeks live in api/limits, and this module does no I/O.
+        `when` is "spawn" or "drained"; queue_status derives the delta.
+
+        ⚠ The delta is the WINDOW's movement, not this queue's alone —
+        anything else on the account moves it too, including the operator's
+        own session. It is a ceiling on what the queue cost, and honest only
+        as that; `cost.by_worker` remains the per-node truth."""
+        if not reading:
+            return
+        usage = cast("dict[str, Any]",
+                     self._queue(qid).setdefault("usage", {}))
+        usage[when] = {"at": now(), "pools": reading}
+
+    def _queue_usage_report(self, q: dict[str, Any]) -> dict[str, Any] | None:
+        """`{pool: {kind: {start, end, delta}}}` from the stamped snapshots,
+        or None when nothing was stamped."""
+        usage = cast("dict[str, dict[str, Any]]", q.get("usage") or {})
+        start = cast("dict[str, Any]", (usage.get("spawn") or {}).get("pools")
+                     or {})
+        end = cast("dict[str, Any]", (usage.get("drained") or {}).get("pools")
+                   or {})
+        if not start and not end:
+            return None
+        out: dict[str, Any] = {}
+        for pool in sorted(set(start) | set(end)):
+            a = cast("dict[str, Any]", start.get(pool) or {})
+            b = cast("dict[str, Any]", end.get(pool) or {})
+            kinds: dict[str, Any] = {}
+            for kind in sorted(set(a) | set(b)):
+                sv, ev = a.get(kind), b.get(kind)
+
+                def _pct(v: Any) -> int | None:
+                    # readings stamped before 2026-09-01 are a bare int
+                    if isinstance(v, int):
+                        return v
+                    if isinstance(v, dict):
+                        p = cast("dict[str, Any]", v).get("pct")
+                        return p if isinstance(p, int) else None
+                    return None
+
+                def _win(v: Any) -> Any:
+                    return (cast("dict[str, Any]", v).get("resets_at")
+                            if isinstance(v, dict) else None)
+
+                sp, ep = _pct(sv), _pct(ev)
+                # ⚠ A PERCENTAGE IS ONLY COMPARABLE WITHIN ONE WINDOW. The
+                # 20-file run crossed a session reset and read 65 -> 29,
+                # computing a delta of -36 — worse than no number, because it
+                # looks like an answer. If the window rolled, say so and
+                # refuse the subtraction.
+                rolled = (_win(sv) is not None and _win(ev) is not None
+                          and _win(sv) != _win(ev))
+                row: dict[str, Any] = {
+                    "start": sp, "end": ep,
+                    "delta": (None if rolled or sp is None or ep is None
+                              else ep - sp)}
+                if rolled:
+                    row["window_reset"] = True
+                    row["note"] = ("the quota window reset mid-run — these "
+                                   "two readings are of different windows "
+                                   "and cannot be subtracted")
+                kinds[kind] = row
+            out[pool] = kinds
+        return {"pools": out,
+                "at": {k: cast("dict[str, Any]", v).get("at")
+                       for k, v in usage.items()},
+                "note": "window movement, not this queue alone — other work "
+                        "on the same account moves it too; a ceiling on the "
+                        "queue's cost, with cost.by_worker the per-node truth"}
+
+    def queue_worker_stalled(self, worker: str, qid: str) -> dict[str, Any]:
+        """Did this worker just end a turn with WORK LEFT AND NOTHING TO DO?
+
+        A worker stops for exactly one legitimate reason: `take` returned a
+        plain empty, meaning the queue is drained. Everything else that ends
+        a turn — the model garbling a tool call, a transport error, an agent
+        deciding it is finished — leaves it idle holding no claim while items
+        sit pending, and NOTHING re-drives it. Measured 2026-09-01: an
+        OpenRouter worker emitted its `orgtree_queue_take` as prose, executed
+        nothing, went idle, and the queue simply ran a worker short until it
+        was nudged by hand.
+
+        So the supervisor asks after every worker turn. Returns
+        ``{"stalled": bool, "pending": n, "nudges": n}``; `nudges` counts how
+        many times this worker has been prodded WITHOUT completing anything
+        since, and is reset by any completion (`queue_done` bumps `done`).
+        A worker that cannot be revived must not be prodded forever — the
+        caller stops at a cap, and a model that never forms a tool call
+        correctly is a lane problem for a human, not a retry loop."""
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return {"stalled": False, "pending": 0, "nudges": 0}
+        if q.get("closed") or q.get("phase") != "draining":
+            return {"stalled": False, "pending": 0, "nudges": 0}
+        pending = len(cast("list[Any]", q["pending"]))
+        claim = cast("dict[str, dict[str, Any]]",
+                     q["claimed"]).get(worker)
+        stats = cast("dict[str, dict[str, Any]]",
+                     q.setdefault("per_worker", {})).setdefault(
+                         worker, {"done": 0})
+        # ⚠ A CLAIM IS NOT PROOF OF PROGRESS. This is asked at a TURN
+        # BOUNDARY — the worker's turn is over — so "holds an item" and
+        # "is working on it" have come apart. Measured 2026-09-01: an
+        # OpenRouter worker took item 0000, made 21 real tool calls, then
+        # its turn simply ended with the item unfinished and the claim
+        # intact. Nothing noticed, because the first cut of this method
+        # treated any claim-holder as busy; only the 30-minute LEASE would
+        # have freed it. That is a designed safety net, not a plan — half an
+        # hour of an unattended run with a worker doing nothing.
+        #
+        # So an unfinished claim at a turn boundary is a stall too. The
+        # nudge tells it to finish THAT item rather than take a new one,
+        # which is also why `item_id` is reported.
+        if not claim and (not pending
+                          or int(stats.get("stream") or 0) > 0):
+            # paused at the ceiling (that path re-drives itself), or
+            # genuinely nothing left — not a stall
+            return {"stalled": False, "pending": pending, "item_id": None,
+                    "nudges": int(stats.get("nudges") or 0)}
+        held = str(claim.get("item_id") or "") if claim else None
+        # A completion since the last nudge clears the count.
+        # ⚠ `stats.get(k, -1)`, NOT `stats.get(k) or -1`: the marker is
+        # legitimately 0 for a worker that has finished nothing yet, and 0 is
+        # falsy — the `or` form reset the counter on every call, so the cap
+        # could never be reached and a dead worker would be nudged forever.
+        done_now = int(stats.get("done") or 0)
+        if int(stats.get("nudged_at_done", -1)) != done_now:
+            stats["nudges"] = 0
+            stats["nudged_at_done"] = done_now
+        n = int(stats.get("nudges") or 0) + 1
+        stats["nudges"] = n
+        self._log("queue_worker_stalled", worker,
+                  {"qid": qid, "pending": pending, "item_id": held,
+                   "nudge": n}, [])
+        return {"stalled": True, "pending": pending, "item_id": held,
+                "nudges": n}
+
+    def queue_end_stream(self, worker: str, qid: str) -> bool:
+        """A turn boundary: this worker may be handed items again. Called from
+        the supervisor's post-turn hook. Returns True when the worker had
+        actually been paused at the ceiling, so the caller knows to re-drive
+        it rather than leave it idle."""
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return False
+        stats = cast("dict[str, dict[str, Any]]",
+                     q.get("per_worker") or {}).get(worker)
+        if not stats:
+            return False
+        was = int(stats.get("stream") or 0)
+        stats["stream"] = 0
+        return was >= int(cast("dict[str, Any]", q["config"])
+                          ["items_per_session"])
+
+    def queue_take(self, worker: str, qid: str,
+                   now_ts: float | None = None) -> dict[str, Any]:
+        """Atomically claim the next item eligible for ``worker``."""
+        ts = _time.time() if now_ts is None else float(now_ts)
+        result = self._queue_take_next(worker, qid, ts)
+        self._log("queue_take", worker,
+                  {"qid": qid,
+                   "item_id": cast("dict[str, Any]", result.get("item")
+                                   or {}).get("id"),
+                   "empty": bool(result.get("empty"))}, [])
+        return result
+
+    def queue_done(self, worker: str, qid: str, item_id: str, result: Any,
+                   cost_usd: float = 0.0, turns: int = 0,
+                   now_ts: float | None = None) -> dict[str, Any]:
+        """Finish the worker's claim, record its result, and claim the next."""
+        q = self._queue(qid)
+        if q.get("closed") or q.get("phase") != "draining":
+            raise LedgerError(f"queue {qid!r} is not draining")
+        claimed = cast("dict[str, dict[str, Any]]", q["claimed"])
+        claim = claimed.get(worker)
+        if claim is None:
+            raise LedgerError(
+                f"worker {worker!r} has no claim in queue {qid!r}")
+        if claim.get("item_id") != item_id:
+            raise LedgerError(
+                f"worker {worker!r} claimed {claim.get('item_id')!r}, not "
+                f"{item_id!r}")
+        claimed_items = cast(
+            "dict[str, dict[str, Any]]", q.setdefault("_claimed_items", {}))
+        item = claimed_items.get(worker)
+        if item is None:
+            raise LedgerError(
+                f"queue {qid!r} claim for {worker!r} has no stored item")
+
+        # cost so far: turns 1..n-1 accrued on the claim by queue_tick_item,
+        # plus whatever the worker passed. The FINAL turn — the one running
+        # right now, that called queue_done — is not booked until _after_turn
+        # fires; `_final_pending` marks this entry so the supervisor's next
+        # breaker tick adds that turn's cost here (queue_book_final_turn).
+        acc_cost = float(claim.get("cost_usd") or 0.0)
+        acc_turns = int(claim.get("turns") or 0)
+        cast("list[dict[str, Any]]", q["done"]).append({
+            "id": item_id,
+            "payload": item["payload"],
+            "result": result,
+            "by": worker,
+            "cost_usd": round(acc_cost + float(cost_usd), 6),
+            "turns": acc_turns + int(turns),
+            "_final_pending": worker,
+        })
+        per_worker = cast(
+            "dict[str, dict[str, Any]]", q.setdefault("per_worker", {}))
+        worker_stats = per_worker.setdefault(worker, {"done": 0})
+        worker_stats["done"] = int(worker_stats["done"]) + 1
+        del claimed[worker]
+        del claimed_items[worker]
+        ts = _time.time() if now_ts is None else float(now_ts)
+        next_result = self._queue_take_next(worker, qid, ts)
+        self._log("queue_done", worker,
+                  {"qid": qid, "item_id": item_id,
+                   "next_item_id": cast(
+                       "dict[str, Any]", next_result.get("item") or {}).get("id")},
+                  [])
+        if self._queue_check_drained(q, qid):
+            next_result["queue_drained"] = True
+        return next_result
+
+    def queue_fail(self, worker: str, qid: str, item_id: str, reason: str,
+                   now_ts: float | None = None,
+                   _breaker: bool = False) -> dict[str, Any]:
+        """Fail the worker's claim, requeueing or dead-lettering the item.
+
+        `_breaker` = the supervisor's circuit breaker is the caller (not the
+        worker mid-turn): the tripping turn's cost is already on the claim
+        and rolled in below, so the dead-letter entry is NOT marked
+        `_final_pending` — there is no further worker turn to book to it."""
+        q = self._queue(qid)
+        if q.get("closed") or q.get("phase") != "draining":
+            raise LedgerError(f"queue {qid!r} is not draining")
+        claimed = cast("dict[str, dict[str, Any]]", q["claimed"])
+        claim = claimed.get(worker)
+        if claim is None:
+            raise LedgerError(
+                f"worker {worker!r} has no claim in queue {qid!r}")
+        if claim.get("item_id") != item_id:
+            raise LedgerError(
+                f"worker {worker!r} claimed {claim.get('item_id')!r}, not "
+                f"{item_id!r}")
+        claimed_items = cast(
+            "dict[str, dict[str, Any]]", q.setdefault("_claimed_items", {}))
+        item = claimed_items.get(worker)
+        if item is None:
+            raise LedgerError(
+                f"queue {qid!r} claim for {worker!r} has no stored item")
+
+        attempts = int(item["attempts"]) + 1
+        item["attempts"] = attempts
+        acc_cost = round(float(claim.get("cost_usd") or 0.0), 6)
+        acc_turns = int(claim.get("turns") or 0)
+        del claimed[worker]
+        del claimed_items[worker]
+        retry_max = int(cast("dict[str, Any]", q["config"])["retry_max"])
+        if attempts <= retry_max:
+            cast("list[dict[str, Any]]", q["pending"]).append(item)
+            out = {"requeued": True, "attempts": attempts}
+        else:
+            entry: dict[str, Any] = {
+                "id": item_id, "payload": item["payload"],
+                "writes": item["writes"],
+                "reason": reason, "attempts": attempts,
+                "cost_usd": acc_cost, "turns": acc_turns,
+            }
+            if not _breaker:
+                entry["_final_pending"] = worker
+            cast("list[dict[str, Any]]", q["failed"]).append(entry)
+            out = {"dead_letter": True}
+        self._log("queue_fail", worker,
+                  {"qid": qid, "item_id": item_id, "reason": reason,
+                   "attempts": attempts,
+                   "dead_letter": bool(out.get("dead_letter"))}, [])
+        if self._queue_check_drained(q, qid):
+            out["queue_drained"] = True
+        return out
+
+    def queue_requeue(self, actor: str, qid: str,
+                      item_id: str) -> dict[str, Any]:
+        """Re-offer one dead letter as fresh work. Re-normalising is what
+        keeps failure bookkeeping out of the pending contract, including on
+        older queue docs whose dead letters carry a different field set."""
+        q = self._queue(qid)
+        if q.get("closed"):
+            raise LedgerError(f"queue {qid!r} is closed")
+        if q.get("phase") == "reducing":
+            raise LedgerError(
+                f"queue {qid!r} is reducing — wait for the reducer to finish, "
+                "then requeue")
+        failed = cast("list[dict[str, Any]]", q["failed"])
+        found = next((i for i, entry in enumerate(failed)
+                      if entry.get("id") == item_id), None)
+        if found is None:
+            raise LedgerError(
+                f"item {item_id!r} is not in the dead-letter list of {qid!r}")
+        entry = failed[found]
+        fresh = self._norm_queue_items([{**entry, "attempts": 0}])[0]
+        del failed[found]
+        pending = cast("list[dict[str, Any]]", q["pending"])
+        pending.append(fresh)
+        if q.get("phase") == "done":
+            q["phase"] = "draining"
+        self._log("queue_requeue", actor,
+                  {"qid": qid, "item_id": item_id}, [])
+        return {"qid": qid, "item_id": item_id,
+                "pending": len(pending), "failed": len(failed)}
+
+    def _queue_check_drained(self, q: dict[str, Any], qid: str) -> bool:
+        """Tail of queue_done / queue_fail: if the queue just emptied — no
+        pending, no live claim, still draining, not closed — advance its
+        phase (``reducing`` when a reducer is configured, else ``done``),
+        stamp ``drained_at``, and log it. Returns True the ONE time it makes
+        that transition so the caller fires the reducer exactly once."""
+        if (q.get("closed") or q.get("phase") != "draining"
+                or cast("list[Any]", q["pending"])
+                or cast("dict[str, Any]", q["claimed"])):
+            return False
+        has_reducer = bool(
+            cast("dict[str, Any]", q["config"]).get("reducer"))
+        q["phase"] = "reducing" if has_reducer else "done"
+        q["drained_at"] = now()
+        self._log("queue_drained", USER,
+                  {"qid": qid, "done": len(cast("list[Any]", q["done"])),
+                   "failed": len(cast("list[Any]", q["failed"])),
+                   "reducer": has_reducer}, [])
+        return True
+
+    def queue_spawn_plan(self, qid: str, *,
+                         repo_root: str | None = None) -> list[dict[str, Any]]:
+        """Build hire-shaped worker specs without hiring or running workers.
+
+        ⚠ WORKERS MAY BE A MIXED CREW. `config.worker_templates` (a list)
+        gives one template per worker, so a queue can run a Codex worker, an
+        Antigravity worker and an OpenRouter worker side by side; the single
+        `worker_template` stays valid and means "all N the same".
+
+        The point is not variety for its own sake — IT IS THE QUOTA POOLS.
+        Every provider bills a different one: Claude has the 5-hour session
+        window, Codex its own usage limit, Antigravity Google OAuth at $0,
+        OpenRouter real metered dollars with no window at all. A homogeneous
+        Claude crew drains one window and stops (measured: 6 card files ≈ 47
+        points of a session). Spread across lanes, the same work runs from
+        four independent budgets — and the expensive-but-careful lane can be
+        saved for the reducer, which is one node instead of N.
+
+        `workers` is derived from the list when one is given, so the count
+        and the crew cannot disagree."""
+        q = self._queue(qid)
+        config = cast("dict[str, Any]", q["config"])
+        raw = config.get("worker_templates")
+        if isinstance(raw, list) and raw:
+            templates = [cast("dict[str, Any]", t) for t in
+                         cast("list[Any]", raw)]
+        else:
+            templates = [cast("dict[str, Any]", config["worker_template"])
+                         ] * int(config["workers"])
+        specs: list[dict[str, Any]] = []
+        names: list[str] = []
+        for i, template in enumerate(templates, start=1):
+            tier = template.get("tier")
+            if not tier:
+                raise LedgerError(
+                    f"queue {qid!r}: worker template {i} needs a tier to spawn")
+            name = f"{qid}-w{i}"
+            names.append(name)
+            specs.append({
+                "name": name,
+                "tier": tier,
+                "grant": template.get("grant") or 0,
+                "add_dirs": template.get("add_dirs") or [],
+                "tools": template.get("tools") or {},
+                "org_visibility": template.get("org_visibility") or "team",
+                "effort": template.get("effort"),
+                "charter": WORKER_CHARTER + "\n\n"
+                           + str(template.get("charter") or ""),
+                "model": template.get("model"),
+            })
+        q["spawn"] = {"repo_root": repo_root, "planned": names, "at": now()}
+        self._log("queue_spawn_plan", USER,
+                  {"qid": qid, "repo_root": repo_root, "planned": names,
+                   "tiers": [s["tier"] for s in specs]}, [])
+        return specs
+
+    def queue_should_compact(self, worker: str, qid: str) -> bool:
+        """Whether this worker just crossed an items-per-session boundary and
+        has not been compacted for it yet. The supervisor polls this after a
+        worker's turn; `queue_note_compacted` closes the boundary so a
+        multi-turn item doesn't re-trigger on every turn while `done` sits on
+        the multiple (the 178k-bloat guard, design §5)."""
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return False
+        stats = cast("dict[str, dict[str, Any]]", q.get("per_worker") or {}
+                     ).get(worker) or {}
+        done = int(stats.get("done") or 0)
+        step = int(cast("dict[str, Any]", q["config"])["items_per_session"])
+        return (done > 0 and done % step == 0
+                and int(stats.get("compacted_at") or -1) != done)
+
+    def queue_note_compacted(self, worker: str, qid: str) -> None:
+        """Record that `worker`'s session was re-minted at its current
+        done-count, so `queue_should_compact` stops firing for this boundary."""
+        q = self._queue(qid)
+        stats = cast("dict[str, dict[str, Any]]",
+                     q.setdefault("per_worker", {})).setdefault(
+                         worker, {"done": 0})
+        stats["compacted_at"] = int(stats.get("done") or 0)
+
+    def queue_of_worker(self, nid: str) -> str | None:
+        """The qid this node was spawned into as a worker, or None. Cheap
+        scan of `queues[*].spawn.workers` — the supervisor calls it once per
+        turn to decide whether the items-per-session guard applies."""
+        for qid, q in cast("dict[str, dict[str, Any]]",
+                           self.d.get("queues") or {}).items():
+            if nid in ((q.get("spawn") or {}).get("workers") or []):
+                return qid
+        return None
+
+    def queue_reducer_plan(self, qid: str) -> dict[str, Any] | None:
+        """One hire-shaped spec for the queue's reducer, or None when no
+        reducer is configured. Records ``queues[qid]['reduce']``. The
+        completion trigger (api._queue_fire_reducer) calls this once, when
+        the queue drains."""
+        q = self._queue(qid)
+        template = cast("dict[str, Any]",
+                        cast("dict[str, Any]", q["config"]).get("reducer") or {})
+        if not template:
+            return None
+        tier = template.get("tier")
+        if not tier:
+            raise LedgerError(f"queue {qid!r} reducer needs a tier")
+        name = f"{qid}-reduce"
+        q["reduce"] = {"planned": name, "at": now()}
+        self._log("queue_reducer_plan", USER, {"qid": qid}, [])
+        return {
+            "name": name,
+            "tier": tier,
+            "grant": template.get("grant") or 0,
+            "add_dirs": template.get("add_dirs") or [],
+            "tools": template.get("tools") or {},
+            "org_visibility": template.get("org_visibility") or "team",
+            "effort": template.get("effort"),
+            "charter": REDUCER_CHARTER.format(qid=qid) + "\n\n"
+                       + str(template.get("charter") or ""),
+            "model": template.get("model"),
+        }
+
+    def queue_results(self, qid: str) -> dict[str, Any]:
+        """Full done results + dead-letter list + the spawn record — the
+        reducer's input (queue_status only carries summaries)."""
+        q = self._queue(qid)
+
+        def _clean(e: dict[str, Any]) -> dict[str, Any]:
+            c = dict(e)
+            c.pop("_final_pending", None)   # internal cost-booking marker
+            return c
+        return {
+            "qid": qid,
+            "done": [_clean(d) for d in cast("list[dict[str, Any]]", q["done"])],
+            "failed": [_clean(f)
+                       for f in cast("list[dict[str, Any]]", q["failed"])],
+            "spawn": q.get("spawn"),
+        }
+
+    def queue_tick_item(self, worker: str, qid: str, *, cost_usd: float,
+                        turn_sig: str) -> dict[str, Any]:
+        """Book one turn against a live item claim and decide its breaker.
+
+        The supervisor owns the hot-path consequence: when ``trip`` is true
+        it calls ``queue_fail`` with this reason, then lets the same worker
+        take another item. This locked ledger seam only accumulates telemetry,
+        makes the deterministic decision, and logs a trip.
+        """
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return {"trip": False, "reason": "", "turns": 0,
+                    "cost_usd": 0.0}
+        claimed = cast("dict[str, dict[str, Any]]", q.get("claimed") or {})
+        claim = claimed.get(worker)
+        if claim is None:
+            return {"trip": False, "reason": "", "turns": 0,
+                    "cost_usd": 0.0}
+
+        turns = int(claim.get("turns") or 0) + 1
+        item_cost = float(claim.get("cost_usd") or 0.0) + float(cost_usd)
+        claim["turns"] = turns
+        claim["cost_usd"] = item_cost
+        sigs = cast("list[str]", claim.setdefault("sigs", []))
+        sigs.append(turn_sig)
+        del sigs[:-5]
+
+        config = cast("dict[str, Any]", q["config"])
+        budget = float(config["per_item_budget_usd"])
+        turn_cap = int(config["per_item_turn_cap"])
+        reason = ""
+        if item_cost > budget:
+            reason = (f"over per-item budget: ${item_cost:.2f} > "
+                      f"${budget:.2f}")
+        elif turns > turn_cap:
+            reason = f"over per-item turn cap: {turns} > {turn_cap}"
+        elif (len(sigs) >= 3 and bool(sigs[-1])
+              and sigs[-3] == sigs[-2] == sigs[-1]):
+            reason = f"identical-turn loop 3x: {turn_sig[:80]}"
+
+        if reason:
+            self._log("queue_item_tripped", worker,
+                      {"qid": qid, "item_id": claim.get("item_id"),
+                       "reason": reason, "turns": turns,
+                       "cost_usd": item_cost}, [])
+        return {"trip": bool(reason), "reason": reason, "turns": turns,
+                "cost_usd": item_cost}
+
+    def queue_book_final_turn(self, worker: str, qid: str, *,
+                              cost_usd: float) -> bool:
+        """Attribute the turn that just ended — the one during which `worker`
+        called queue_done / queue_fail — to the item it finished. queue_done
+        runs mid-turn, before _after_turn knows the turn's cost, so it stamps
+        the recorded entry `_final_pending`; this books that cost + 1 turn to
+        the MOST RECENT such entry and clears every `_final_pending` for this
+        worker. Returns True when it booked (the supervisor then SKIPS the
+        claim tick — the turn belonged to a finished item, not to whatever
+        the worker claimed next).
+
+        ⚠ When a worker finishes SEVERAL items in one turn, only the last
+        gets that turn's cost; the earlier ones keep whatever queue_done
+        recorded (their claim-accrued spend, often ~0). The per-worker and
+        queue totals stay exact; only the per-item split is lossy, and only
+        for a worker batching items — which is itself a sign of little work
+        per item."""
+        try:
+            q = self._queue(qid)
+        except LedgerError:
+            return False
+        entries = [e for lst in ("done", "failed")
+                   for e in cast("list[dict[str, Any]]", q.get(lst) or [])
+                   if e.get("_final_pending") == worker]
+        if not entries:
+            return False
+        last = entries[-1]
+        last["cost_usd"] = round(
+            float(last.get("cost_usd") or 0.0) + float(cost_usd), 6)
+        last["turns"] = int(last.get("turns") or 0) + 1
+        for e in entries:
+            e.pop("_final_pending", None)
+        return True
+
+    def queue_fire_reducer(self, qid: str) -> dict[str, Any]:
+        """The drain consequence (Inc 4/5): hire the queue's reducer with
+        every worker result as one input mail and return
+        ``{"reducer": <node id>}`` for the caller to drive. No reducer
+        configured -> a user notice and ``{"notice": True}``.
+        ``{"skipped": <why>}`` when there is nothing to do (already hired) or
+        the hire itself refused.
+
+        Called from api.agent_call's queue_done/_fail dispatch AND from the
+        supervisor's per-item breaker when it dead-letters the last item, so
+        it lives here rather than in either. No provider gate: the reducer is
+        system-initiated on a queue the user already configured with a
+        reducer tier — a signed-out provider surfaces at the hire or the
+        first turn, same as any other reducer failure."""
+        try:
+            spec = self.queue_reducer_plan(qid)
+        except LedgerError as e:
+            return {"skipped": str(e)}
+        payload = self.queue_results(qid)
+        n_done = len(cast("list[Any]", payload["done"]))
+        n_dead = len(cast("list[Any]", payload["failed"]))
+        if spec is None:
+            self.to_user_inbox({
+                "from": SYSTEM, "kind": "notice", "at": now(),
+                "body": (f"Work queue '{qid}' drained — {n_done} done, "
+                         f"{n_dead} dead-lettered. No reducer configured; the "
+                         f"results are on the queue.")})
+            return {"notice": True}
+        if spec["name"] in self.nodes:
+            return {"skipped": "reducer already hired"}
+        try:
+            res = self.hire(USER, None, str(spec["tier"]),
+                            int(spec["grant"] or 0), str(spec["name"]),
+                            cast("list[Any]", spec["add_dirs"]),
+                            tools=cast("Mapping[str, Any]", spec["tools"]),
+                            org_visibility=cast("str", spec["org_visibility"]),
+                            charter=cast("str", spec["charter"]))
+            # PORT NOTE (2026-09-09). The fork passed
+            # `or_slug=spec.get("model")` here, because in THAT tree an
+            # OpenRouter seat was a fixed band (spark..nova) carrying a
+            # separate model id alongside it. This tree makes the MODEL the
+            # tier - an OpenRouter favorite IS a tier, `or:<model id>` (D-232)
+            # - so `Org.hire` has no `or_slug` parameter at all and the
+            # reducer's model choice travels in `spec["tier"]` above. A
+            # reducer that wants a specific OpenRouter model names it as its
+            # tier. `spec["model"]` is consequently unread here; it is left
+            # in the spec rather than removed so a queue authored against the
+            # fork still round-trips, and so this note has something to
+            # point at.
+            node = str(res["node"])
+            if spec.get("effort"):
+                self.set_scope(USER, node, effort=cast("str", spec["effort"]))
+        except LedgerError as e:
+            return {"skipped": f"reducer hire refused: {e}"}
+        lines = [f"Queue '{qid}' is fully drained — {n_done} result(s):"]
+        for d in cast("list[dict[str, Any]]", payload["done"]):
+            body = json.dumps(d.get("result"), indent=2, default=str)
+            lines.append(f"\n— item {d['id']} (by {d.get('by')}, "
+                         f"${float(d.get('cost_usd') or 0):.4f}, "
+                         f"{int(d.get('turns') or 0)} turns):\n{body[:4000]}")
+        failed = cast("list[dict[str, Any]]", payload["failed"])
+        if failed:
+            lines.append("\nDead-letter (" + str(n_dead) + "): " + ", ".join(
+                f"{f['id']} ({f.get('reason')})" for f in failed))
+        wts = cast("list[dict[str, Any]]",
+                   (payload.get("spawn") or {}).get("worktrees") or [])
+        if wts:
+            lines.append("\nWorker branches to merge into the base: "
+                         + ", ".join(str(w["branch"]) for w in wts))
+        self.post_mail(USER, node, "\n".join(lines))
+        # queue_reducer_plan already created ["reduce"]; pin the real node id
+        # so queue_reducer_reported can recognise this seat.
+        cast("dict[str, Any]", self._queue(qid)["reduce"])["node"] = node
+        return {"reducer": node}
+
+    def queue_reducer_reported(self, nid: str, status: str) -> str | None:
+        """Called from the orgtree_status dispatch: if `nid` is the reducer
+        of a queue still in `reducing` and it just reported a terminal status
+        (`done` / `idle`), close the queue — phase `done`, `closed`,
+        `closed_at`. Returns the qid it closed, or None. This is what stops a
+        queue sitting at `reducing` forever after the reducer finishes."""
+        if status not in ("done", "idle"):
+            return None
+        for qid, q in cast("dict[str, dict[str, Any]]",
+                           self.d.get("queues") or {}).items():
+            rd = q.get("reduce") or {}
+            if rd.get("node") == nid and q.get("phase") == "reducing" \
+                    and not q.get("closed"):
+                q["phase"] = "done"
+                q["closed"] = True
+                q["closed_at"] = now()
+                self._log("queue_reduced", nid, {"qid": qid}, [])
+                return qid
+        return None
 
     # ------------------------------------------------------------------ hire
     def hire(self, actor: str, parent: str | None, tier: str, grant: int, name: str,

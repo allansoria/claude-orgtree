@@ -406,7 +406,13 @@ def _():
     # +orgtree_restart_wake (2026-09-04)
     # +orgtree_work (the docket, 2026-09-05)
     # +orgtree_staff (item + seat + assignment in one call, 2026-09-05)
-    assert len(tools) == 34, [x["name"] for x in tools]
+    # +orgtree_queue_plan/_take/_done/_fail (the work queue, ported 2026-09-09)
+    #
+    # NOTE: this number was already WRONG before the queue verbs arrived. At
+    # upstream 80a706a the catalogue held 35 cards while this asserted 34, so
+    # the check was failing on a clean tree - verified by running this file in
+    # a pristine checkout. 39 = that real 35 + the 4 queue verbs.
+    assert len(tools) == 39, [x["name"] for x in tools]
     for c in tools:
         assert c["name"].startswith("orgtree_"), c
         assert len(c["description"]) > 20, c
@@ -592,7 +598,7 @@ def _():
     # +orgtree_restart_wake (2026-09-04)
     # +orgtree_work (2026-09-05); +orgtree_staff (2026-09-05, the item, the
     # seat and the assignment in one call)
-    assert len(CARDS) == 34, len(CARDS)
+    assert len(CARDS) == 39, len(CARDS)   # +4 queue verbs, 2026-09-09
 
 
 @t("☠ the op-lookup door answers, is never advertised, and does NOTHING")
@@ -778,10 +784,21 @@ def _():
     # paragraph says "swaps only the session", which is not this node's
     # prompt, so `orgtree_swap` really is absent rather than accidentally
     # satisfied.)
-    assert absent == ["orgtree_list_orgs", "orgtree_list_tiers", "orgtree_move", "orgtree_rename",
+    # The four queue verbs (ported 2026-09-09) are absent for a DIFFERENT and
+    # equally deliberate reason: a queue worker does not discover them from
+    # the recital at all. `queue_spawn_plan` writes WORKER_CHARTER into the
+    # seat, and that charter names take/done/fail explicitly; the reducer's
+    # charter names its own. An agent with no queue has no moment for them,
+    # so putting them in every node's prompt would be noise for the many to
+    # serve the few. `orgtree_queue_plan` is proposal-only and reached the
+    # same way.
+    assert absent == ["orgtree_list_orgs", "orgtree_list_tiers", "orgtree_move",
+                      "orgtree_queue_done", "orgtree_queue_fail",
+                      "orgtree_queue_plan", "orgtree_queue_take",
+                      "orgtree_rename",
                       "orgtree_restart_wake",
                       "orgtree_self_subjugate", "orgtree_swap",
-                      "orgtree_switch_model"], \
+                      "orgtree_switch_model", "orgtree_unstick"], \
         f"the recital gap changed — update or retire this pin: {absent}"
     # D-181 audit amendment: capability guidance is identity, while today's
     # child count is live state. The leaf must already know the read/retire

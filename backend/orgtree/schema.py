@@ -864,5 +864,11 @@ class OrgDoc(TypedDict):
                                             # Org-level and monotonic: node deletion
                                             # never has to re-bank it.
     _actors_typed: NotRequired[bool]        # one-shot @-sentinel migration marker
+    # work-queue execution (Inc 1): {qid: {phase, pending:[item], claimed:{worker:
+    # {item_id, at, lease_until}}, done:[{id, result, by, cost_usd, turns}],
+    # failed:[{id, reason, attempts}], closed, config, created, closed_at,
+    # overlaps}} — item = {id, payload, writes:[path], attempts}. Add-only
+    # migration seeds existing orgs with {}.
+    queues: NotRequired[dict[str, dict[str, Any]]]
     # ---- legacy keys old docs may still carry (popped/rewritten on load) ----
     default_dirs: NotRequired[list[Any]]    # superseded by `dirs` with modes

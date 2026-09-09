@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import ipaddress
+import fnmatch
 import json
 import math
 import os
@@ -71,6 +72,8 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, model_validator
 
+from . import autopartition
+from . import queueworker
 from . import crashreports
 from . import events
 from . import refs
@@ -880,6 +883,12 @@ async def _wire_notify() -> None:  # type: ignore[unused-function]  # registered
     # children, which is also their restart-recovery (the doc is the registry)
     supervisor.start_watchdog_engine()
     supervisor.start_extern_sweeper()          # D-166
+    # the work-queue sweeper (ported 2026-09-09): the ONE recovery path that
+    # does not wait for a turn to end or a `take` to be called. Without it a
+    # queue whose workers all went idle holding stale claims sits forever
+    # (measured 2026-09-01, 18/20 items, both leases expired an hour earlier,
+    # no error anywhere).
+    supervisor.start_queue_sweeper()
     # D-236: a mid-turn message whose recipient is inside a long tool call has
     # no injection point until that call ends — this is what tells the SENDER,
     # which is the half no answer available at send time could give.
@@ -2757,6 +2766,40 @@ def codex_usage_peek() -> dict[str, Any]:
     return codex_limits.peek()
 
 
+def _usage_reading() -> dict[str, Any]:
+    """Quota standing across the pools we can read, as
+    `{pool: {kind: percent}}` — for `Org.queue_stamp_usage`.
+
+    ⚠ CACHE-ONLY, both of them. A queue spawn must not be able to add an
+    upstream usage request (`limits.peek` / `codex_limits.peek` exist for
+    exactly this); a stale or absent pool simply does not appear, and a
+    missing baseline is better than a slow spawn or a wrong number.
+
+    Only the metered lanes have a window to read. Antigravity bills $0 with
+    no published quota (D-AG-2) and OpenRouter is real dollars with no
+    window at all — for those, `cost.by_worker` is already the whole story."""
+    out: dict[str, Any] = {}
+    for pool, fn in (("claude", limits.peek), ("codex", codex_limits.peek)):
+        try:
+            p = fn()
+        except Exception:                                    # noqa: BLE001
+            continue
+        if not p.get("available"):
+            continue
+        # ⚠ the percent alone is not enough: a percentage is only comparable
+        # WITHIN one window. A run that spans a reset reads 65 -> 29 and
+        # computes a delta of -36, which is worse than no number at all
+        # (measured 2026-09-01 — the 20-file run crossed the 23:20 reset).
+        # `resets_at` is what makes the two readings comparable or not.
+        rows = {str(x.get("kind")): {"pct": x.get("percent"),
+                                     "resets_at": x.get("resets_at")}
+                for x in (p.get("limits") or [])
+                if isinstance(x.get("percent"), int)}
+        if rows:
+            out[pool] = rows
+    return out
+
+
 @app.get("/api/antigravity/usage")
 def antigravity_usage() -> dict[str, Any]:
     """The Antigravity account's standing for the header modal — OBSERVED,
@@ -4017,6 +4060,361 @@ async def document_dismiss(slug: str, did: str) -> dict[str, Any]:
         store.save_org(org)
     await hub.changed(slug)
     return {"ok": True, "node": r["node"]}
+
+
+# ============================================================ work queues
+# Ported from the fork 2026-09-09 (design-work-queue.md,
+# design-auto-partition.md). Placed here, among the other /api/orgs
+# routes and well ABOVE the SPA catch-all at the foot of this file: a
+# route registered after `@app.get("/{path:path}")` is shadowed by it and
+# answers index.html with a 200 instead of 404.
+
+# ---- work queues (design-work-queue.md Inc 1) — state + lifecycle only.
+# Loopback/user path (never the kiosk): a queue spawns workers and spends.
+# ---- auto-partitioning (design-auto-partition.md Inc A) --------------------
+# `autopartition.plan` is pure and does NO I/O by design — the caller supplies
+# the file listing. That listing is the security-relevant half, so it is built
+# HERE, containment-checked against the org's own dir grants, and never taken
+# from the request as paths.
+_PLAN_MAX_LISTING = 20000     # a walk that big is a mis-pointed root, not a plan
+
+
+def _plan_root(org: Org, root: str) -> str:
+    """Resolve `root` and refuse it unless it sits inside a directory this org
+    actually holds (its workspace or a granted dir). The planner turns paths
+    into agent work; an unchecked root would walk the operator's filesystem."""
+    real = os.path.realpath(root)
+    # `dirs` already carries the workspace for an org made by create_org, so
+    # de-duplicate: the refusal message below lists these, and printing the
+    # workspace twice reads like a bug in the grant (live smoke, 2026-08-31).
+    allowed = list(dict.fromkeys(
+        [org.d.get("workspace") or ""]
+        + [d["path"] for d in norm_dirs(org.d.get("dirs"))]))
+    for a in allowed:
+        if not a:
+            continue
+        base = os.path.realpath(a)
+        if real == base or real.startswith(base + os.sep):
+            return real
+    raise HTTPException(
+        422, f"root {root!r} is not inside this org's folders — grant it on "
+             f"the org first (holdings: {[a for a in allowed if a]})")
+
+
+def _plan_listing(root: str, globs: list[str] | None) -> list[str]:
+    """Repo-relative, forward-slashed, sorted paths that EXIST under `root`.
+    `.git` and other dot-directories are skipped: they are never work items
+    and walking them dwarfs the real listing."""
+    pats = [g for g in (globs or []) if g.strip()] or ["*"]
+    out: list[str] = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for f in sorted(files):
+            rel = os.path.relpath(os.path.join(base, f), root).replace("\\", "/")
+            if any(fnmatch.fnmatch(rel, p) for p in pats):
+                out.append(rel)
+                if len(out) > _PLAN_MAX_LISTING:
+                    raise HTTPException(
+                        422, f"more than {_PLAN_MAX_LISTING} files matched under "
+                             f"{root!r} — narrow `root` or `globs`")
+    return sorted(out)
+
+
+class QueuePlan(Body):
+    # the directory the paths are relative to; must be inside the org's dirs
+    root: str
+    strategy: str
+    globs: list[str] | None = None          # which files form the listing
+    spec: dict[str, Any] = {}               # strategy args (units, dirs, …)
+
+
+@app.post("/api/orgs/{slug}/queues/plan")
+def queue_plan(slug: str, body: QueuePlan, request: Request) -> dict[str, Any]:
+    """DRY RUN — build a partition and return it. Creates NOTHING: no queue,
+    no hires, no doc write. A partition you can look at before spending
+    anything is what makes auto-partitioning safe to trust
+    (design-auto-partition.md §4.2)."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    try:
+        org = store.load_org(slug)
+    except LedgerError as e:
+        raise HTTPException(404, str(e))
+    root = _plan_root(org, body.root)
+    listing = _plan_listing(root, body.globs)
+    spec = {**body.spec, "strategy": body.strategy}
+    try:
+        r = autopartition.plan(spec, listing=listing)
+    except (ValueError, KeyError, TypeError) as e:
+        raise HTTPException(422, f"cannot plan: {e}")
+    return {**r, "root": root, "listed": len(listing)}
+
+
+class QueueCreate(Body):
+    qid: str
+    # either an explicit item list (Inc 1) …
+    items: list[dict[str, Any]] | None = None
+    # … or the same spec `POST …/queues/plan` takes, planned server-side
+    plan: QueuePlan | None = None
+    config: dict[str, Any] | None = None
+
+
+@app.post("/api/orgs/{slug}/queues")
+async def queue_create(slug: str, body: QueueCreate,
+                       request: Request) -> dict[str, Any]:
+    """Register a pre-filled work queue. Either an explicit `items` list
+    (Inc 1) or a `plan` spec run through the same planner as the dry run
+    (design-auto-partition.md §4.2). Nothing spawns; an overlapping write-set
+    on a 'shared' workspace is refused."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    if (body.items is None) == (body.plan is None):
+        raise HTTPException(422, "give exactly one of `items` or `plan`")
+    planned: dict[str, Any] | None = None
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+        except LedgerError as e:
+            raise HTTPException(404, str(e))
+        items = body.items
+        if body.plan is not None:
+            # ⚠ re-planned HERE, against a listing taken now — not carried
+            # from an earlier dry run. Files appear and vanish between a plan
+            # and its acceptance (design-auto-partition.md §7, "listing
+            # drift"); planning under the same lock that creates the queue is
+            # what keeps a stale plan from being run.
+            p = body.plan
+            listing = _plan_listing(_plan_root(org, p.root), p.globs)
+            try:
+                planned = autopartition.plan(
+                    {**p.spec, "strategy": p.strategy}, listing=listing)
+            except (ValueError, KeyError, TypeError) as e:
+                raise HTTPException(422, f"cannot plan: {e}")
+            if planned["refusals"]:
+                raise HTTPException(
+                    422, "the partition was refused: " + "; ".join(
+                        f"[rule {r['rule']}] {r['why']}"
+                        for r in planned["refusals"]))
+            items = planned["items"]
+        try:
+            r = org.queue_create(USER, body.qid, items, body.config)
+        except LedgerError as e:
+            raise HTTPException(422, str(e))
+        store.save_org(org)
+    await hub.changed(slug)
+    if planned is not None:
+        r["planned"] = planned["stats"]
+    return r
+
+
+@app.get("/api/orgs/{slug}/queues/{qid}")
+def queue_status(slug: str, qid: str, request: Request) -> dict[str, Any]:
+    """Computed snapshot of one queue — no turn, no mutation."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    try:
+        org = store.load_org(slug)
+        return org.queue_status(qid)
+    except LedgerError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/orgs/{slug}/queues/{qid}/close")
+async def queue_close(slug: str, qid: str, request: Request) -> dict[str, Any]:
+    """Stop a queue: phase -> done, no further take/done/fail. Idempotent."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+            r = org.queue_close(USER, qid)
+        except LedgerError as e:
+            raise HTTPException(404 if "no such queue" in str(e) else 422,
+                                str(e))
+        store.save_org(org)
+    await hub.changed(slug)
+    return r
+
+
+@app.delete("/api/orgs/{slug}/queues/{qid}")
+async def queue_delete(slug: str, qid: str, request: Request) -> dict[str, Any]:
+    """Remove a queue record. Refuses while a worker holds a claim — the
+    escape hatch for a queue created with no crew that can never spawn."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+            r = org.queue_delete(USER, qid)
+        except LedgerError as e:
+            raise HTTPException(404 if "no such queue" in str(e) else 422,
+                                str(e))
+        store.save_org(org)
+    await hub.changed(slug)
+    return r
+
+
+@app.post("/api/orgs/{slug}/queues/{qid}/items/{item_id}/requeue")
+async def queue_requeue(slug: str, qid: str, item_id: str,
+                        request: Request) -> dict[str, Any]:
+    """Put one dead letter back behind live work with a fresh retry budget."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+            r = org.queue_requeue(USER, qid, item_id)
+        except LedgerError as e:
+            raise HTTPException(404 if "no such queue" in str(e) else 422,
+                                str(e))
+        store.save_org(org)
+    await hub.changed(slug)
+    return r
+
+
+def _usage_reading() -> dict[str, Any]:
+    """Quota standing across the pools we can read, as
+    `{pool: {kind: percent}}` — for `Org.queue_stamp_usage`.
+
+    ⚠ CACHE-ONLY, both of them. A queue spawn must not be able to add an
+    upstream usage request (`limits.peek` / `codex_limits.peek` exist for
+    exactly this); a stale or absent pool simply does not appear, and a
+    missing baseline is better than a slow spawn or a wrong number.
+
+    Only the metered lanes have a window to read. Antigravity bills $0 with
+    no published quota (D-AG-2) and OpenRouter is real dollars with no
+    window at all — for those, `cost.by_worker` is already the whole story."""
+    out: dict[str, Any] = {}
+    for pool, fn in (("claude", limits.peek), ("codex", codex_limits.peek)):
+        try:
+            p = fn()
+        except Exception:                                    # noqa: BLE001
+            continue
+        if not p.get("available"):
+            continue
+        # ⚠ the percent alone is not enough: a percentage is only comparable
+        # WITHIN one window. A run that spans a reset reads 65 -> 29 and
+        # computes a delta of -36, which is worse than no number at all
+        # (measured 2026-09-01 — the 20-file run crossed the 23:20 reset).
+        # `resets_at` is what makes the two readings comparable or not.
+        rows = {str(x.get("kind")): {"pct": x.get("percent"),
+                                     "resets_at": x.get("resets_at")}
+                for x in (p.get("limits") or [])
+                if isinstance(x.get("percent"), int)}
+        if rows:
+            out[pool] = rows
+    return out
+
+
+class QueueSpawn(Body):
+    # required when config.workspace == "per-worker": the repo each worker
+    # gets an isolated `git worktree` of.
+    repo_root: str | None = None
+    base_ref: str = "HEAD"
+
+
+@app.post("/api/orgs/{slug}/queues/{qid}/spawn")
+async def queue_spawn(slug: str, qid: str, body: QueueSpawn,
+                      request: Request) -> dict[str, Any]:
+    """Inc 3: hire `config.workers` workers from the queue's worker_template,
+    give each its own `git worktree` when workspace=='per-worker', and kick
+    each into the take/done loop. Loopback/user only; one shot per queue."""
+    if _public_slug(request):
+        raise HTTPException(404, "not found")
+    kicks: list[str] = []
+    with store.DOC_LOCK:
+        try:
+            org = store.load_org(slug)
+            st = org.queue_status(qid)             # 404s a missing queue
+        except LedgerError as e:
+            raise HTTPException(404 if "no such queue" in str(e) else 422,
+                                str(e))
+        if st["closed"]:
+            raise HTTPException(422, f"queue {qid!r} is closed")
+        qd = org.d["queues"][qid]
+        if (qd.get("spawn") or {}).get("workers"):
+            raise HTTPException(
+                409, f"queue {qid!r} already spawned "
+                     f"{qd['spawn']['workers']}")
+        try:
+            specs = org.queue_spawn_plan(qid, repo_root=body.repo_root)
+        except LedgerError as e:
+            raise HTTPException(422, str(e))
+
+        workspace = st["config"]["workspace"]
+        worktrees: list[dict[str, str]] = []
+        if workspace == "per-worker":
+            if not body.repo_root:
+                raise HTTPException(
+                    422, "workspace is 'per-worker' — repo_root is required so "
+                         "each worker gets its own git worktree")
+            dest = os.path.join(store.scratch_root(slug), "queue", qid)
+            try:
+                worktrees = queueworker.make_worktrees(
+                    body.repo_root, dest, qid, len(specs),
+                    base_ref=body.base_ref)
+            except queueworker.WorktreeError as e:
+                raise HTTPException(422, f"worktree setup failed: {e}")
+            for spec, wt in zip(specs, worktrees):
+                spec["add_dirs"] = [{"path": wt["path"], "mode": "rw"}]
+
+        made: list[str] = []
+        spec = {}
+        try:
+            for spec in specs:
+                # gated PER WORKER: a mixed crew spans provider lanes, so
+                # each one meets its own door (a signed-out Codex must not
+                # look like a broken queue)
+                # PORT NOTE (2026-09-09), the same divergence as the reducer
+                # hire in ledger.py. In the fork this gate took the chosen
+                # OpenRouter MODEL alongside the tier and RETURNED the tier to
+                # use, because an OpenRouter seat there was a fixed band
+                # (spark..nova) carrying a separate model id. Here a favorite
+                # IS a tier (`or:<model id>`, D-232), so the gate takes no
+                # model, returns None, and is called purely for its refusal.
+                # The tier to hire on is `spec["tier"]` unchanged.
+                provider_hire_gate(org, spec["tier"])
+                res = org.hire(USER, None, spec["tier"],
+                               int(spec["grant"] or 0),
+                               spec["name"], spec["add_dirs"],
+                               tools=spec["tools"],
+                               org_visibility=spec["org_visibility"],
+                               charter=spec["charter"])
+                node = str(res["node"])
+                if spec.get("effort"):
+                    org.set_scope(USER, node, effort=spec["effort"])
+                made.append(node)
+        except (LedgerError, HTTPException) as e:
+            # nothing is saved on this path — the whole spawn rolls back with
+            # the dropped `org`. NAME THE LANE: on a mixed crew "spawn failed"
+            # is useless, because the answer is nearly always "that one
+            # provider is signed out", and which one decides what you do next.
+            why = e.detail if isinstance(e, HTTPException) else str(e)
+            raise HTTPException(
+                422, f"spawn aborted at worker {len(made) + 1}/{len(specs)} "
+                     f"({spec.get('name')}, tier {spec.get('tier')!r}): {why}"
+                     + (f" — {made} were planned before it and none were kept."
+                        if made else ""))
+
+        qd["spawn"] = {**(qd.get("spawn") or {}), "workers": made,
+                       "worktrees": worktrees, "workspace": workspace}
+        qd["phase"] = "draining"
+        # the quota BASELINE, taken at the last moment before any worker can
+        # burn anything — a run measured from a remembered number is a run
+        # not measured at all (2026-09-01)
+        org.queue_stamp_usage(qid, "spawn", _usage_reading())
+        store.save_org(org)
+        kicks = made
+
+    for node in kicks:
+        supervisor.send_message(
+            slug, node,
+            f"(orgtree) You are a work-queue worker for queue '{qid}'. Start "
+            f"now: call orgtree_queue_take with qid '{qid}', do the item, then "
+            f"orgtree_queue_done — it hands you the next one. Stop when it "
+            f"returns empty.")
+    await hub.changed(slug)
+    return store.load_org(slug).queue_status(qid)
 
 
 class RenameRepair(Body):
@@ -6802,7 +7200,7 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
         return _forced_self_restart(body, a)
     if body.tool in ("orgtree_read_transcript", "orgtree_read_scratch",
                      "orgtree_chart", "orgtree_send_file",
-                     "orgtree_list_tiers"):
+                     "orgtree_list_tiers", "orgtree_queue_plan"):
         try:
             org = store.load_org(body.org)
             org.node(body.node)
@@ -6814,6 +7212,45 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                     return _tier_discovery_payload()
                 except RuntimeError as e:
                     raise HTTPException(503, str(e)) from e
+            if body.tool == "orgtree_queue_plan":
+                # Inc B: a PROPOSAL. Read-shaped like its neighbours here —
+                # it walks the filesystem and mutates nothing, so it runs
+                # outside DOC_LOCK and never writes the doc.
+                #
+                # ⚠ THE AGENT'S ROOT IS CLAMPED TO ITS OWN GRANTS, not the
+                # org's. `_plan_root` answers "does this org hold it"; an
+                # agent may hold strictly less, and a planner that could list
+                # a folder its caller cannot read would be a disclosure
+                # channel (the plan echoes every path back).
+                _root = _plan_root(org, str(a.get("root") or ""))
+                _sc = org.node(body.node)["scope"]
+                _held = [os.path.realpath(d["path"])
+                         for d in norm_dirs(_sc.get("add_dirs"))]
+                if not any(_root == h or _root.startswith(h + os.sep)
+                           for h in _held):
+                    raise HTTPException(
+                        422, f"you do not hold {a.get('root')!r} — plan inside "
+                             f"a folder you have been granted: {_held}")
+                _listing = _plan_listing(
+                    _root, cast("list[str] | None", a.get("globs")))
+                _spec = {k: v for k, v in a.items()
+                         if k in ("strategy", "units", "group_by", "files",
+                                  "dirs", "out_prefix", "payload_template",
+                                  "limits")}
+                try:
+                    _p = autopartition.plan(_spec, listing=_listing)
+                except (ValueError, KeyError, TypeError) as e:
+                    raise HTTPException(422, f"cannot plan: {e}")
+                _p["listed"] = len(_listing)
+                _p["status"] = (
+                    "PROPOSAL ONLY — nothing was created and nothing spent. "
+                    + (f"{len(_p['refusals'])} refusal(s): this partition is "
+                       f"NOT usable as it stands — fix what each names and "
+                       f"plan again."
+                       if _p["refusals"] else
+                       f"{len(_p['items'])} disjoint item(s). Report it to "
+                       f"whoever asked; only the user can create the queue."))
+                return _p
             if body.tool == "orgtree_chart":
                 # D-178: archived nodes are hidden from the default chart (it
                 # is rebuilt into every turn of every agent); this flag is the
@@ -6901,6 +7338,11 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
         except LedgerError as e:
             raise HTTPException(422, str(e))
     drive: list[str] = []      # nodes whose turn should run after we release the lock
+    reducer_kicks: list[str] = []   # queue reducers just hired on a drain — an
+                                    # explicit self-contained kick, not the
+                                    # mail_ping drive tail (a freshly-hired node
+                                    # the same transaction created does not wake
+                                    # reliably off a pointer — first live run)
     stale_freeze_resumed: list[str] = []  # switch_model cleared their freeze
     unstick_resume: tuple[str, list[str], list[str]] | None = None
     org_send: tuple[str, str] | None = None   # (dst-slug, body) outbound to another org's inbox
@@ -7562,6 +8004,41 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                 # above" ping, and an unfrozen node needs the accurate one.
                 stale_freeze_resumed.extend(
                     result.pop("resume_stale_freeze", []))
+            elif body.tool == "orgtree_queue_take":
+                result = org.queue_take(body.node, str(a.get("qid") or ""))
+            elif body.tool == "orgtree_queue_done":
+                raw_cost = a.get("cost_usd", 0.0)
+                try:
+                    cost_usd = float(raw_cost)
+                except (TypeError, ValueError, OverflowError):
+                    raise LedgerError(
+                        f"cost_usd must be a number (got {raw_cost!r})")
+                result = org.queue_done(
+                    body.node, str(a.get("qid") or ""),
+                    str(a.get("item_id") or ""), a.get("result"),
+                    cost_usd=cost_usd,
+                    turns=_arg_int(a, "turns", 0))
+                if result.get("queue_drained"):
+                    _q = str(a.get("qid") or "")
+                    # the closing quota reading, paired with the spawn
+                    # baseline so the run reports its own window cost
+                    org.queue_stamp_usage(_q, "drained", _usage_reading())
+                    _fr = org.queue_fire_reducer(_q)
+                    if _fr.get("reducer"):
+                        reducer_kicks.append(str(_fr["reducer"]))
+            elif body.tool == "orgtree_queue_fail":
+                result = org.queue_fail(
+                    body.node, str(a.get("qid") or ""),
+                    str(a.get("item_id") or ""),
+                    str(a.get("reason") or ""))
+                if result.get("queue_drained"):
+                    _q = str(a.get("qid") or "")
+                    # the closing quota reading, paired with the spawn
+                    # baseline so the run reports its own window cost
+                    org.queue_stamp_usage(_q, "drained", _usage_reading())
+                    _fr = org.queue_fire_reducer(_q)
+                    if _fr.get("reducer"):
+                        reducer_kicks.append(str(_fr["reducer"]))
             elif body.tool == "orgtree_status":
                 status = a.get("status", "working")
                 summary = a.get("summary", "")
@@ -7586,6 +8063,13 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
                 else:
                     org.node(body.node).pop("working_activity_at", None)
                 result = {"recorded": status}
+                # queue auto-close (ported 2026-09-09): a reducer reporting
+                # `done` is what CLOSES its queue - the one place the queue's
+                # lifecycle ends on the agent's own word rather than an
+                # operator action. No-op for every node that does not reduce.
+                _closed_q = org.queue_reducer_reported(body.node, stored)
+                if _closed_q:
+                    result["queue_closed"] = _closed_q
                 if status in ("done", "blocked"):
                     parent = org.node(body.node)["parent"]
                     if parent:
@@ -7791,6 +8275,13 @@ def agent_call(body: AgentCall, request: Request) -> dict[str, Any]:
             mail_notify(body.org, body.node, _n)
             if _n not in noticed_nodes and _n not in _deferred:
                 noticed_nodes.append(_n)
+    for target in reducer_kicks:
+        supervisor.send_message(
+            body.org, target,
+            "(orgtree) The work queue you reduce has drained — every worker "
+            "result is in the mail above. Do your reduction now: write the "
+            "shared output(s), merge the worker branches one at a time, then "
+            "report to the user. Do this once and stop.")
     if notice_to is not None:
         # wake=False: steer a running recipient so the notice arrives
         # mid-task like any mail would, but an idle one stays idle — the
